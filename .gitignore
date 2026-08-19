@@ -1,0 +1,12 @@
+.DS_Store
+.build/
+DerivedData/
+Build/
+.sparkle-tools/
+SparkleUpdates/
+*.xcuserstate
+xcuserdata/
+
+# Sparkle private-key exports must never be committed. The release workflow
+# reads the signing key directly from the login Keychain.
+*.sparkle-private-key

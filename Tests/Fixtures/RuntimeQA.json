@@ -1,0 +1,14 @@
+{
+  "application": "LighTxt",
+  "purpose": "runtime edit, search, syntax, and save verification",
+  "unicode": "calm water — café — 測試 — 🟦",
+  "records": [
+    { "id": 1, "active": true, "tags": ["blue", "green"] },
+    { "id": 2, "active": false, "tags": ["fast", "small"] },
+    { "id": 3, "active": true, "tags": ["find-me", "replace-me"] }
+  ],
+  "nested": {
+    "viewer": { "virtualized": true, "viewportKiB": 512 },
+    "editor": { "fileBacked": true, "undo": true }
+  }
+}

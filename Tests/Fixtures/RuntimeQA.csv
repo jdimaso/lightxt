@@ -1,0 +1,6 @@
+id,name,notes,active
+1,Ada,"comma, preserved",true
+2,Grace,"a quoted ""word""",true
+3,Linus,"multiline
+cell",false
+4,Zoë,Unicode stays intact,true

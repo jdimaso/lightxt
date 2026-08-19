@@ -1,0 +1,30 @@
+LighTxt Third-Party Notices
+============================
+
+Sparkle 2.9.6
+https://github.com/sparkle-project/Sparkle
+
+LighTxt embeds the official Sparkle framework for secure automatic updates.
+Sparkle's complete license and bundled third-party notices are included in
+this application as Sparkle-LICENSE.txt and in the source tree at:
+
+  LighTxt/Sparkle-LICENSE.txt
+
+simdjson 4.6.1
+Copyright (c) 2018-2025 The simdjson authors
+https://github.com/simdjson/simdjson
+
+LighTxt statically links the unmodified official simdjson 4.6.1 single-header
+distribution to accelerate validation of resident JSON documents up to the
+library's exact 4 GiB single-document limit.
+
+simdjson is available under either the Apache License, Version 2.0, or the MIT
+License. Copies of both licenses are included in this application bundle as
+LICENSE and LICENSE-MIT and in the source tree at:
+
+  LighTxt/Vendor/JSONAccelerator/LICENSE
+  LighTxt/Vendor/JSONAccelerator/LICENSE-MIT
+
+The complete corresponding vendored source is included at:
+
+  LighTxt/Vendor/JSONAccelerator/simdjson/
