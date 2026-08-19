@@ -9,6 +9,24 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Secure LighTxt application updates</description>
         <language>en</language>
         <item>
+            <title>1.2</title>
+            <pubDate>Wed, 19 Aug 2026 19:26:31 -0400</pubDate>
+            <link>https://github.com/jdimaso/lightxt</link>
+            <sparkle:version>5</sparkle:version>
+            <sparkle:shortVersionString>1.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[# LighTxt 1.2
+
+LighTxt 1.2 turns CSV View into a more capable large-file data workspace:
+
+- Sort and filter individual columns without loading the entire CSV into memory.
+- Inspect quick column summaries built from bounded, representative samples.
+- Add or delete rows and columns with each operation preserved as a single Undo step.
+- Benefit from reliability and performance improvements throughout sparse CSV indexing and editing.
+]]></description>
+            <enclosure url="https://github.com/jdimaso/lightxt/releases/download/v1.2/LighTxt-1.2-macOS-universal.zip" length="5121957" type="application/octet-stream" sparkle:edSignature="FIU75mO7M767uI+IPg10HMrTPlRUGvnN/Bo2PzNn98rR/N2u+u4rPR216KdXsZaq8A7tO5h+V2QkfRom0v6aDw=="/>
+        </item>
+        <item>
             <title>1.1</title>
             <pubDate>Wed, 19 Aug 2026 11:37:20 -0400</pubDate>
             <link>https://github.com/jdimaso/lightxt</link>
@@ -26,6 +44,6 @@ This release also includes the large-file JSON, CSV, Markdown, navigation, and p
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: Tjffjv3VB+F/o3BLAvH94tS1XB4bPo/UkMT254uc0Dq+pH3sVsauQXZYhLZIdlgcbbj/jAOI2ZN7iP5NNxqYBg==
-length: 1681
+edSignature: 7h7TfWfsIyT+DTGqfndPg6nqj0C+DoWX6T6WdG26oSwLswLEGoX2bJaMMTGsaTpbc2IrnFBFWgFlqFgegpErAw==
+length: 2859
 -->
