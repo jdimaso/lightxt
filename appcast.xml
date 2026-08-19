@@ -1,13 +1,31 @@
-<?xml version="1.0" encoding="utf-8" standalone="yes"?><!-- sparkle-sign-warning:
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<!-- sparkle-sign-warning:
 IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
---><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+-->
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
         <title>LighTxt Updates</title>
         <link>https://github.com/jdimaso/lightxt/releases</link>
         <description>Secure LighTxt application updates</description>
         <language>en</language>
+        <item>
+            <title>1.1</title>
+            <pubDate>Wed, 19 Aug 2026 11:37:20 -0400</pubDate>
+            <link>https://github.com/jdimaso/lightxt</link>
+            <sparkle:version>4</sparkle:version>
+            <sparkle:shortVersionString>1.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[# LighTxt 1.1
+
+LighTxt 1.1 adds secure automatic updates powered by Sparkle and fixes JSON View search so typing a query remains in the Find field without switching to Edit mode.
+
+This release also includes the large-file JSON, CSV, Markdown, navigation, and presentation improvements completed since LighTxt 1.0.
+]]></description>
+            <enclosure url="https://github.com/jdimaso/lightxt/releases/download/v1.1/LighTxt-1.1-macOS-universal.zip" length="4841566" type="application/octet-stream" sparkle:edSignature="2GfqIRAMzvcA1F9PQ09GThzfl/23ZPGKpIhLo7DX2m4YCE1Dyov7Du6gfeganRWi1KerXU9O8GIU1MmeF96WAw=="/>
+        </item>
     </channel>
-</rss><!-- sparkle-signatures:
-edSignature: W/UMv5UedVaOuG1PVvEqaVoZOOf/1uaiLSmGm4KP4IfgHr7GTF2wMt2wjvy9hhHj1pvFOLaugDhV8gbIbsH7AQ==
-length: 620
+</rss>
+<!-- sparkle-signatures:
+edSignature: Tjffjv3VB+F/o3BLAvH94tS1XB4bPo/UkMT254uc0Dq+pH3sVsauQXZYhLZIdlgcbbj/jAOI2ZN7iP5NNxqYBg==
+length: 1681
 -->
