@@ -180,6 +180,22 @@ nonisolated private func rootsAreIdentical(_ lhs: PieceNode?, _ rhs: PieceNode?)
     }
 }
 
+/// One source-coordinate edit in an atomic byte-edit batch.
+///
+/// Every range in a batch addresses the same immutable document revision.
+/// `FileBackedPieceTable` validates and applies those ranges from the end of
+/// the document toward the beginning, so an earlier replacement never shifts
+/// a later edit's source coordinates.
+public nonisolated struct ByteEdit: Sendable, Equatable {
+    public let byteRange: Range<Int64>
+    public let replacement: Data
+
+    public init(byteRange: Range<Int64>, replacement: Data) {
+        self.byteRange = byteRange
+        self.replacement = replacement
+    }
+}
+
 private nonisolated struct SplitMix64 {
     private var state: UInt64 = 0x4c69_6768_5478_7421
 
@@ -471,19 +487,172 @@ public nonisolated final class FileBackedPieceTable: @unchecked Sendable {
     }
 
     public func replace(byteRange: Range<Int64>, with bytes: Data) throws {
+        try replaceAtomically(edits: [
+            ByteEdit(byteRange: byteRange, replacement: bytes),
+        ])
+    }
+
+    /// Applies non-overlapping source-coordinate edits as one transaction.
+    ///
+    /// Validation, replacement storage, and the new persistent tree are all
+    /// prepared before the live state is published. A failure therefore leaves
+    /// the document bytes, revision, dirty state, and undo/redo stacks exactly
+    /// as they were. The batch consumes one undo level and one revision.
+    public func replaceAtomically(
+        edits: [ByteEdit],
+        cancellation: (@Sendable () -> Bool)? = nil
+    ) throws {
+        try replaceAtomically(
+            edits: edits,
+            requiring: nil,
+            cancellation: cancellation
+        )
+    }
+
+    /// Applies an atomic batch only if `captured` is still the current root.
+    /// This is the safe commit boundary for edits whose ranges were calculated
+    /// asynchronously from an immutable snapshot.
+    public func replaceAtomically(
+        edits: [ByteEdit],
+        replacing captured: DocumentSnapshot,
+        cancellation: (@Sendable () -> Bool)? = nil
+    ) throws {
+        try replaceAtomically(
+            edits: edits,
+            requiring: captured,
+            cancellation: cancellation
+        )
+    }
+
+    private func replaceAtomically(
+        edits: [ByteEdit],
+        requiring captured: DocumentSnapshot?,
+        cancellation: (@Sendable () -> Bool)?
+    ) throws {
+        if cancellation?() == true { throw CancellationError() }
         try withLock {
             guard var current = state else { throw LighTxtCoreError.documentClosed }
-            let oldByteCount = treeByteCount(current.root)
-            try validateByteRange(byteRange, byteCount: oldByteCount)
-            guard !byteRange.isEmpty || !bytes.isEmpty else { return }
+            if cancellation?() == true { throw CancellationError() }
+            if let captured,
+               !rootsAreIdentical(current.root, captured.root) {
+                throw LighTxtCoreError.documentChangedDuringBulkOperation
+            }
 
-            let retainedBytes = oldByteCount - (byteRange.upperBound - byteRange.lowerBound)
-            guard Int64(bytes.count) <= Int64.max - retainedBytes else {
+            let oldByteCount = treeByteCount(current.root)
+            var ordered = edits.filter { !$0.byteRange.isEmpty || !$0.replacement.isEmpty }
+            for edit in ordered {
+                if cancellation?() == true { throw CancellationError() }
+                try validateByteRange(edit.byteRange, byteCount: oldByteCount)
+            }
+            guard !ordered.isEmpty else { return }
+
+            // A deterministic tie-break makes zero-length insertions at the
+            // same source offset well-defined without relying on sort
+            // stability. Later entries at that offset are applied first, so
+            // their final byte order matches the caller's array order.
+            ordered = ordered.enumerated().sorted { lhs, rhs in
+                if lhs.element.byteRange.lowerBound != rhs.element.byteRange.lowerBound {
+                    return lhs.element.byteRange.lowerBound > rhs.element.byteRange.lowerBound
+                }
+                if lhs.element.byteRange.upperBound != rhs.element.byteRange.upperBound {
+                    return lhs.element.byteRange.upperBound > rhs.element.byteRange.upperBound
+                }
+                return lhs.offset > rhs.offset
+            }.map(\.element)
+            if cancellation?() == true { throw CancellationError() }
+
+            for pair in zip(ordered, ordered.dropFirst()) {
+                if cancellation?() == true { throw CancellationError() }
+                let higher = pair.0.byteRange
+                let lower = pair.1.byteRange
+                guard lower.upperBound <= higher.lowerBound else {
+                    throw LighTxtCoreError.overlappingByteEdits(
+                        first: higher,
+                        second: lower
+                    )
+                }
+            }
+
+            var totalRemoved: Int64 = 0
+            var totalInserted: Int64 = 0
+            for edit in ordered {
+                if cancellation?() == true { throw CancellationError() }
+                let removed = edit.byteRange.upperBound - edit.byteRange.lowerBound
+                let inserted = Int64(edit.replacement.count)
+                let removedTotal = totalRemoved.addingReportingOverflow(removed)
+                let insertedTotal = totalInserted.addingReportingOverflow(inserted)
+                guard !removedTotal.overflow, !insertedTotal.overflow else {
+                    throw LighTxtCoreError.fileTooLarge(Int64.max)
+                }
+                totalRemoved = removedTotal.partialValue
+                totalInserted = insertedTotal.partialValue
+            }
+            let retainedByteCount = oldByteCount - totalRemoved
+            guard !retainedByteCount.addingReportingOverflow(totalInserted).overflow else {
                 throw LighTxtCoreError.fileTooLarge(Int64.max)
             }
 
+            let originalRoot = current.root
+            var nextRoot = originalRoot
+            for edit in ordered {
+                if cancellation?() == true { throw CancellationError() }
+                let (before, tail) = splitTree(
+                    nextRoot,
+                    at: edit.byteRange.lowerBound,
+                    random: &current.random
+                )
+                let (_, after) = splitTree(
+                    tail,
+                    at: edit.byteRange.upperBound - edit.byteRange.lowerBound,
+                    random: &current.random
+                )
+
+                var insertedRoot: PieceNode?
+                if !edit.replacement.isEmpty {
+                    let byteLength = Int64(edit.replacement.count)
+                    let residentBudgetRemaining = configuration.maximumResidentEditBytes
+                        - current.residentEditBytes
+                    let storeOnDisk = byteLength
+                        > configuration.individualEditSpillThresholdBytes
+                        || byteLength > residentBudgetRemaining
+                    let segment: AdditionSegment
+                    if storeOnDisk {
+                        let store: TemporaryAdditionStore
+                        if let existing = current.temporaryAdditionStore {
+                            store = existing
+                        } else {
+                            store = try TemporaryAdditionStore()
+                            current.temporaryAdditionStore = store
+                        }
+                        segment = try AdditionSegment(
+                            data: edit.replacement,
+                            temporaryStore: store
+                        )
+                    } else {
+                        segment = try AdditionSegment(
+                            data: edit.replacement,
+                            temporaryStore: nil
+                        )
+                        current.residentEditBytes += byteLength
+                    }
+                    insertedRoot = PieceNode(
+                        piece: Piece(
+                            backing: .addition(segment),
+                            offset: 0,
+                            length: byteLength
+                        ),
+                        priority: current.random.next()
+                    )
+                }
+                if cancellation?() == true { throw CancellationError() }
+                nextRoot = mergeTrees(mergeTrees(before, insertedRoot), after)
+            }
+
+            // This is the linearization point. Cancellation before it leaves
+            // the live root, revision, undo/redo stacks, and dirty state intact.
+            if cancellation?() == true { throw CancellationError() }
             if configuration.maximumUndoLevels > 0 {
-                current.undoRoots.append(current.root)
+                current.undoRoots.append(originalRoot)
                 if current.undoRoots.count > configuration.maximumUndoLevels {
                     current.undoRoots.removeFirst(
                         current.undoRoots.count - configuration.maximumUndoLevels
@@ -491,55 +660,7 @@ public nonisolated final class FileBackedPieceTable: @unchecked Sendable {
                 }
             }
             current.redoRoots.removeAll(keepingCapacity: true)
-
-            let (before, tail) = splitTree(
-                current.root,
-                at: byteRange.lowerBound,
-                random: &current.random
-            )
-            let (_, after) = splitTree(
-                tail,
-                at: byteRange.upperBound - byteRange.lowerBound,
-                random: &current.random
-            )
-
-            var inserted: PieceNode?
-            if bytes.isEmpty {
-                inserted = nil
-            } else {
-                let byteLength = Int64(bytes.count)
-                let exceedsIndividualThreshold = byteLength
-                    > configuration.individualEditSpillThresholdBytes
-                let exceedsResidentBudget = byteLength
-                    > configuration.maximumResidentEditBytes - current.residentEditBytes
-                let storeOnDisk = exceedsIndividualThreshold || exceedsResidentBudget
-                let segment: AdditionSegment
-                if storeOnDisk {
-                    let store: TemporaryAdditionStore
-                    if let existing = current.temporaryAdditionStore {
-                        store = existing
-                    } else {
-                        store = try TemporaryAdditionStore()
-                        current.temporaryAdditionStore = store
-                    }
-                    segment = try AdditionSegment(data: bytes, temporaryStore: store)
-                } else {
-                    segment = try AdditionSegment(data: bytes, temporaryStore: nil)
-                }
-                if !storeOnDisk {
-                    current.residentEditBytes += byteLength
-                }
-                inserted = PieceNode(
-                    piece: Piece(
-                        backing: .addition(segment),
-                        offset: 0,
-                        length: Int64(bytes.count)
-                    ),
-                    priority: current.random.next()
-                )
-            }
-
-            current.root = mergeTrees(mergeTrees(before, inserted), after)
+            current.root = nextRoot
             current.revision &+= 1
             state = current
         }
@@ -550,13 +671,36 @@ public nonisolated final class FileBackedPieceTable: @unchecked Sendable {
     /// new root (and later by redo) without becoming the on-disk save baseline.
     func installBulkRewrite(
         _ rewrittenMapping: MemoryMappedFile,
-        replacing captured: DocumentSnapshot
+        replacing captured: DocumentSnapshot,
+        cancellation: (@Sendable () -> Bool)? = nil
     ) throws {
+        if cancellation?() == true { throw CancellationError() }
         try withLock {
             guard var current = state else { throw LighTxtCoreError.documentClosed }
+            if cancellation?() == true { throw CancellationError() }
             guard rootsAreIdentical(current.root, captured.root) else {
                 throw LighTxtCoreError.documentChangedDuringBulkOperation
             }
+            if cancellation?() == true { throw CancellationError() }
+
+            let rewrittenRoot: PieceNode?
+            if rewrittenMapping.byteCount == 0 {
+                rewrittenRoot = nil
+            } else {
+                rewrittenRoot = PieceNode(
+                    piece: Piece(
+                        backing: .mapped(rewrittenMapping),
+                        offset: 0,
+                        length: rewrittenMapping.byteCount
+                    ),
+                    priority: current.random.next()
+                )
+            }
+
+            // Cancellation and root publication linearize under the same
+            // document lock. Once this check passes, the rewrite wins the race;
+            // cancellation observed before it publishes no document state.
+            if cancellation?() == true { throw CancellationError() }
 
             if configuration.maximumUndoLevels > 0 {
                 current.undoRoots.append(current.root)
@@ -567,19 +711,7 @@ public nonisolated final class FileBackedPieceTable: @unchecked Sendable {
                 }
             }
             current.redoRoots.removeAll(keepingCapacity: true)
-
-            if rewrittenMapping.byteCount == 0 {
-                current.root = nil
-            } else {
-                current.root = PieceNode(
-                    piece: Piece(
-                        backing: .mapped(rewrittenMapping),
-                        offset: 0,
-                        length: rewrittenMapping.byteCount
-                    ),
-                    priority: current.random.next()
-                )
-            }
+            current.root = rewrittenRoot
             current.revision &+= 1
             state = current
         }

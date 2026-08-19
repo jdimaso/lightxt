@@ -41,7 +41,12 @@ CSV View never retains a whole-file copy. A native RFC-4180 lexical scanner
 consumes the same bounded source slices and emits only adaptive sparse row
 checkpoints; cell lookup rescans from the nearest checkpoint. The native and
 Swift reference scanners are parity-tested across quote, CRLF, chunk, and
-cancellation boundaries.
+cancellation boundaries. Filters stream matching source ordinals into an
+unlinked temporary row map. Stable sorts persist exact comparison keys in
+bounded external runs and compact them incrementally with fixed fan-in, keeping
+both memory and live file descriptors bounded. Column profiles use bounded,
+stratified sampling for large tables. Row mutations are atomic byte-edit batches;
+column mutations stream into a replacement mapping and publish as one undo root.
 
 ## Memory behavior
 

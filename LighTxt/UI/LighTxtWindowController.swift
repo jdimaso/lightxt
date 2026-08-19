@@ -431,6 +431,11 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             self.refreshChrome()
             guard !typeChanged else { return }
             self.handleJSONDocumentChange()
+            // A transactional rewrite publishes a temporary dirty state so
+            // Close/Quit remains prompt-safe. Do not rebuild an unchanged CSV
+            // table (or other rendered view) at that start notification; the
+            // final notification installs exactly one fresh generation.
+            guard !self.session.isBulkEditing else { return }
             if self.presentationMode == .view {
                 (self.installedPrimaryContentView as? MarkdownPreviewView)?.reloadDocument()
                 if let table = self.installedPrimaryContentView as? CSVTableView,

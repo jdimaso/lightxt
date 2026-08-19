@@ -67,6 +67,157 @@ final class FileBackedPieceTableTests: XCTestCase {
         XCTAssertFalse(table.redo())
     }
 
+    func testAtomicByteEditsUseSourceCoordinatesAndOneUndoRevision() throws {
+        let source = try makeFile(named: "atomic.txt", contents: Data("0123456789".utf8))
+        let table = try FileBackedPieceTable(opening: source)
+        let revisionBefore = try table.snapshot().revision
+
+        try table.replaceAtomically(edits: [
+            ByteEdit(byteRange: 2..<4, replacement: Data("AB".utf8)),
+            ByteEdit(byteRange: 10..<10, replacement: Data("!".utf8)),
+            ByteEdit(byteRange: 6..<8, replacement: Data()),
+        ])
+
+        XCTAssertEqual(try text(of: table), "01AB4589!")
+        XCTAssertEqual(try table.snapshot().revision, revisionBefore + 1)
+        XCTAssertTrue(table.hasUnsavedChanges)
+        XCTAssertTrue(table.undo())
+        XCTAssertEqual(try text(of: table), "0123456789")
+        XCTAssertFalse(table.hasUnsavedChanges)
+        XCTAssertFalse(table.canUndo, "The complete batch must consume one undo level")
+        XCTAssertTrue(table.redo())
+        XCTAssertEqual(try text(of: table), "01AB4589!")
+    }
+
+    func testAtomicByteEditValidationNeverPublishesAPartialBatch() throws {
+        let source = try makeFile(named: "atomic-invalid.txt", contents: Data("abcdefghij".utf8))
+        let table = try FileBackedPieceTable(opening: source)
+        let revisionBefore = try table.snapshot().revision
+
+        XCTAssertThrowsError(try table.replaceAtomically(edits: [
+            ByteEdit(byteRange: 7..<9, replacement: Data("valid".utf8)),
+            ByteEdit(byteRange: 4..<8, replacement: Data()),
+        ])) { error in
+            guard case LighTxtCoreError.overlappingByteEdits = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertEqual(try text(of: table), "abcdefghij")
+        XCTAssertEqual(try table.snapshot().revision, revisionBefore)
+        XCTAssertFalse(table.hasUnsavedChanges)
+        XCTAssertFalse(table.canUndo)
+
+        XCTAssertThrowsError(try table.replaceAtomically(edits: [
+            ByteEdit(byteRange: 2..<3, replacement: Data("x".utf8)),
+            ByteEdit(byteRange: 9..<11, replacement: Data()),
+        ]))
+        XCTAssertEqual(try text(of: table), "abcdefghij")
+        XCTAssertEqual(try table.snapshot().revision, revisionBefore)
+        XCTAssertFalse(table.canUndo)
+    }
+
+    func testAtomicSameOffsetInsertionsPreserveCallerOrder() throws {
+        let source = try makeFile(named: "atomic-insert-order.txt", contents: Data("ac".utf8))
+        let table = try FileBackedPieceTable(opening: source)
+
+        try table.replaceAtomically(edits: [
+            ByteEdit(byteRange: 1..<1, replacement: Data("1".utf8)),
+            ByteEdit(byteRange: 1..<1, replacement: Data("2".utf8)),
+            ByteEdit(byteRange: 1..<1, replacement: Data("3".utf8)),
+        ])
+
+        XCTAssertEqual(try text(of: table), "a123c")
+        XCTAssertTrue(table.undo())
+        XCTAssertEqual(try text(of: table), "ac")
+        XCTAssertFalse(table.canUndo)
+    }
+
+    func testAtomicByteEditsRejectAStaleSnapshotWithoutChangingNewerEdit() throws {
+        let source = try makeFile(named: "atomic-stale.txt", contents: Data("abcdef".utf8))
+        let table = try FileBackedPieceTable(opening: source)
+        let stale = try table.snapshot()
+        try table.insert(utf8: "!", at: table.byteCount)
+        let revisionAfterNewerEdit = try table.snapshot().revision
+
+        XCTAssertThrowsError(try table.replaceAtomically(
+            edits: [ByteEdit(byteRange: 0..<1, replacement: Data("A".utf8))],
+            replacing: stale
+        )) { error in
+            guard case LighTxtCoreError.documentChangedDuringBulkOperation = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertEqual(try text(of: table), "abcdef!")
+        XCTAssertEqual(try table.snapshot().revision, revisionAfterNewerEdit)
+        XCTAssertTrue(table.undo())
+        XCTAssertEqual(try text(of: table), "abcdef")
+        XCTAssertFalse(table.canUndo, "The rejected batch must not add undo state")
+    }
+
+    func testAtomicByteEditCancellationDuringPreparationPublishesNothing() throws {
+        let source = try makeFile(
+            named: "atomic-cancel.txt",
+            contents: Data("0123456789".utf8)
+        )
+        let table = try FileBackedPieceTable(opening: source)
+        let snapshot = try table.snapshot()
+        // This fires after at least one replacement root has been prepared in
+        // local state, proving cancellation still wins before publication.
+        let cancellation = AtomicEditCancellationProbe(cancelAfterChecks: 17)
+
+        XCTAssertThrowsError(try table.replaceAtomically(
+            edits: [
+                ByteEdit(byteRange: 0..<1, replacement: Data("A".utf8)),
+                ByteEdit(byteRange: 2..<3, replacement: Data("B".utf8)),
+                ByteEdit(byteRange: 4..<5, replacement: Data("C".utf8)),
+                ByteEdit(byteRange: 6..<7, replacement: Data("D".utf8)),
+            ],
+            replacing: snapshot,
+            cancellation: { cancellation.shouldCancel() }
+        )) { error in
+            XCTAssertTrue(error is CancellationError, "Unexpected error: \(error)")
+        }
+
+        XCTAssertGreaterThanOrEqual(cancellation.checkCount, 17)
+        XCTAssertEqual(try text(of: table), "0123456789")
+        XCTAssertEqual(try table.snapshot().revision, snapshot.revision)
+        XCTAssertFalse(table.hasUnsavedChanges)
+        XCTAssertFalse(table.canUndo)
+        XCTAssertFalse(table.canRedo)
+    }
+
+    func testBulkRewriteCancellationAtCommitPublishesNothing() throws {
+        let source = try makeFile(
+            named: "bulk-cancel-source.txt",
+            contents: Data("original".utf8)
+        )
+        let rewrite = try makeFile(
+            named: "bulk-cancel-rewrite.txt",
+            contents: Data("replacement".utf8)
+        )
+        let table = try FileBackedPieceTable(opening: source)
+        let snapshot = try table.snapshot()
+        let mapping = try MemoryMappedFile(url: rewrite)
+        // The fourth check occurs after the replacement root is prepared but
+        // while the document lock still protects the publication boundary.
+        let cancellation = AtomicEditCancellationProbe(cancelAfterChecks: 4)
+
+        XCTAssertThrowsError(try table.installBulkRewrite(
+            mapping,
+            replacing: snapshot,
+            cancellation: { cancellation.shouldCancel() }
+        )) { error in
+            XCTAssertTrue(error is CancellationError, "Unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(cancellation.checkCount, 4)
+        XCTAssertEqual(try text(of: table), "original")
+        XCTAssertEqual(try table.snapshot().revision, snapshot.revision)
+        XCTAssertFalse(table.hasUnsavedChanges)
+        XCTAssertFalse(table.canUndo)
+        XCTAssertFalse(table.canRedo)
+    }
+
     func testRandomizedEditsMatchContiguousReference() throws {
         var reference = Data((0..<512).map { UInt8($0 & 0xff) })
         let source = try makeFile(named: "random.bin", contents: reference)
@@ -353,6 +504,27 @@ final class FileBackedPieceTableTests: XCTestCase {
     private func text(of table: FileBackedPieceTable) throws -> String {
         let snapshot = try table.snapshot()
         return try snapshot.utf8String(in: 0..<snapshot.byteCount)
+    }
+}
+
+private final class AtomicEditCancellationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let cancelAfterChecks: Int
+    private var checks = 0
+
+    init(cancelAfterChecks: Int) {
+        self.cancelAfterChecks = cancelAfterChecks
+    }
+
+    var checkCount: Int {
+        lock.withLock { checks }
+    }
+
+    func shouldCancel() -> Bool {
+        lock.withLock {
+            checks += 1
+            return checks >= cancelAfterChecks
+        }
     }
 }
 

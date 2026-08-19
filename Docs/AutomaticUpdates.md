@@ -6,10 +6,12 @@ alter a release. The app checks the signed feed at:
 
 `https://raw.githubusercontent.com/jdimaso/lightxt/main/appcast.xml`
 
-The checked-in feed intentionally contains no release item until a real,
-newer build is ready. A user can run **LighTxt > Check for Updates…**, and
-Sparkle also checks once per day. Automatic download and installation are
-enabled by default; the user can change that choice in Sparkle's update UI.
+The checked-in feed contains only immutable, publicly available releases. A new
+item is promoted only after its signed ZIP is downloadable and an isolated
+copy of the previous public version has completed an end-to-end update. A user
+can run **LighTxt > Check for Updates…**, and Sparkle also checks once per day.
+Automatic download and installation are enabled by default; the user can
+change that choice in Sparkle's update UI.
 
 ## Security and sandboxing
 
@@ -69,9 +71,14 @@ enabled by default; the user can change that choice in Sparkle's update UI.
    git push
    ```
 
-6. From the previous public version, choose **Check for Updates…** and complete
-   one end-to-end installation. Keep the GitHub asset immutable after the feed
-   is live. Replacing it invalidates its EdDSA signature.
+6. Before changing the production feed, expose the generated feed at a temporary
+   QA-only URL and launch a fresh copy of the previous public version with that
+   feed override. Complete one end-to-end install and relaunch, verifying that
+   only the disposable copy changed.
+7. After promoting the signed feed, repeat the update from another fresh copy of
+   the previous public version with no override. Keep every GitHub asset
+   immutable after the feed is live; replacing it invalidates its EdDSA
+   signature.
 
 The user-facing DMG may be attached to the same GitHub Release, but Sparkle
 uses the ZIP containing only `LighTxt.app`. Do not put the DMG layout helpers

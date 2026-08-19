@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 
 @MainActor
-final class LighTxtDocumentSession: VirtualTextEditorDelegate {
+final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditorDelegate {
     struct Callbacks {
         var documentChanged: ((Int64, Bool) -> Void)?
         var selectionChanged: ((Range<Int64>, Int64, Int) -> Void)?
@@ -86,8 +86,8 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate {
     var editorSyntaxFileType: SyntaxFileType { syntaxFileType }
     var byteCount: Int64 { engine.byteCount }
     var isEdited: Bool { engine.hasUnsavedChanges || requiresDestinationSave || isBulkEditing }
-    var canUndo: Bool { !isMutationSuspended && engine.canUndo }
-    var canRedo: Bool { !isMutationSuspended && engine.canRedo }
+    var canUndo: Bool { !isMutationSuspended && !isBulkEditing && engine.canUndo }
+    var canRedo: Bool { !isMutationSuspended && !isBulkEditing && engine.canRedo }
     var totalLineCount: Int64? { lineIndex.totalLineCount }
 
     func editorSnapshot() throws -> DocumentSnapshot {
@@ -104,6 +104,138 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate {
         }
         guard !isBulkEditing else { throw LighTxtSessionError.bulkOperationInProgress }
         try engine.replace(byteRange: range, with: bytes)
+    }
+
+    func editorApplyCSVRowEdits(
+        _ edits: [ByteEdit],
+        replacing snapshot: DocumentSnapshot,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        let meaningfulEdits = edits.filter {
+            !$0.byteRange.isEmpty || !$0.replacement.isEmpty
+        }
+        guard !meaningfulEdits.isEmpty else {
+            completion(.success(()))
+            return
+        }
+        let token: CancellationToken
+        do {
+            token = try beginCSVMutation(status: "Updating CSV rows…")
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        let engine = self.engine
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<Void, Error>
+            do {
+                if token.isCancelled { throw CancellationError() }
+                try engine.replaceAtomically(
+                    edits: meaningfulEdits,
+                    replacing: snapshot,
+                    cancellation: { token.isCancelled }
+                )
+                result = .success(())
+            } catch {
+                result = .failure(error)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.bulkCancellation === token else { return }
+                self.bulkCancellation = nil
+                self.isBulkEditing = false
+                switch result {
+                case .success:
+                    self.finishSuccessfulCSVMutation(
+                        status: meaningfulEdits.count == 1
+                            ? "Updated 1 CSV row"
+                            : "Updated \(meaningfulEdits.count.formatted()) CSV rows"
+                    )
+                    completion(.success(()))
+                case .failure(let error as CancellationError):
+                    _ = error
+                    self.finishCancelledCSVMutation(status: "CSV row update cancelled")
+                    completion(.failure(CancellationError()))
+                case .failure(let error):
+                    self.finishFailedCSVMutation(error)
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    func editorApplyCSVColumnMutation(
+        _ mutation: CSVColumnMutation,
+        snapshot: DocumentSnapshot,
+        index: CSVRowIndex,
+        progress: @escaping (CSVColumnRewriteProgress) -> Void,
+        completion: @escaping (Result<CSVColumnRewriteResult, Error>) -> Void
+    ) {
+        let token: CancellationToken
+        do {
+            token = try beginCSVMutation(status: "Updating CSV column…")
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        let engine = self.engine
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var lastProgressUpdate = CFAbsoluteTimeGetCurrent() - 1
+            let reportProgress: (CSVColumnRewriteProgress) -> Void = { update in
+                let now = CFAbsoluteTimeGetCurrent()
+                guard now - lastProgressUpdate >= 0.10
+                        || update.fractionCompleted >= 1 else { return }
+                lastProgressUpdate = now
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.bulkCancellation === token,
+                          !token.isCancelled else { return }
+                    progress(update)
+                }
+            }
+            let result = Result {
+                try engine.applyCSVColumnMutation(
+                    mutation,
+                    snapshot: snapshot,
+                    index: index,
+                    cancellation: { token.isCancelled },
+                    progress: reportProgress
+                )
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.bulkCancellation === token else { return }
+                self.bulkCancellation = nil
+                self.isBulkEditing = false
+                switch result {
+                case let .success(summary):
+                    if summary.didChange {
+                        self.finishSuccessfulCSVMutation(
+                            status: "Updated \(summary.changedRecordCount.formatted()) CSV rows"
+                        )
+                    } else {
+                        self.callbacks.documentChanged?(self.engine.byteCount, self.isEdited)
+                        self.callbacks.statusChanged?("No CSV values changed", false, false)
+                    }
+                    completion(.success(summary))
+                case .failure(let error):
+                    if error is CancellationError
+                        || (error as? CSVRowIndex.IndexError) == .cancelled {
+                        self.finishCancelledCSVMutation(status: "CSV column update cancelled")
+                        completion(.failure(CancellationError()))
+                    } else {
+                        self.finishFailedCSVMutation(error)
+                        completion(.failure(error))
+                    }
+                }
+            }
+        }
+    }
+
+    func editorCancelCSVMutation() {
+        cancelBulkOperation()
     }
 
     /// Freezes every user mutation while AppKit reviews whether the current
@@ -303,6 +435,9 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate {
         guard !isMutationSuspended else {
             throw LighTxtSessionError.documentNavigationInProgress
         }
+        guard !isBulkEditing else {
+            throw LighTxtSessionError.bulkOperationInProgress
+        }
         guard let match = currentMatch else { return nil }
         searchController.cancel()
         callbacks.searchResultsInvalidated?()
@@ -328,6 +463,10 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate {
     ) {
         guard !isMutationSuspended else {
             completion(.failure(LighTxtSessionError.documentNavigationInProgress))
+            return
+        }
+        guard !isBulkEditing else {
+            completion(.failure(LighTxtSessionError.bulkOperationInProgress))
             return
         }
         guard !searchQuery.isEmpty else {
@@ -434,7 +573,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate {
 
     @discardableResult
     func undo() -> Bool {
-        guard !isMutationSuspended else { return false }
+        guard !isMutationSuspended, !isBulkEditing else { return false }
         guard engine.undo() else { return false }
         invalidateSearchResults()
         lineLookupCancellation?.cancel()
@@ -446,7 +585,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate {
 
     @discardableResult
     func redo() -> Bool {
-        guard !isMutationSuspended else { return false }
+        guard !isMutationSuspended, !isBulkEditing else { return false }
         guard engine.redo() else { return false }
         invalidateSearchResults()
         lineLookupCancellation?.cancel()
@@ -510,10 +649,50 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate {
     func prepareForClose() {
         searchController.cancel()
         bulkCancellation?.cancel()
+        bulkCancellation = nil
+        isBulkEditing = false
         lineIndexWarmupWork?.cancel()
         lineIndexCancellation.cancel()
         lineLookupCancellation?.cancel()
         engine.close()
+    }
+
+    private func beginCSVMutation(status: String) throws -> CancellationToken {
+        guard syntaxFileType == .csv else {
+            throw LighTxtSessionError.csvMutationUnavailable
+        }
+        guard !isMutationSuspended else {
+            throw LighTxtSessionError.documentNavigationInProgress
+        }
+        guard !isBulkEditing else {
+            throw LighTxtSessionError.bulkOperationInProgress
+        }
+        invalidateSearchResults()
+        let token = CancellationToken()
+        bulkCancellation = token
+        isBulkEditing = true
+        callbacks.statusChanged?(status, true, false)
+        // The in-flight flag participates in `isEdited`, ensuring Close/Quit
+        // invokes AppKit's save review while the old root is still visible.
+        callbacks.documentChanged?(engine.byteCount, true)
+        return token
+    }
+
+    private func finishSuccessfulCSVMutation(status: String) {
+        lineLookupCancellation?.cancel()
+        rebuildLineIndexAfterEdit()
+        callbacks.documentChanged?(engine.byteCount, isEdited)
+        callbacks.statusChanged?(status, false, false)
+    }
+
+    private func finishCancelledCSVMutation(status: String) {
+        callbacks.documentChanged?(engine.byteCount, isEdited)
+        callbacks.statusChanged?(status, false, false)
+    }
+
+    private func finishFailedCSVMutation(_ error: Error) {
+        callbacks.documentChanged?(engine.byteCount, isEdited)
+        callbacks.statusChanged?(error.localizedDescription, false, true)
     }
 
     private func invalidateSearchResults() {
@@ -606,15 +785,18 @@ enum LighTxtSessionError: Error, LocalizedError {
     case bulkOperationInProgress
     case saveInProgress
     case documentNavigationInProgress
+    case csvMutationUnavailable
 
     var errorDescription: String? {
         switch self {
         case .bulkOperationInProgress:
-            "Finish or cancel Replace All before editing."
+            "Finish or cancel the current document operation before editing."
         case .saveInProgress:
             "A save is already in progress."
         case .documentNavigationInProgress:
             "Finish switching documents before editing."
+        case .csvMutationUnavailable:
+            "CSV row and column operations are available only for CSV documents."
         }
     }
 }

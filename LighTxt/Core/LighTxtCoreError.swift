@@ -27,6 +27,7 @@ public nonisolated enum LighTxtCoreError: Error, LocalizedError, Equatable {
     case requestedMaterializationTooLarge(requested: Int64, limit: Int64)
     case fileChangedExternally(path: String)
     case documentChangedDuringBulkOperation
+    case overlappingByteEdits(first: Range<Int64>, second: Range<Int64>)
     case overlappingSearchMatches(previousEnd: Int64, next: Range<Int64>)
     case copyDestinationMatchesDocument
     case io(operation: String, path: String, code: Int32)
@@ -65,6 +66,8 @@ public nonisolated enum LighTxtCoreError: Error, LocalizedError, Equatable {
             return "The file at \(path) changed outside LighTxt. Reload it or choose Save As to avoid overwriting those changes."
         case .documentChangedDuringBulkOperation:
             return "The document changed while the bulk operation was running. No bulk result was applied."
+        case let .overlappingByteEdits(first, second):
+            return "Atomic byte edits overlap (\(first) and \(second)). No edits were applied."
         case let .overlappingSearchMatches(previousEnd, next):
             return "Replace All cannot apply overlapping matches (previous end \(previousEnd), next \(next))."
         case .copyDestinationMatchesDocument:

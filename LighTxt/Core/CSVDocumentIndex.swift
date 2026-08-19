@@ -636,14 +636,28 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
                 } else if byte == 0x0A || byte == 0x0D {
                     var completeEnd = position + 1
                     if byte == 0x0D, position + 1 < byteCount {
-                        let next = try reader((position + 1)..<(position + 2))
-                        guard next.count == 1 else {
-                            throw IndexError.invalidReaderResult(
-                                requested: (position + 1)..<(position + 2),
-                                actualByteCount: next.count
-                            )
+                        let nextByte: UInt8
+                        if localOffset + 1 < data.count {
+                            // Dense RFC-4180 files normally use CRLF. The LF is
+                            // already present in this chunk almost every time;
+                            // issuing a separate one-byte snapshot read per row
+                            // turns a linear refinement scan into millions of
+                            // tiny reads on large exports.
+                            nextByte = data[localOffset + 1]
+                        } else {
+                            // Only a CR at the exact chunk boundary needs a
+                            // bounded look-ahead into the next chunk.
+                            let requestedNext = (position + 1)..<(position + 2)
+                            let next = try reader(requestedNext)
+                            guard next.count == 1 else {
+                                throw IndexError.invalidReaderResult(
+                                    requested: requestedNext,
+                                    actualByteCount: next.count
+                                )
+                            }
+                            nextByte = next[0]
                         }
-                        if next[0] == 0x0A { completeEnd += 1 }
+                        if nextByte == 0x0A { completeEnd += 1 }
                     }
                     if requestedRecords.contains(currentRecord) {
                         found.append(RecordLocation(
@@ -764,6 +778,15 @@ public nonisolated struct CSVParsedRecord: Sendable, Equatable {
     public let hadMoreFields: Bool
 }
 
+/// A bounded projection of one record. `fieldCount` always describes the
+/// complete RFC-4180 record, while `fields` contains only the requested
+/// columns. This lets query and transformation code inspect a column near the
+/// end of a very wide row without retaining every preceding value.
+public nonisolated struct CSVSelectedFields: Sendable, Equatable {
+    public let fieldCount: Int
+    public let fields: [Int: CSVFieldValue]
+}
+
 public nonisolated enum CSVRecordParser {
     public struct Limits: Sendable, Equatable {
         public let maximumFields: Int
@@ -788,16 +811,20 @@ public nonisolated enum CSVRecordParser {
         limits: Limits = .init(),
         cancellation: CSVRowIndex.CancellationCheck? = nil
     ) throws -> CSVParsedRecord {
+        let contentRange = try logicalContentRange(
+            snapshot: snapshot,
+            location: location
+        )
         var fields: [CSVFieldValue] = []
         fields.reserveCapacity(min(32, limits.maximumFields))
-        var fieldStart = location.contentRange.lowerBound
+        var fieldStart = contentRange.lowerBound
         var current = Data()
         current.reserveCapacity(min(256, limits.maximumPreviewBytesPerField))
         var truncated = false
         var atFieldStart = true
         var inQuotedField = false
         var pendingQuote = false
-        var absoluteOffset = location.contentRange.lowerBound
+        var absoluteOffset = contentRange.lowerBound
         var hadMoreFields = false
         var retainedPreviewBytes = 0
 
@@ -829,7 +856,7 @@ public nonisolated enum CSVRecordParser {
             pendingQuote = false
         }
 
-        try snapshot.forEachByteSlice(in: location.contentRange) { bytes in
+        try snapshot.forEachByteSlice(in: contentRange) { bytes in
             if cancellation?() == true { throw CancellationError() }
             for (localOffset, byte) in bytes.enumerated() {
                 if localOffset.isMultiple(of: 16_384), cancellation?() == true {
@@ -868,8 +895,131 @@ public nonisolated enum CSVRecordParser {
                 absoluteOffset += 1
             }
         }
-        finishField(at: location.contentRange.upperBound)
+        finishField(at: contentRange.upperBound)
         return CSVParsedRecord(fields: fields, hadMoreFields: hadMoreFields)
+    }
+
+    /// Parses only selected logical fields while still scanning the complete
+    /// record for exact field coordinates and RFC-4180 quoting. Retained value
+    /// bytes are independently capped per field and in aggregate. Callers that
+    /// require exact comparisons must reject `wasTruncated` rather than treating
+    /// a preview as a complete value.
+    public static func selectedFields(
+        snapshot: DocumentSnapshot,
+        location: CSVRowIndex.RecordLocation,
+        columns requestedColumns: Set<Int>,
+        delimiter: UInt8 = 0x2C,
+        maximumValueBytesPerField: Int = 1 << 20,
+        maximumRetainedValueBytes: Int = 4 << 20,
+        cancellation: CSVRowIndex.CancellationCheck? = nil
+    ) throws -> CSVSelectedFields {
+        let contentRange = try logicalContentRange(
+            snapshot: snapshot,
+            location: location
+        )
+        let columns = Set(requestedColumns.filter { $0 >= 0 })
+        let perFieldLimit = max(0, maximumValueBytesPerField)
+        let aggregateLimit = max(0, maximumRetainedValueBytes)
+        var selected: [Int: CSVFieldValue] = [:]
+        selected.reserveCapacity(columns.count)
+        var fieldIndex = 0
+        var fieldStart = contentRange.lowerBound
+        var current = Data()
+        current.reserveCapacity(min(256, perFieldLimit))
+        var truncated = false
+        var retainedBytes = 0
+        var retainsCurrentField = columns.contains(0)
+        var atFieldStart = true
+        var inQuotedField = false
+        var pendingQuote = false
+        var absoluteOffset = contentRange.lowerBound
+
+        func appendValueByte(_ byte: UInt8) {
+            guard retainsCurrentField else { return }
+            if current.count < perFieldLimit, retainedBytes < aggregateLimit {
+                current.append(byte)
+                retainedBytes += 1
+            } else {
+                truncated = true
+            }
+        }
+
+        func finishField(at end: Int64) {
+            if retainsCurrentField {
+                selected[fieldIndex] = CSVFieldValue(
+                    byteRange: fieldStart..<end,
+                    value: String(decoding: current, as: UTF8.self),
+                    wasTruncated: truncated
+                )
+            }
+            fieldIndex += 1
+            retainsCurrentField = columns.contains(fieldIndex)
+            current.removeAll(keepingCapacity: true)
+            truncated = false
+            fieldStart = end + 1
+            atFieldStart = true
+            inQuotedField = false
+            pendingQuote = false
+        }
+
+        try snapshot.forEachByteSlice(in: contentRange) { bytes in
+            if cancellation?() == true { throw CancellationError() }
+            for (localOffset, byte) in bytes.enumerated() {
+                if localOffset.isMultiple(of: 16_384), cancellation?() == true {
+                    throw CancellationError()
+                }
+                if inQuotedField {
+                    if pendingQuote {
+                        if byte == 0x22 {
+                            appendValueByte(0x22)
+                            pendingQuote = false
+                            absoluteOffset += 1
+                            continue
+                        }
+                        inQuotedField = false
+                        pendingQuote = false
+                    } else if byte == 0x22 {
+                        pendingQuote = true
+                        absoluteOffset += 1
+                        continue
+                    } else {
+                        appendValueByte(byte)
+                        absoluteOffset += 1
+                        continue
+                    }
+                }
+
+                if atFieldStart, byte == 0x22 {
+                    inQuotedField = true
+                    atFieldStart = false
+                } else if byte == delimiter {
+                    finishField(at: absoluteOffset)
+                } else {
+                    appendValueByte(byte)
+                    atFieldStart = false
+                }
+                absoluteOffset += 1
+            }
+        }
+        finishField(at: contentRange.upperBound)
+        return CSVSelectedFields(fieldCount: fieldIndex, fields: selected)
+    }
+
+    /// UTF-8 BOM bytes describe the file encoding and are not part of the
+    /// first logical CSV value. Keep their raw bytes outside the editable
+    /// field range so header detection and cell replacement both preserve the
+    /// marker used by Excel-style exports.
+    private static func logicalContentRange(
+        snapshot: DocumentSnapshot,
+        location: CSVRowIndex.RecordLocation
+    ) throws -> Range<Int64> {
+        guard location.record == 0,
+              location.contentRange.lowerBound == 0,
+              location.contentRange.upperBound >= 3,
+              try snapshot.data(in: 0..<3) == Data([0xEF, 0xBB, 0xBF]) else {
+            return location.contentRange
+        }
+        return 3..<location.contentRange.upperBound
     }
 
     /// Encodes one logical value as a standards-compliant CSV field. Replacing
@@ -891,6 +1041,18 @@ public nonisolated enum CSVRecordParser {
             encoded.append(byte)
         }
         encoded.append(0x22)
+        return encoded
+    }
+
+    public static func encodedRecord(
+        _ values: [String],
+        delimiter: UInt8 = 0x2C
+    ) -> Data {
+        var encoded = Data()
+        for (index, value) in values.enumerated() {
+            if index > 0 { encoded.append(delimiter) }
+            encoded.append(encodedField(value, delimiter: delimiter))
+        }
         return encoded
     }
 }

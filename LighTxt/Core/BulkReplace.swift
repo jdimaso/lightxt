@@ -190,7 +190,11 @@ extension FileBackedPieceTable {
 
         let rewrittenMapping = try output.finishAndMap()
         if cancellation?.isCancelled == true { throw CancellationError() }
-        try installBulkRewrite(rewrittenMapping, replacing: captured)
+        try installBulkRewrite(
+            rewrittenMapping,
+            replacing: captured,
+            cancellation: { cancellation?.isCancelled == true }
+        )
         report(captured.byteCount)
         return BulkReplaceResult(
             replacementCount: replacementCount,

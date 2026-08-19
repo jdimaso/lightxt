@@ -300,6 +300,476 @@ final class CSVDocumentIndexTests: XCTestCase {
         XCTAssertLessThan(cancellation.checkCount, 20)
     }
 
+    func testSelectedFieldsPreserveRFC4180CoordinatesWithoutRetainingOtherColumns() throws {
+        let source = Data("skip,\"hello,\n\"\"world\"\"\",tail\r\n".utf8)
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(source, at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: snapshot)
+        let location = try XCTUnwrap(index.recordLocation(forRecord: 0))
+
+        let selected = try CSVRecordParser.selectedFields(
+            snapshot: snapshot,
+            location: location,
+            columns: [1],
+            maximumValueBytesPerField: 128,
+            maximumRetainedValueBytes: 128
+        )
+
+        XCTAssertEqual(selected.fieldCount, 3)
+        XCTAssertEqual(selected.fields.keys.sorted(), [1])
+        XCTAssertEqual(selected.fields[1]?.value, "hello,\n\"world\"")
+        XCTAssertEqual(
+            try snapshot.utf8String(in: XCTUnwrap(selected.fields[1]?.byteRange)),
+            "\"hello,\n\"\"world\"\"\""
+        )
+        XCTAssertFalse(try XCTUnwrap(selected.fields[1]).wasTruncated)
+    }
+
+    func testFilteredRowMapComposesColumnPredicatesAndSkipsHeader() throws {
+        let text = "id,name,amount\r\n"
+            + "1,Alice,10\r\n"
+            + "2,ALICIA,20\r\n"
+            + "3,Bob,30\r\n"
+            + "4,,40\r\n"
+        let source = Data(text.utf8)
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(source, at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: snapshot)
+
+        let result = try CSVRowQueryEngine.execute(
+            snapshot: snapshot,
+            index: index,
+            query: CSVRowQuery(firstRecord: 1, filters: [
+                CSVColumnFilter(
+                    column: 1,
+                    predicate: .beginsWith("ali", caseSensitive: false)
+                ),
+                CSVColumnFilter(
+                    column: 2,
+                    predicate: .numeric(.greaterThanOrEqual, 20)
+                ),
+            ])
+        )
+
+        XCTAssertEqual(result.rowCount, 1)
+        XCTAssertEqual(try result.record(at: 0), 2)
+        XCTAssertEqual(try result.records(in: 0..<20), [2])
+        result.close()
+        XCTAssertThrowsError(try result.record(at: 0)) { error in
+            XCTAssertEqual(error as? CSVDataOperationError, .rowMapClosed)
+        }
+    }
+
+    func testExactFilterRejectsTruncatedQueryValue() throws {
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(Data("value\nabcdefghij\n".utf8), at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: snapshot)
+
+        XCTAssertThrowsError(
+            try CSVRowQueryEngine.execute(
+                snapshot: snapshot,
+                index: index,
+                query: CSVRowQuery(firstRecord: 1, filters: [
+                    CSVColumnFilter(
+                        column: 0,
+                        predicate: .contains("j", caseSensitive: true)
+                    ),
+                ]),
+                configuration: .init(
+                    pageRecordCount: 1,
+                    maximumValueBytesPerField: 4,
+                    maximumRetainedValueBytesPerRecord: 4
+                )
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? CSVDataOperationError,
+                .queryValueTooLarge(record: 1, column: 0, limit: 4)
+            )
+        }
+    }
+
+    func testColumnProfileIsBoundedAndReportsKindsTopValuesAndNumericStats() throws {
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(Data("value\n10\n20\n20\ntext\n\n".utf8), at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: snapshot)
+
+        let profile = try CSVColumnProfiler.profile(
+            snapshot: snapshot,
+            index: index,
+            column: 0,
+            firstRecord: 1,
+            configuration: .init(maximumRecords: 100, topValueCapacity: 4)
+        )
+
+        XCTAssertEqual(profile.sampledRecordCount, 5)
+        XCTAssertTrue(profile.isCompleteDataset)
+        XCTAssertEqual(profile.samplingStrategy, .complete)
+        XCTAssertEqual(profile.emptyValueCount, 1)
+        XCTAssertEqual(profile.integerValueCount, 3)
+        XCTAssertEqual(profile.textValueCount, 1)
+        XCTAssertEqual(profile.inferredKind, .mixed)
+        XCTAssertEqual(profile.minimumNumericValue, 10)
+        XCTAssertEqual(profile.maximumNumericValue, 20)
+        XCTAssertEqual(
+            try XCTUnwrap(profile.meanNumericValue),
+            50.0 / 3.0,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(profile.topValues.first?.value, "20")
+        XCTAssertEqual(profile.topValues.first?.estimatedCount, 2)
+        XCTAssertGreaterThanOrEqual(profile.approximateDistinctValueCount, 3)
+    }
+
+    func testCompletedLargeProfileUsesDeterministicStrataAcrossWholeDataset() throws {
+        var source = Data("value\n".utf8)
+        for record in 0..<1_000 {
+            let value: String
+            if record < 400 { value = "head" }
+            else if record < 600 { value = "middle" }
+            else { value = "tail" }
+            source.append(Data("\(value)\n".utf8))
+        }
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(source, at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: snapshot)
+        _ = try index.scanToEnd()
+
+        let profile = try CSVColumnProfiler.profile(
+            snapshot: snapshot,
+            index: index,
+            column: 0,
+            firstRecord: 1,
+            configuration: .init(
+                maximumRecords: 30,
+                topValueCapacity: 6
+            )
+        )
+
+        XCTAssertEqual(profile.samplingStrategy, .stratified)
+        XCTAssertFalse(profile.isCompleteDataset)
+        XCTAssertEqual(profile.sampledRecordCount, 30)
+        XCTAssertEqual(profile.totalRecordCount, 1_001)
+        XCTAssertEqual(Set(profile.topValues.map(\.value)), ["head", "middle", "tail"])
+    }
+
+    func testProfileApproximateDistinctCountHasReasonableAccuracy() throws {
+        var source = Data("value\n".utf8)
+        for record in 0..<1_000 { source.append(Data("unique-\(record)\n".utf8)) }
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(source, at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: snapshot)
+        let profile = try CSVColumnProfiler.profile(
+            snapshot: snapshot,
+            index: index,
+            column: 0,
+            firstRecord: 1,
+            configuration: .init(maximumRecords: 2_000)
+        )
+        XCTAssertTrue(
+            700...1_300 ~= profile.approximateDistinctValueCount,
+            "estimate=\(profile.approximateDistinctValueCount)"
+        )
+    }
+
+    func testFilteringCancellationDoesNotPublishAPartialRowMap() throws {
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(Data(String(repeating: "a,b\n", count: 10_000).utf8), at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: snapshot)
+        let cancellation = CancellationProbe(cancelAfterChecks: 8)
+
+        XCTAssertThrowsError(
+            try CSVRowQueryEngine.execute(
+                snapshot: snapshot,
+                index: index,
+                query: CSVRowQuery(filters: [
+                    CSVColumnFilter(column: 0, predicate: .equals("a", caseSensitive: true)),
+                ]),
+                configuration: .init(pageRecordCount: 512),
+                cancellation: { cancellation.shouldCancel() }
+            )
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+
+    func testAutomaticSortHasDeterministicStableTotalOrderAndEmptyValuesLast() throws {
+        let text = "value\n\n10\n2\napple2\nApple10\n2.0\nbanana\n"
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(Data(text.utf8), at: 0)
+        let snapshot = try engine.snapshot()
+
+        func sorted(_ order: CSVSortOrder) throws -> [Int64] {
+            let index = try CSVRowIndex(snapshot: snapshot)
+            let map = try CSVRowQueryEngine.execute(
+                snapshot: snapshot,
+                index: index,
+                query: CSVRowQuery(
+                    firstRecord: 1,
+                    sortDescriptors: [CSVSortDescriptor(column: 0, order: order)]
+                )
+            )
+            return try map.records(in: 0..<map.rowCount)
+        }
+
+        // 2 and 2.0 compare numerically equal and retain source order. Text is
+        // numeric-aware/case-insensitive, and empty remains last both ways.
+        XCTAssertEqual(try sorted(.ascending), [3, 6, 2, 4, 5, 7, 1])
+        XCTAssertEqual(try sorted(.descending), [7, 5, 4, 2, 3, 6, 1])
+    }
+
+    func testExternalMergeSortPersistsKeysAndDoesNotRereadSourceRows() throws {
+        var source = Data("value\n".utf8)
+        for value in stride(from: 4_999, through: 0, by: -1) {
+            source.append(Data("\(value)\n".utf8))
+        }
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(source, at: 0)
+        let snapshot = try engine.snapshot()
+
+        func execute(sorted: Bool) throws -> (CSVRowMap, Int) {
+            let recorder = MaximumReadRecorder()
+            let index = try CSVRowIndex(
+                byteCount: snapshot.byteCount,
+                configuration: .init(
+                    readChunkByteCount: 257,
+                    initialCheckpointRecordInterval: 16,
+                    maximumCheckpointCount: 1_024,
+                    allowsAcceleratedScanner: false
+                ),
+                reader: { range in
+                    recorder.observe(Int64(range.count))
+                    return try snapshot.data(in: range)
+                }
+            )
+            let map = try CSVRowQueryEngine.execute(
+                snapshot: snapshot,
+                index: index,
+                query: CSVRowQuery(
+                    firstRecord: 1,
+                    sortDescriptors: sorted ? [CSVSortDescriptor(column: 0)] : []
+                ),
+                configuration: .init(
+                    pageRecordCount: 128,
+                    sortRunMemoryByteCount: 64 << 10,
+                    mergeFanIn: 3
+                )
+            )
+            return (map, recorder.readCount)
+        }
+
+        let baseline = try execute(sorted: false)
+        let sorted = try execute(sorted: true)
+        XCTAssertEqual(sorted.0.rowCount, 5_000)
+        XCTAssertEqual(try sorted.0.record(at: 0), 5_000)
+        XCTAssertEqual(try sorted.0.record(at: 4_999), 1)
+        XCTAssertEqual(
+            sorted.1,
+            baseline.1,
+            "External merge passes must consume persisted keys, not sparse source rescans"
+        )
+    }
+
+    func testRowMutationPlannerPreservesCRLFQuotedNewlinesAndTerminalEmptyRecord() throws {
+        let original = "id,note\r\n1,\"a\r\nb\"\r\n\r\n"
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(Data(original.utf8), at: 0)
+        let before = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: before)
+
+        let insertion = try CSVRowMutationPlanner.insert(
+            values: ["2", "x,y"],
+            beforeRecord: 2,
+            snapshot: before,
+            index: index
+        )
+        try engine.replaceAtomically(edits: [insertion], replacing: before)
+        var snapshot = try engine.snapshot()
+        XCTAssertEqual(
+            try snapshot.utf8String(in: 0..<snapshot.byteCount),
+            "id,note\r\n1,\"a\r\nb\"\r\n2,\"x,y\"\r\n\r\n"
+        )
+
+        let updatedIndex = try CSVRowIndex(snapshot: snapshot)
+        let deletion = try CSVRowMutationPlanner.delete(
+            record: 3,
+            snapshot: snapshot,
+            index: updatedIndex
+        )
+        try engine.replaceAtomically(edits: [deletion], replacing: snapshot)
+        snapshot = try engine.snapshot()
+        XCTAssertEqual(
+            try snapshot.utf8String(in: 0..<snapshot.byteCount),
+            "id,note\r\n1,\"a\r\nb\"\r\n2,\"x,y\"\r\n"
+        )
+    }
+
+    func testStreamedColumnInsertDeleteIsOneUndoAndPreservesUntouchedBytes() throws {
+        let original = "id,name\r\n1,\"A,lice\"\r\n2\r\n,\r\n"
+        let inserted = "id,score,name\r\n1,,\"A,lice\"\r\n2,\r\n,,\r\n"
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(Data(original.utf8), at: 0)
+        // Make the fixture the saved-like baseline for this focused undo test.
+        let before = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: before)
+
+        let result = try engine.applyCSVColumnMutation(
+            .insert(CSVColumnInsertion(
+                column: 1,
+                headerRecord: 0,
+                headerValue: "score"
+            )),
+            snapshot: before,
+            index: index
+        )
+        XCTAssertEqual(result.changedRecordCount, 4)
+        var snapshot = try engine.snapshot()
+        XCTAssertEqual(try snapshot.utf8String(in: 0..<snapshot.byteCount), inserted)
+        XCTAssertTrue(engine.undo())
+        snapshot = try engine.snapshot()
+        XCTAssertEqual(try snapshot.utf8String(in: 0..<snapshot.byteCount), original)
+        XCTAssertTrue(engine.redo())
+        snapshot = try engine.snapshot()
+        XCTAssertEqual(try snapshot.utf8String(in: 0..<snapshot.byteCount), inserted)
+
+        let insertedIndex = try CSVRowIndex(snapshot: snapshot)
+        let deletion = try engine.applyCSVColumnMutation(
+            .delete(column: 1),
+            snapshot: snapshot,
+            index: insertedIndex
+        )
+        XCTAssertEqual(deletion.changedRecordCount, 4)
+        snapshot = try engine.snapshot()
+        XCTAssertEqual(try snapshot.utf8String(in: 0..<snapshot.byteCount), original)
+    }
+
+    func testFirstColumnMutationsPreserveUTF8BOMThroughUndoRedoAndSave() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "LighTxt-CSV-BOM-QA-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("excel-export.csv")
+        let bom = Data([0xEF, 0xBB, 0xBF])
+        let original = bom + Data("name,age\r\nAlice,30\r\n".utf8)
+        try original.write(to: url)
+
+        let engine = try FileBackedPieceTable(opening: url)
+        var snapshot = try engine.snapshot()
+        var index = try CSVRowIndex(snapshot: snapshot)
+        let headerLocation = try XCTUnwrap(index.recordLocation(forRecord: 0))
+        let dataLocation = try XCTUnwrap(index.recordLocation(forRecord: 1))
+        let header = try CSVRecordParser.parse(snapshot: snapshot, location: headerLocation)
+        let firstData = try CSVRecordParser.parse(snapshot: snapshot, location: dataLocation)
+        XCTAssertEqual(header.fields.map(\.value), ["name", "age"])
+        XCTAssertEqual(header.fields.first?.byteRange, 3..<7)
+        XCTAssertTrue(CSVHeaderDetector.isLikelyHeader(first: header, second: firstData))
+
+        // A normal View-mode cell replacement uses this exact byte range. It
+        // must begin after the BOM and leave the marker at byte zero.
+        try engine.replace(
+            byteRange: try XCTUnwrap(header.fields.first?.byteRange),
+            with: CSVRecordParser.encodedField("full_name")
+        )
+        snapshot = try engine.snapshot()
+        XCTAssertEqual(
+            try snapshot.data(in: 0..<snapshot.byteCount),
+            bom + Data("full_name,age\r\nAlice,30\r\n".utf8)
+        )
+        XCTAssertTrue(engine.undo())
+        snapshot = try engine.snapshot()
+        index = try CSVRowIndex(snapshot: snapshot)
+
+        _ = try engine.applyCSVColumnMutation(
+            .insert(CSVColumnInsertion(
+                column: 0,
+                headerRecord: 0,
+                headerValue: "id"
+            )),
+            snapshot: snapshot,
+            index: index
+        )
+        let inserted = bom + Data("id,name,age\r\n,Alice,30\r\n".utf8)
+        snapshot = try engine.snapshot()
+        XCTAssertEqual(try snapshot.data(in: 0..<snapshot.byteCount), inserted)
+
+        XCTAssertTrue(engine.undo())
+        snapshot = try engine.snapshot()
+        XCTAssertEqual(try snapshot.data(in: 0..<snapshot.byteCount), original)
+
+        index = try CSVRowIndex(snapshot: snapshot)
+        _ = try engine.applyCSVColumnMutation(
+            .delete(column: 0),
+            snapshot: snapshot,
+            index: index
+        )
+        let deleted = bom + Data("age\r\n30\r\n".utf8)
+        snapshot = try engine.snapshot()
+        XCTAssertEqual(try snapshot.data(in: 0..<snapshot.byteCount), deleted)
+        XCTAssertTrue(engine.undo())
+        XCTAssertTrue(engine.redo())
+        try engine.save()
+        XCTAssertFalse(engine.hasUnsavedChanges)
+        XCTAssertEqual(try Data(contentsOf: url), deleted)
+    }
+
+    func testFirstRowInsertAndDeleteKeepUTF8BOMAtFileStart() throws {
+        let bom = Data([0xEF, 0xBB, 0xBF])
+        let original = bom + Data("first,1\r\nsecond,2\r\n".utf8)
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(original, at: 0)
+        var snapshot = try engine.snapshot()
+        var index = try CSVRowIndex(snapshot: snapshot)
+
+        let insertion = try CSVRowMutationPlanner.insert(
+            values: ["new", "0"],
+            beforeRecord: 0,
+            snapshot: snapshot,
+            index: index
+        )
+        try engine.replaceAtomically(edits: [insertion], replacing: snapshot)
+        var expected = bom + Data("new,0\r\nfirst,1\r\nsecond,2\r\n".utf8)
+        snapshot = try engine.snapshot()
+        XCTAssertEqual(try snapshot.data(in: 0..<snapshot.byteCount), expected)
+
+        XCTAssertTrue(engine.undo())
+        snapshot = try engine.snapshot()
+        index = try CSVRowIndex(snapshot: snapshot)
+        let deletion = try CSVRowMutationPlanner.delete(
+            record: 0,
+            snapshot: snapshot,
+            index: index
+        )
+        try engine.replaceAtomically(edits: [deletion], replacing: snapshot)
+        expected = bom + Data("second,2\r\n".utf8)
+        snapshot = try engine.snapshot()
+        XCTAssertEqual(try snapshot.data(in: 0..<snapshot.byteCount), expected)
+    }
+
+    func testDeletingMissingColumnLeavesRaggedRowByteIdentical() throws {
+        let original = "a,b\n1,2\nragged\n"
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(Data(original.utf8), at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: snapshot)
+        let result = try engine.applyCSVColumnMutation(
+            .delete(column: 1),
+            snapshot: snapshot,
+            index: index
+        )
+        XCTAssertEqual(result.changedRecordCount, 2)
+        let after = try engine.snapshot()
+        XCTAssertEqual(try after.utf8String(in: 0..<after.byteCount), "a\n1\nragged\n")
+    }
+
     func testRealLargeCSVIndexReleaseQAWhenRequested() throws {
         guard let path = ProcessInfo.processInfo.environment["LIGHTXT_CSV_TARGET"],
               !path.isEmpty else {
@@ -416,6 +886,7 @@ final class CSVDocumentIndexTests: XCTestCase {
 private final class MaximumReadRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var storedMaximum: Int64 = 0
+    private var storedReadCount = 0
 
     var maximum: Int64 {
         lock.lock()
@@ -423,9 +894,16 @@ private final class MaximumReadRecorder: @unchecked Sendable {
         return storedMaximum
     }
 
+    var readCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedReadCount
+    }
+
     func observe(_ count: Int64) {
         lock.lock()
         storedMaximum = max(storedMaximum, count)
+        storedReadCount += 1
         lock.unlock()
     }
 }
