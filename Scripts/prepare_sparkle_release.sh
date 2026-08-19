@@ -66,7 +66,11 @@ SIGN_UPDATE="$SPARKLE_BIN/sign_update"
 "$GENERATE_KEYS" --account "$KEYCHAIN_ACCOUNT" -p >/dev/null
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
-codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -q "Authority=Developer ID Application:"
+CODESIGN_DETAILS="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1)"
+[[ "$CODESIGN_DETAILS" == *"Authority=Developer ID Application:"* ]] || {
+    print -u2 "The app is not signed with a Developer ID Application certificate."
+    exit 65
+}
 xcrun stapler validate "$APP_PATH"
 spctl --assess --type execute --verbose=2 "$APP_PATH"
 
