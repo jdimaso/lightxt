@@ -111,6 +111,7 @@ cp "$REPOSITORY_ROOT/appcast.xml" "$OUTPUT_DIR/appcast.xml"
     --download-url-prefix "https://github.com/$REPOSITORY/releases/download/v$SHORT_VERSION/" \
     --link "https://github.com/$REPOSITORY" \
     --embed-release-notes \
+    --maximum-versions 0 \
     --maximum-deltas 0 \
     "$OUTPUT_DIR"
 
