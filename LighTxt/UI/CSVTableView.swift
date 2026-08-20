@@ -60,39 +60,20 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     private let controls = NSView()
     private let headerCheckbox = NSButton(checkboxWithTitle: "First row is header", target: nil, action: nil)
-    private lazy var addButton = QuietButton(
-        title: "Add",
-        symbolName: "plus",
-        minimumHeight: 28,
-        target: self,
-        action: #selector(showAddMenu(_:))
-    )
-    private lazy var deleteButton = QuietButton(
-        title: "Delete",
-        symbolName: "minus",
-        minimumHeight: 28,
-        target: self,
-        action: #selector(showDeleteMenu(_:))
-    )
     private lazy var clearFiltersButton = QuietButton(
         title: "Clear Filters",
-        symbolName: "line.3.horizontal.decrease.circle.fill",
+        symbolName: "xmark.circle",
         minimumHeight: 28,
         target: self,
         action: #selector(clearAllFilters(_:))
     )
-    private lazy var actionButtons: NSStackView = {
-        let stack = NSStackView(views: [addButton, deleteButton, clearFiltersButton])
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 6
-        stack.detachesHiddenViews = true
-        return stack
-    }()
+    private let filterStripScrollView = NSScrollView()
+    private let filterChipContainer = NSView()
+    private var filterStripWidthConstraint: NSLayoutConstraint?
     private let statusLabel = NSTextField(labelWithString: "Preparing table…")
     private let progressIndicator = NSProgressIndicator()
     private let scrollView = NSScrollView()
-    private let tableView = NSTableView()
+    private let tableView = LighTxtCSVTableView()
 
     private var snapshot: DocumentSnapshot?
     private var rowIndex: CSVRowIndex?
@@ -125,10 +106,21 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     private var isEditingRegistered = false
     private var focusedDataColumn = 0
     private var activeFilters: [Int: CSVFilterDraft] = [:]
+    private enum PopoverAnchor: Equatable {
+        case tableHeader(column: Int)
+        case filterChip(column: Int)
+    }
     private var presentedPopover: NSPopover?
+    private var presentedPopoverAnchor: PopoverAnchor?
+    private var uniqueValuesTask: Task<Void, Never>?
+    private var pendingFilterQuery: DispatchWorkItem?
     private var activeSort: (column: Int, ascending: Bool)?
     private var isTableOperationInFlight = false
     private var isSettingSortDescriptors = false
+#if LIGHTXT_STANDALONE_CSV_QA
+    private var qaQueryLaunchCountStorage = 0
+    private var qaNextColumnName: String?
+#endif
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -146,6 +138,8 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         queryCancellation?.cancel()
         summaryCancellation?.cancel()
         mutationCancellation?.cancel()
+        uniqueValuesTask?.cancel()
+        pendingFilterQuery?.cancel()
         displayedRowMap?.close()
     }
 
@@ -156,8 +150,12 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         cancelQueryAndCloseRowMap()
         cancelColumnSummaryRequest()
         cancelCSVMutation()
+        cancelUniqueValueRequest()
+        pendingFilterQuery?.cancel()
+        pendingFilterQuery = nil
         presentedPopover?.close()
         presentedPopover = nil
+        presentedPopoverAnchor = nil
         let cancellation = CancellationToken()
         indexingCancellation = cancellation
         cachedRecords.removeAll(keepingCapacity: true)
@@ -203,8 +201,12 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         cancelQueryAndCloseRowMap()
         cancelColumnSummaryRequest()
         cancelCSVMutation()
+        cancelUniqueValueRequest()
+        pendingFilterQuery?.cancel()
+        pendingFilterQuery = nil
         presentedPopover?.close()
         presentedPopover = nil
+        presentedPopoverAnchor = nil
         rowIndex = nil
         snapshot = nil
         latestProgress = nil
@@ -306,13 +308,18 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         headerCheckbox.font = .systemFont(ofSize: 13)
         headerCheckbox.setAccessibilityHelp("Keep the first CSV row fixed as column headings")
 
-        addButton.toolTip = "Add a row or column"
-        addButton.setAccessibilityLabel("Add CSV row or column")
-        deleteButton.toolTip = "Delete the selected rows or current column"
-        deleteButton.setAccessibilityLabel("Delete CSV row or column")
         clearFiltersButton.toolTip = "Remove every CSV column filter"
         clearFiltersButton.setAccessibilityLabel("Clear all CSV filters")
-        clearFiltersButton.isHidden = true
+
+        filterStripScrollView.documentView = filterChipContainer
+        filterStripScrollView.drawsBackground = false
+        filterStripScrollView.borderType = .noBorder
+        filterStripScrollView.hasHorizontalScroller = false
+        filterStripScrollView.hasVerticalScroller = false
+        filterStripScrollView.autohidesScrollers = true
+        filterStripScrollView.horizontalScrollElasticity = .allowed
+        filterStripScrollView.setAccessibilityLabel("Active CSV filters")
+        filterChipContainer.frame = NSRect(x: 0, y: 0, width: 1, height: 30)
 
         statusLabel.font = .systemFont(ofSize: 12)
         statusLabel.lineBreakMode = .byTruncatingMiddle
@@ -342,12 +349,31 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         headerView.menuProvider = { [weak self] tableColumn in
             self?.columnMenu(forTableColumn: tableColumn)
         }
+        headerView.onCommitContainsFilter = { [weak self] column, value in
+            self?.commitInlineContainsFilter(column: column, value: value)
+        }
+        headerView.onShowFilterValues = { [weak self] column in
+            self?.showColumnFilter(column: column)
+        }
+        headerView.filterTextProvider = { [weak self] column in
+            self?.activeFilters[column]?.value ?? ""
+        }
+        headerView.filterEditingEnabledProvider = { [weak self] in
+            guard let self else { return false }
+            return self.latestProgress?.isComplete == true && self.mutationCancellation == nil
+        }
+        headerView.frame.size.height = 54
         tableView.headerView = headerView
+        tableView.bodyMenuProvider = { [weak self] tableColumn, row in
+            self?.rowMenu(forTableColumn: tableColumn, row: row)
+        }
         tableView.setAccessibilityLabel("CSV table")
 
         let rowNumber = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("row-number"))
         rowNumber.title = "#"
-        rowNumber.headerCell = LighTxtCSVHeaderCell(textCell: "#")
+        let rowHeader = LighTxtCSVHeaderCell(textCell: "#")
+        rowHeader.showsFilterControls = false
+        rowNumber.headerCell = rowHeader
         rowNumber.width = 62
         rowNumber.minWidth = 48
         rowNumber.maxWidth = 100
@@ -367,10 +393,18 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             $0.translatesAutoresizingMaskIntoConstraints = false
             addSubview($0)
         }
-        [headerCheckbox, actionButtons, statusLabel, progressIndicator].forEach {
+        [headerCheckbox, filterStripScrollView, statusLabel, progressIndicator].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             controls.addSubview($0)
         }
+
+        let stripWidth = filterStripScrollView.widthAnchor.constraint(equalToConstant: 0)
+        stripWidth.priority = .defaultHigh
+        filterStripWidthConstraint = stripWidth
+        filterStripScrollView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let progressWidth = progressIndicator.widthAnchor.constraint(equalToConstant: 150)
+        progressWidth.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
             controls.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -380,14 +414,17 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
             headerCheckbox.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 16),
             headerCheckbox.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
-            actionButtons.leadingAnchor.constraint(equalTo: headerCheckbox.trailingAnchor, constant: 14),
-            actionButtons.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
-            statusLabel.leadingAnchor.constraint(equalTo: actionButtons.trailingAnchor, constant: 14),
+            filterStripScrollView.leadingAnchor.constraint(equalTo: headerCheckbox.trailingAnchor, constant: 12),
+            filterStripScrollView.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
+            filterStripScrollView.heightAnchor.constraint(equalToConstant: 32),
+            stripWidth,
+            statusLabel.leadingAnchor.constraint(equalTo: filterStripScrollView.trailingAnchor, constant: 12),
             statusLabel.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
             statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: progressIndicator.leadingAnchor, constant: -14),
             progressIndicator.trailingAnchor.constraint(equalTo: controls.trailingAnchor, constant: -18),
             progressIndicator.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
-            progressIndicator.widthAnchor.constraint(equalToConstant: 150),
+            progressIndicator.widthAnchor.constraint(greaterThanOrEqualToConstant: 80),
+            progressWidth,
 
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -597,6 +634,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             tableColumn.title = columnTitle(column, header: header)
             let headerCell = LighTxtCSVHeaderCell(textCell: tableColumn.title)
             headerCell.isFiltered = activeFilters[column] != nil
+            headerCell.filterText = activeFilters[column]?.value ?? ""
             tableColumn.headerCell = headerCell
             tableColumn.sortDescriptorPrototype = NSSortDescriptor(
                 key: tableColumn.identifier.rawValue,
@@ -618,9 +656,12 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     private func updateColumnTitles(from header: CSVParsedRecord?) {
         for column in 0..<columnCount {
-            tableView.tableColumns[column + 1].title = columnTitle(column, header: header)
-            (tableView.tableColumns[column + 1].headerCell as? LighTxtCSVHeaderCell)?.isFiltered =
-                activeFilters[column] != nil
+            guard let tableColumn = tableColumn(forDataColumn: column) else { continue }
+            tableColumn.title = columnTitle(column, header: header)
+            if let headerCell = tableColumn.headerCell as? LighTxtCSVHeaderCell {
+                headerCell.isFiltered = activeFilters[column] != nil
+                headerCell.filterText = activeFilters[column]?.value ?? ""
+            }
         }
         applyColumnHeaderAppearance()
     }
@@ -657,7 +698,38 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     private func removeDataColumns() {
-        for column in tableView.tableColumns.dropFirst() { tableView.removeTableColumn(column) }
+        for column in tableView.tableColumns where column.identifier.rawValue != "row-number" {
+            tableView.removeTableColumn(column)
+        }
+    }
+
+    /// Dataset operations always use the immutable source-column identifier,
+    /// never the user's current visual order. This keeps filters and mutation
+    /// menus attached to the same bytes after drag-reordering columns.
+    private func dataColumn(forTableColumnIndex tableColumnIndex: Int) -> Int? {
+        guard let tableColumn = tableView.tableColumns[safe: tableColumnIndex] else { return nil }
+        return dataColumn(for: tableColumn)
+    }
+
+    private func dataColumn(for tableColumn: NSTableColumn) -> Int? {
+        let raw = tableColumn.identifier.rawValue
+        guard raw.hasPrefix("csv-column-"),
+              let column = Int(raw.dropFirst("csv-column-".count)),
+              column >= 0,
+              column < columnCount else { return nil }
+        return column
+    }
+
+    private func tableColumn(forDataColumn column: Int) -> NSTableColumn? {
+        tableView.tableColumns.first {
+            $0.identifier.rawValue == "csv-column-\(column)"
+        }
+    }
+
+    private func tableColumnIndex(forDataColumn column: Int) -> Int? {
+        guard let tableColumn = tableColumn(forDataColumn: column) else { return nil }
+        let index = tableView.column(withIdentifier: tableColumn.identifier)
+        return index >= 0 ? index : nil
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -720,8 +792,8 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
-        guard tableView.clickedColumn > 0 else { return }
-        focusedDataColumn = tableView.clickedColumn - 1
+        guard let column = dataColumn(forTableColumnIndex: tableView.clickedColumn) else { return }
+        focusedDataColumn = column
     }
 
     func tableView(
@@ -901,11 +973,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         }
         guard !rows.isEmpty else { return }
         var columns = IndexSet()
-        if tableView.tableColumns.count > 1 {
-            for column in 1..<tableView.tableColumns.count
-            where tableView.rect(ofColumn: column).intersects(tableView.visibleRect) {
+        for column in tableView.tableColumns.indices
+        where dataColumn(forTableColumnIndex: column) != nil
+            && tableView.rect(ofColumn: column).intersects(tableView.visibleRect) {
                 columns.insert(column)
-            }
         }
         guard !columns.isEmpty else { return }
         tableView.reloadData(forRowIndexes: rows, columnIndexes: columns)
@@ -1073,43 +1144,8 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         setFirstRowIsHeader(sender.state == .on)
     }
 
-    @objc private func showAddMenu(_ sender: NSButton) {
-        let menu = NSMenu(title: "Add")
-        menu.addItem(menuItem("Row Above", symbol: "arrow.up.to.line.compact", action: #selector(addRowAbove(_:))))
-        menu.addItem(menuItem("Row Below", symbol: "arrow.down.to.line.compact", action: #selector(addRowBelow(_:))))
-        menu.addItem(.separator())
-        let before = menuItem("Column Before", symbol: "arrow.left.to.line.compact", action: #selector(addColumnBefore(_:)))
-        before.isEnabled = snapshot?.byteCount == 0 || focusedDataColumn < Self.maximumPresentedColumns
-        menu.addItem(before)
-        let after = menuItem("Column After", symbol: "arrow.right.to.line.compact", action: #selector(addColumnAfter(_:)))
-        after.isEnabled = snapshot?.byteCount == 0 || focusedDataColumn + 1 < Self.maximumPresentedColumns
-        menu.addItem(after)
-        present(menu, from: sender)
-    }
-
-    @objc private func showDeleteMenu(_ sender: NSButton) {
-        let selectedRows = selectedVisibleRows()
-        let rowTitle = selectedRows.count > 1
-            ? "Delete \(selectedRows.count.formatted()) Rows"
-            : "Delete Row"
-        let menu = NSMenu(title: "Delete")
-        let deleteRows = menuItem(rowTitle, symbol: "minus.rectangle", action: #selector(deleteSelectedRows(_:)))
-        deleteRows.isEnabled = !selectedRows.isEmpty
-        menu.addItem(deleteRows)
-        let columnName = currentColumnTitle
-        let deleteColumn = menuItem(
-            "Delete Column \u{201c}\(columnName)\u{201d}",
-            symbol: "rectangle.split.1x2",
-            action: #selector(deleteCurrentColumn(_:))
-        )
-        deleteColumn.isEnabled = columnCount > 0
-        menu.addItem(deleteColumn)
-        present(menu, from: sender)
-    }
-
     private func columnMenu(forTableColumn tableColumn: Int) -> NSMenu? {
-        guard tableColumn > 0, tableColumn <= columnCount else { return nil }
-        let column = tableColumn - 1
+        guard let column = dataColumn(forTableColumnIndex: tableColumn) else { return nil }
         focusedDataColumn = column
         let title = tableView.tableColumns[tableColumn].title
         let menu = NSMenu(title: title)
@@ -1163,6 +1199,65 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         return menu
     }
 
+    private func rowMenu(forTableColumn tableColumn: Int, row: Int) -> NSMenu? {
+        let isExistingRow = row >= 0 && row < tableView.numberOfRows
+        if !isExistingRow {
+            tableView.deselectAll(nil)
+            let menu = NSMenu(title: "CSV Table")
+            let addRow = menuItem(
+                "Add Row",
+                symbol: "plus.rectangle.on.rectangle",
+                action: #selector(addRowBelow(_:))
+            )
+            addRow.isEnabled = canStartDatasetOperation
+            menu.addItem(addRow)
+            if columnCount == 0 {
+                let addColumn = menuItem(
+                    "Add Column…",
+                    symbol: "rectangle.split.1x2",
+                    action: #selector(addFirstColumn(_:))
+                )
+                addColumn.isEnabled = canStartDatasetOperation
+                menu.addItem(addColumn)
+            }
+            return menu
+        }
+        if !tableView.selectedRowIndexes.contains(row) {
+            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        if let column = dataColumn(forTableColumnIndex: tableColumn) {
+            focusedDataColumn = column
+        }
+        let selectedRows = selectedVisibleRows()
+        let menu = NSMenu(title: "CSV Row")
+        let above = menuItem(
+            "Add Row Above",
+            symbol: "arrow.up.to.line.compact",
+            action: #selector(addRowAbove(_:))
+        )
+        above.isEnabled = canStartDatasetOperation
+        menu.addItem(above)
+        let below = menuItem(
+            "Add Row Below",
+            symbol: "arrow.down.to.line.compact",
+            action: #selector(addRowBelow(_:))
+        )
+        below.isEnabled = canStartDatasetOperation
+        menu.addItem(below)
+        menu.addItem(.separator())
+        let deleteTitle = selectedRows.count > 1
+            ? "Delete \(selectedRows.count.formatted()) Rows"
+            : "Delete Row"
+        let deleteRows = menuItem(
+            deleteTitle,
+            symbol: "trash",
+            action: #selector(deleteSelectedRows(_:))
+        )
+        deleteRows.isEnabled = canStartDatasetOperation && !selectedRows.isEmpty
+        menu.addItem(deleteRows)
+        return menu
+    }
+
     private func menuItem(_ title: String, symbol: String, action: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
@@ -1170,18 +1265,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         return item
     }
 
-    private func present(_ menu: NSMenu, from button: NSButton) {
-        menu.popUp(
-            positioning: nil,
-            at: NSPoint(x: 0, y: button.bounds.minY - 4),
-            in: button
-        )
-    }
-
     private var currentColumnTitle: String {
         guard columnCount > 0 else { return "" }
         let column = min(max(0, focusedDataColumn), columnCount - 1)
-        return tableView.tableColumns[column + 1].title
+        return tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
     }
 
     private func selectedVisibleRows() -> IndexSet {
@@ -1217,10 +1304,12 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     private func setSort(column: Int, ascending: Bool) {
         guard canStartDatasetOperation else { return }
-        guard column >= 0, column < columnCount else { return }
+        guard column >= 0,
+              column < columnCount,
+              let tableColumn = tableColumn(forDataColumn: column) else { return }
         focusedDataColumn = column
         let descriptor = NSSortDescriptor(
-            key: tableView.tableColumns[column + 1].identifier.rawValue,
+            key: tableColumn.identifier.rawValue,
             ascending: ascending
         )
         activeSort = (column, ascending)
@@ -1247,9 +1336,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         isSettingSortDescriptors = true
         if let activeSort,
            activeSort.column >= 0,
-           activeSort.column < columnCount {
+           activeSort.column < columnCount,
+           let tableColumn = tableColumn(forDataColumn: activeSort.column) {
             tableView.sortDescriptors = [NSSortDescriptor(
-                key: tableView.tableColumns[activeSort.column + 1].identifier.rawValue,
+                key: tableColumn.identifier.rawValue,
                 ascending: activeSort.ascending
             )]
         } else {
@@ -1304,6 +1394,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         requestAddColumn(at: representedColumn(sender))
     }
 
+    @objc private func addFirstColumn(_ sender: Any?) {
+        guard guardDatasetOperationAvailable() else { return }
+        requestAddColumn(at: 0)
+    }
+
     @objc private func addColumnAfter(_ sender: Any?) {
         guard guardDatasetOperationAvailable() else { return }
         requestAddColumn(at: representedColumn(sender) + 1)
@@ -1346,7 +1441,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         guard guardDatasetOperationAvailable() else { return }
         guard columnCount > 0 else { return }
         let column = representedColumn(sender)
-        let title = tableView.tableColumns[column + 1].title
+        let title = tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
         confirmDestructiveChange(
             title: "Delete column \u{201c}\(title)\u{201d}?",
             information: "This removes the column from every row. The change is applied transactionally and can be undone.",
@@ -1378,61 +1473,226 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     @objc private func showColumnFilter(_ sender: Any?) {
-        guard guardDatasetOperationAvailable() else { return }
-        guard columnCount > 0 else { return }
-        let column = representedColumn(sender)
-        let title = tableView.tableColumns[column + 1].title
+        showColumnFilter(column: representedColumn(sender))
+    }
+
+    private func showColumnFilter(column: Int) {
+        showColumnFilter(column: column, anchorView: nil)
+    }
+
+    private func showColumnFilter(column: Int, anchorView: NSView?) {
+        guard latestProgress?.isComplete == true,
+              mutationCancellation == nil,
+              column >= 0,
+              column < columnCount,
+              let title = tableColumn(forDataColumn: column)?.title else {
+            NSSound.beep()
+            return
+        }
+        focusedDataColumn = column
         let controller = CSVFilterPopoverViewController(
             columnTitle: title,
             filter: activeFilters[column]
         )
-        controller.onApply = { [weak self, weak controller] filter in
+        controller.onCommit = { [weak self] filter in
             guard let self else { return }
-            self.activeFilters[column] = filter
-            self.dismissPopover(containing: controller)
-            self.updateFilterChrome()
-            self.requestApplyQuery()
+            self.commitFilterDraft(filter, for: column)
         }
-        controller.onClear = { [weak self, weak controller] in
+        controller.onClear = { [weak self] in
             guard let self else { return }
-            self.activeFilters.removeValue(forKey: column)
-            self.dismissPopover(containing: controller)
-            self.updateFilterChrome()
-            self.requestApplyQuery()
+            self.clearFilter(column: column, closePopover: false)
         }
-        presentPopover(controller, forDataColumn: column)
+        presentPopover(controller, forDataColumn: column, anchorView: anchorView)
+        requestUniqueValues(column: column, controller: controller)
     }
 
     @objc private func clearColumnFilter(_ sender: Any?) {
-        activeFilters.removeValue(forKey: representedColumn(sender))
-        updateFilterChrome()
-        requestApplyQuery()
+        clearFilter(column: representedColumn(sender), closePopover: false)
     }
 
     @objc private func clearAllFilters(_ sender: Any?) {
         guard !activeFilters.isEmpty else { return }
+        guard !isEditingRegistered || commitPendingEdit() else { return }
         activeFilters.removeAll(keepingCapacity: true)
         updateFilterChrome()
-        requestApplyQuery()
+        scheduleFilterQuery()
     }
 
     private func updateFilterChrome() {
-        clearFiltersButton.isHidden = activeFilters.isEmpty
-        clearFiltersButton.title = activeFilters.count == 1
-            ? "Clear Filter"
-            : "Clear Filters (\(activeFilters.count))"
         for column in 0..<columnCount {
-            (tableView.tableColumns[column + 1].headerCell as? LighTxtCSVHeaderCell)?.isFiltered =
-                activeFilters[column] != nil
+            if let headerCell = tableColumn(forDataColumn: column)?.headerCell as? LighTxtCSVHeaderCell {
+                headerCell.isFiltered = activeFilters[column] != nil
+                headerCell.filterText = activeFilters[column]?.value ?? ""
+            }
         }
+        rebuildFilterStrip()
+        (tableView.headerView as? LighTxtCSVHeaderView)?.refreshFilterDisplay()
         tableView.headerView?.needsDisplay = true
+    }
+
+    private func commitInlineContainsFilter(column: Int, value: String) {
+        let current = activeFilters[column] ?? CSVFilterDraft(
+            predicate: .contains,
+            value: "",
+            isCaseSensitive: false
+        )
+        commitFilterDraft(CSVFilterDraft(
+            predicate: .contains,
+            value: value,
+            isCaseSensitive: false,
+            selectedValues: current.selectedValues
+        ), for: column)
+    }
+
+    private func commitFilterDraft(_ draft: CSVFilterDraft, for column: Int) {
+        guard column >= 0, column < columnCount else { return }
+        guard mutationCancellation == nil else {
+            NSSound.beep()
+            return
+        }
+        // A failed table-cell validation must not change the filter state or
+        // launch a query against bytes that were not durably committed.
+        guard !isEditingRegistered || commitPendingEdit() else { return }
+        let previous = activeFilters[column]
+        if draft.isEmpty {
+            activeFilters.removeValue(forKey: column)
+        } else {
+            activeFilters[column] = draft
+        }
+        guard previous != activeFilters[column] else { return }
+        updateFilterChrome()
+        scheduleFilterQuery()
+    }
+
+    private func clearFilter(column: Int, closePopover: Bool) {
+        guard !isEditingRegistered || commitPendingEdit() else { return }
+        guard activeFilters.removeValue(forKey: column) != nil else { return }
+        if closePopover {
+            cancelUniqueValueRequest()
+            cancelColumnSummaryRequest()
+            presentedPopover?.close()
+            presentedPopover = nil
+            presentedPopoverAnchor = nil
+        }
+        updateFilterChrome()
+        scheduleFilterQuery()
+    }
+
+    /// Typing edits only local draft state. Commits from Return, focus loss,
+    /// or checkbox selection coalesce so rapid selections do not repeatedly
+    /// scan a multi-gigabyte file.
+    private func scheduleFilterQuery() {
+        // Invalidate the currently running generation now, not after the UI
+        // debounce, so its stale map can never publish beneath newer chips.
+        queryGeneration &+= 1
+        queryCancellation?.cancel()
+        queryCancellation = nil
+        pendingFilterQuery?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingFilterQuery = nil
+            self.requestApplyQuery()
+        }
+        pendingFilterQuery = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(180), execute: work)
+    }
+
+    private func rebuildFilterStrip() {
+        filterChipContainer.subviews.forEach { $0.removeFromSuperview() }
+        guard !activeFilters.isEmpty else {
+            filterChipContainer.frame = NSRect(x: 0, y: 0, width: 1, height: 30)
+            filterStripWidthConstraint?.constant = 0
+            filterStripScrollView.isHidden = true
+            return
+        }
+
+        var x: CGFloat = 0
+        for column in activeFilters.keys.sorted() {
+            guard let draft = activeFilters[column] else { continue }
+            let title = tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
+            let chip = CSVFilterChipView(
+                sourceColumn: column,
+                title: title,
+                summary: draft.shortSummary,
+                fullDescription: draft.accessibilityDescription(columnTitle: title)
+            )
+            chip.onOpen = { [weak self, weak chip] in
+                self?.showColumnFilter(column: column, anchorView: chip)
+            }
+            chip.onClear = { [weak self] in self?.clearFilter(column: column, closePopover: true) }
+            chip.frame.origin = NSPoint(x: x, y: 1)
+            filterChipContainer.addSubview(chip)
+            x += chip.frame.width + 6
+        }
+        clearFiltersButton.title = "Clear filters"
+        clearFiltersButton.sizeToFit()
+        clearFiltersButton.frame = NSRect(
+            x: x,
+            y: 1,
+            width: max(94, clearFiltersButton.frame.width + 10),
+            height: 28
+        )
+        filterChipContainer.addSubview(clearFiltersButton)
+        x = clearFiltersButton.frame.maxX
+        filterChipContainer.frame = NSRect(x: 0, y: 0, width: max(1, x), height: 30)
+        filterStripWidthConstraint?.constant = min(430, x)
+        filterStripScrollView.isHidden = false
+    }
+
+    private func requestUniqueValues(
+        column: Int,
+        controller: CSVFilterPopoverViewController
+    ) {
+        cancelUniqueValueRequest()
+        guard let snapshot, let rowIndex else { return }
+        let firstRecord: Int64 = firstRowIsHeader ? 1 : 0
+        let baseFilters = coreFilters(excluding: column)
+        let progressRelay = CSVUniqueValuesProgressRelay(controller: controller)
+        controller.showUniqueValuesLoading()
+        uniqueValuesTask = Task { [weak self, weak controller] in
+            do {
+                let result = try await CSVUniqueValueProvider.values(
+                    snapshot: snapshot,
+                    index: rowIndex,
+                    column: column,
+                    firstRecord: firstRecord,
+                    baseFilters: baseFilters,
+                    configuration: .init(
+                        pageRecordCount: 4_096,
+                        maximumUniqueValueCount: 500,
+                        maximumValueBytes: 64 << 10
+                    ),
+                    progress: { @Sendable progress in progressRelay.report(progress) }
+                )
+                guard !Task.isCancelled,
+                      let self,
+                      let controller,
+                      self.presentedPopover?.contentViewController === controller else { return }
+                controller.showUniqueValues(result)
+                self.uniqueValuesTask = nil
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled,
+                      let self,
+                      let controller,
+                      self.presentedPopover?.contentViewController === controller else { return }
+                controller.showUniqueValues(error: error)
+                self.uniqueValuesTask = nil
+            }
+        }
+    }
+
+    private func cancelUniqueValueRequest() {
+        uniqueValuesTask?.cancel()
+        uniqueValuesTask = nil
     }
 
     @objc private func showColumnSummary(_ sender: Any?) {
         guard guardDatasetOperationAvailable() else { return }
         guard columnCount > 0 else { return }
         let column = representedColumn(sender)
-        let title = tableView.tableColumns[column + 1].title
+        let title = tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
         let controller = CSVColumnSummaryPopoverViewController(columnTitle: title)
         presentPopover(controller, forDataColumn: column)
         requestColumnSummary(
@@ -1454,7 +1714,13 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         }
     }
 
-    private func presentPopover(_ controller: NSViewController, forDataColumn column: Int) {
+    private func presentPopover(
+        _ controller: NSViewController,
+        forDataColumn column: Int,
+        anchorView: NSView? = nil
+    ) {
+        cancelUniqueValueRequest()
+        cancelColumnSummaryRequest()
         presentedPopover?.close()
         let popover = NSPopover()
         popover.behavior = .transient
@@ -1462,8 +1728,24 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         popover.delegate = self
         popover.contentViewController = controller
         presentedPopover = popover
-        guard let header = tableView.headerView else { return }
-        let tableColumn = min(max(1, column + 1), tableView.tableColumns.count - 1)
+        if let chip = anchorView as? CSVFilterChipView {
+            // A committed draft rebuilds the chip strip. Anchor to its stable
+            // container (using the clicked chip's current rect) so removing
+            // and recreating that chip cannot detach or close this popover.
+            let anchorRect = filterChipContainer.convert(chip.bounds, from: chip)
+            presentedPopoverAnchor = .filterChip(column: column)
+            popover.show(relativeTo: anchorRect, of: filterChipContainer, preferredEdge: .maxY)
+            return
+        }
+        guard let header = tableView.headerView,
+              let tableColumn = tableColumnIndex(forDataColumn: column) else {
+            presentedPopover = nil
+            presentedPopoverAnchor = nil
+            cancelUniqueValueRequest()
+            cancelColumnSummaryRequest()
+            return
+        }
+        presentedPopoverAnchor = .tableHeader(column: column)
         popover.show(
             relativeTo: header.headerRect(ofColumn: tableColumn),
             of: header,
@@ -1473,14 +1755,19 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     private func dismissPopover(containing controller: NSViewController?) {
         guard let controller, presentedPopover?.contentViewController === controller else { return }
+        cancelUniqueValueRequest()
+        cancelColumnSummaryRequest()
         presentedPopover?.close()
         presentedPopover = nil
+        presentedPopoverAnchor = nil
     }
 
     func popoverDidClose(_ notification: Notification) {
         if notification.object as? NSPopover === presentedPopover {
             presentedPopover = nil
+            presentedPopoverAnchor = nil
             cancelColumnSummaryRequest()
+            cancelUniqueValueRequest()
         }
     }
 
@@ -1494,7 +1781,13 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     private func requestApplyQuery() {
-        guard commitPendingEdit() else { return }
+        // Filter controls have their own committed/draft lifecycle. Ending all
+        // window editing here would steal focus from a popover or inline
+        // search field shortly after the user typed the first characters.
+        guard !isEditingRegistered || commitPendingEdit() else { return }
+#if LIGHTXT_STANDALONE_CSV_QA
+        qaQueryLaunchCountStorage += 1
+#endif
         queryGeneration &+= 1
         let currentQueryGeneration = queryGeneration
         queryCancellation?.cancel()
@@ -1523,10 +1816,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         }
         guard let snapshot, let rowIndex else { return }
 
-        let filters = activeFilters.keys.sorted().compactMap { column -> CSVColumnFilter? in
-            guard let draft = activeFilters[column] else { return nil }
-            return CSVColumnFilter(column: column, predicate: predicate(for: draft))
-        }
+        let filters = coreFilters()
         let sortDescriptors: [CSVSortDescriptor]
         if let activeSort {
             sortDescriptors = [CSVSortDescriptor(
@@ -1617,35 +1907,27 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         }
     }
 
+    private func coreFilters(excluding excludedColumn: Int? = nil) -> [CSVColumnFilter] {
+        activeFilters.keys.sorted().compactMap { column -> CSVColumnFilter? in
+            guard column != excludedColumn,
+                  let draft = activeFilters[column],
+                  !draft.isEmpty else { return nil }
+            return CSVColumnFilter(
+                column: column,
+                containsText: draft.value,
+                selectedValues: draft.selectedValues,
+                containsCaseSensitive: draft.isCaseSensitive,
+                selectedValuesCaseSensitive: true
+            )
+        }
+    }
+
     private var projectionVerb: String {
         switch (activeFilters.isEmpty, activeSort == nil) {
         case (false, false): "Filtering and sorting"
         case (false, true): "Filtering"
         case (true, false): "Sorting"
         case (true, true): "Preparing table"
-        }
-    }
-
-    private func predicate(for draft: CSVFilterDraft) -> CSVFilterPredicate {
-        switch draft.predicate {
-        case .contains:
-            .contains(draft.value, caseSensitive: draft.isCaseSensitive)
-        case .equals:
-            .equals(draft.value, caseSensitive: draft.isCaseSensitive)
-        case .doesNotEqual:
-            .notEquals(draft.value, caseSensitive: draft.isCaseSensitive)
-        case .startsWith:
-            .beginsWith(draft.value, caseSensitive: draft.isCaseSensitive)
-        case .endsWith:
-            .endsWith(draft.value, caseSensitive: draft.isCaseSensitive)
-        case .isEmpty:
-            .isEmpty
-        case .isNotEmpty:
-            .isNotEmpty
-        case .greaterThan:
-            .numeric(.greaterThan, Double(draft.value) ?? .nan)
-        case .lessThan:
-            .numeric(.lessThan, Double(draft.value) ?? .nan)
         }
     }
 
@@ -1807,6 +2089,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             applyColumnMutation(.insert(CSVColumnInsertion(column: column)), label: "Adding column")
             return
         }
+#if LIGHTXT_STANDALONE_CSV_QA
+        // The runtime harness still dispatches the real context-menu action;
+        // this supplies the value a user would enter into the naming sheet so
+        // headless AppKit services do not make the test depend on alert UI.
+        if let name = qaNextColumnName {
+            qaNextColumnName = nil
+            applyNamedColumn(name, at: column, toEmptyDocument: isEmptyDocument)
+            return
+        }
+#endif
         let alert = NSAlert()
         alert.messageText = "Add Column"
         alert.informativeText = "Choose a name for the new column."
@@ -1824,27 +2116,35 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                 NSSound.beep()
                 return
             }
-            if isEmptyDocument {
-                self.firstRowIsHeader = true
-                self.headerDetectionCompleted = true
-                self.headerCheckbox.state = .on
-                self.requestBootstrapColumn(named: name)
-            } else {
-                self.applyColumnMutation(
-                    .insert(CSVColumnInsertion(
-                        column: column,
-                        headerRecord: 0,
-                        headerValue: name,
-                        defaultValue: ""
-                    )),
-                    label: "Adding column"
-                )
-            }
+            self.applyNamedColumn(name, at: column, toEmptyDocument: isEmptyDocument)
         }
         if let window {
             alert.beginSheetModal(for: window, completionHandler: apply)
         } else {
             apply(alert.runModal())
+        }
+    }
+
+    private func applyNamedColumn(
+        _ name: String,
+        at column: Int,
+        toEmptyDocument isEmptyDocument: Bool
+    ) {
+        if isEmptyDocument {
+            firstRowIsHeader = true
+            headerDetectionCompleted = true
+            headerCheckbox.state = .on
+            requestBootstrapColumn(named: name)
+        } else {
+            applyColumnMutation(
+                .insert(CSVColumnInsertion(
+                    column: column,
+                    headerRecord: 0,
+                    headerValue: name,
+                    defaultValue: ""
+                )),
+                label: "Adding column"
+            )
         }
     }
 
@@ -1904,6 +2204,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         mutationCancellation?.cancel()
         let cancellation = CancellationToken()
         mutationCancellation = cancellation
+        (tableView.headerView as? LighTxtCSVHeaderView)?.refreshFilterDisplay()
         setOperationBusy(text: status, fraction: 0)
         Self.mutationQueue.async { [weak self] in
             do {
@@ -1922,6 +2223,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                           self.mutationGeneration == currentMutationGeneration,
                           !cancellation.isCancelled else { return }
                     self.mutationCancellation = nil
+                    (self.tableView.headerView as? LighTxtCSVHeaderView)?.refreshFilterDisplay()
                     self.isTableOperationInFlight = false
                     self.report(error)
                 }
@@ -1936,6 +2238,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     ) {
         guard mutationGeneration == generation, !cancellation.isCancelled else { return }
         mutationCancellation = nil
+        (tableView.headerView as? LighTxtCSVHeaderView)?.refreshFilterDisplay()
         isTableOperationInFlight = false
         switch result {
         case .success:
@@ -1964,6 +2267,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         // controller-owned reload can never apply an old filter or sort to a
         // newly shifted column.
         cancelQueryAndCloseRowMap()
+        cancelUniqueValueRequest()
+        cancelColumnSummaryRequest()
+        presentedPopover?.close()
+        presentedPopover = nil
+        presentedPopoverAnchor = nil
         activeFilters.removeAll(keepingCapacity: true)
         activeSort = nil
         isSettingSortDescriptors = true
@@ -1978,6 +2286,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         mutationCancellation?.cancel()
         let cancellation = CancellationToken()
         mutationCancellation = cancellation
+        (tableView.headerView as? LighTxtCSVHeaderView)?.refreshFilterDisplay()
         setOperationBusy(text: "\(label)…", fraction: 0)
         mutationDelegate.editorApplyCSVColumnMutation(
             mutation,
@@ -1998,6 +2307,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                       self.mutationGeneration == currentMutationGeneration,
                       !cancellation.isCancelled else { return }
                 self.mutationCancellation = nil
+                (self.tableView.headerView as? LighTxtCSVHeaderView)?.refreshFilterDisplay()
                 self.isTableOperationInFlight = false
                 switch result {
                 case .success:
@@ -2017,6 +2327,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         mutationGeneration &+= 1
         mutationCancellation?.cancel()
         mutationCancellation = nil
+        (tableView.headerView as? LighTxtCSVHeaderView)?.refreshFilterDisplay()
         (editorDelegate as? CSVMutationEditorDelegate)?.editorCancelCSVMutation()
         if wasRunning { isTableOperationInFlight = false }
     }
@@ -2133,17 +2444,19 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     /// the same state machine and mutation adapters as user interaction while
     /// keeping test-only surface out of release builds.
     func qaCycleHeaderSort(column: Int) {
-        guard column >= 0, column < columnCount else { return }
+        guard column >= 0,
+              column < columnCount,
+              let tableColumn = tableColumn(forDataColumn: column) else { return }
         let oldDescriptors = tableView.sortDescriptors
         let nextDescriptor: NSSortDescriptor
         if activeSort?.column == column, activeSort?.ascending == true {
             nextDescriptor = NSSortDescriptor(
-                key: tableView.tableColumns[column + 1].identifier.rawValue,
+                key: tableColumn.identifier.rawValue,
                 ascending: false
             )
         } else {
             nextDescriptor = NSSortDescriptor(
-                key: tableView.tableColumns[column + 1].identifier.rawValue,
+                key: tableColumn.identifier.rawValue,
                 ascending: true
             )
         }
@@ -2162,6 +2475,149 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         )
         updateFilterChrome()
         requestApplyQuery()
+    }
+
+    func qaBeginInlineContainsFilter(column: Int) {
+        (tableView.headerView as? LighTxtCSVHeaderView)?.qaBeginEditing(dataColumn: column)
+    }
+
+    func qaTypeInlineContainsFilter(_ value: String) {
+        (tableView.headerView as? LighTxtCSVHeaderView)?.qaType(value)
+    }
+
+    func qaCommitInlineContainsFilter() {
+        (tableView.headerView as? LighTxtCSVHeaderView)?.qaCommit()
+    }
+
+    func qaCancelInlineContainsFilter() {
+        (tableView.headerView as? LighTxtCSVHeaderView)?.qaCancel()
+    }
+
+    var qaInlineFilterHasFocus: Bool {
+        (tableView.headerView as? LighTxtCSVHeaderView)?.qaHasFocus == true
+    }
+
+    func qaShowFilterPopover(column: Int) { showColumnFilter(column: column) }
+
+    func qaTypePopoverContains(_ value: String) {
+        (presentedPopover?.contentViewController as? CSVFilterPopoverViewController)?.qaType(value)
+    }
+
+    func qaCommitPopoverContains() {
+        (presentedPopover?.contentViewController as? CSVFilterPopoverViewController)?.qaCommit()
+    }
+
+    func qaEndPopoverContainsEditingByFocusLoss() {
+        (presentedPopover?.contentViewController as? CSVFilterPopoverViewController)?
+            .qaEndEditingByFocusLoss()
+    }
+
+    var qaPopoverFilterHasFocus: Bool {
+        (presentedPopover?.contentViewController as? CSVFilterPopoverViewController)?.qaHasFocus == true
+    }
+
+    var qaPopoverUniqueValues: [String] {
+        (presentedPopover?.contentViewController as? CSVFilterPopoverViewController)?.qaUniqueValues ?? []
+    }
+
+    func qaTogglePopoverValue(_ value: String) {
+        (presentedPopover?.contentViewController as? CSVFilterPopoverViewController)?.qaToggle(value)
+    }
+
+    func qaCommittedFilter(column: Int) -> (contains: String, selected: Set<String>)? {
+        activeFilters[column].map { ($0.value, $0.selectedValues) }
+    }
+
+    var qaFilterChipCount: Int {
+        filterChipContainer.subviews.compactMap { $0 as? CSVFilterChipView }.count
+    }
+
+    func qaOpenFilterChip(column: Int) {
+        filterChipContainer.subviews
+            .compactMap { $0 as? CSVFilterChipView }
+            .first { $0.sourceColumn == column }?
+            .qaOpen()
+    }
+
+    func qaClearFilterChip(column: Int) {
+        filterChipContainer.subviews
+            .compactMap { $0 as? CSVFilterChipView }
+            .first { $0.sourceColumn == column }?
+            .qaClear()
+    }
+
+    func qaMoveDataColumn(_ column: Int, toVisualIndex destination: Int) {
+        guard let source = tableColumnIndex(forDataColumn: column),
+              destination >= 0,
+              destination < tableView.tableColumns.count else { return }
+        tableView.moveColumn(source, toColumn: destination)
+    }
+
+    func qaScrollDataColumnToVisible(_ column: Int) {
+        guard let index = tableColumnIndex(forDataColumn: column) else { return }
+        tableView.scrollColumnToVisible(index)
+    }
+    var qaHorizontalOffset: CGFloat { tableView.visibleRect.minX }
+
+    var qaAccessibleFilterButtonColumns: Set<Int> {
+        guard let header = tableView.headerView as? LighTxtCSVHeaderView else { return [] }
+        header.qaSynchronizeFilterButtons()
+        return header.qaFilterButtonColumns
+    }
+
+    func qaRowContextMenuTitles(row: Int) -> [String] {
+        rowMenu(forTableColumn: tableColumnIndex(forDataColumn: 0) ?? 0, row: row)?
+            .items.filter { !$0.isSeparatorItem }.map(\.title) ?? []
+    }
+
+    var qaEmptySpaceContextMenuTitles: [String] {
+        rowMenu(forTableColumn: -1, row: -1)?
+            .items.filter { !$0.isSeparatorItem }.map(\.title) ?? []
+    }
+
+    @discardableResult
+    func qaPerformEmptySpaceContextMenuItem(
+        named title: String,
+        columnName: String? = nil
+    ) -> Bool {
+        qaNextColumnName = columnName
+        guard let item = rowMenu(forTableColumn: -1, row: -1)?
+            .items.first(where: { !$0.isSeparatorItem && $0.title == title }),
+              item.isEnabled,
+              let action = item.action else {
+            qaNextColumnName = nil
+            return false
+        }
+        let sent = NSApp.sendAction(action, to: item.target, from: item)
+        if !sent { qaNextColumnName = nil }
+        return sent
+    }
+
+    var qaHasPresentedPopover: Bool { presentedPopover != nil }
+    var qaPopoverAnchoredToFilterChip: Bool {
+        if case .filterChip = presentedPopoverAnchor { return true }
+        return false
+    }
+
+    var qaStructuralMutationInFlight: Bool { mutationCancellation != nil }
+    var qaQueryLaunchCount: Int { qaQueryLaunchCountStorage }
+    var qaPopoverContentView: NSView? { presentedPopover?.contentViewController?.view }
+
+    func qaPreparePopoverCaptureBackground() {
+        (presentedPopover?.contentViewController as? CSVFilterPopoverViewController)?
+            .qaPrepareCaptureBackground()
+    }
+
+    var qaFilterAffordanceContrast: CGFloat {
+        guard let header = tableView.headerView as? LighTxtCSVHeaderView else { return 0 }
+        header.qaSynchronizeFilterButtons()
+        return header.qaMinimumFilterAffordanceContrast
+    }
+
+    func qaShowColumnSummary(column: Int) {
+        let item = NSMenuItem()
+        item.representedObject = column
+        showColumnSummary(item)
     }
 
     func qaClearFilters() { clearAllFilters(nil) }
@@ -2224,7 +2680,9 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     func qaSetFirstRowIsHeader(_ enabled: Bool) { setFirstRowIsHeader(enabled) }
-    var qaColumnTitles: [String] { Array(tableView.tableColumns.dropFirst().map(\.title)) }
+    var qaColumnTitles: [String] {
+        (0..<columnCount).compactMap { tableColumn(forDataColumn: $0)?.title }
+    }
 
     func qaRequestDisplayedRows(_ rows: [Int]) {
         for row in rows {
@@ -2265,10 +2723,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         statusLabel.setAccessibilityValue(text)
         progressIndicator.doubleValue = latestProgress?.fractionCompleted ?? (busy ? 0 : 1)
         progressIndicator.isHidden = !busy
-        let canMutate = latestProgress?.isComplete == true && !isTableOperationInFlight
-        headerCheckbox.isEnabled = canMutate
-        addButton.isEnabled = canMutate
-        deleteButton.isEnabled = canMutate
+        headerCheckbox.isEnabled = latestProgress?.isComplete == true && !isTableOperationInFlight
         onStatusChange?(text, busy)
     }
 
@@ -2279,8 +2734,6 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         progressIndicator.doubleValue = min(1, max(0, fraction ?? 0))
         progressIndicator.isHidden = false
         headerCheckbox.isEnabled = false
-        addButton.isEnabled = false
-        deleteButton.isEnabled = false
         onStatusChange?(text, true)
         reloadVisibleEditableCells()
     }
@@ -2314,11 +2767,14 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         guard visible.location != NSNotFound,
               visible.length > 0,
               tableView.tableColumns.count > 1 else { return }
+        let dataColumns = IndexSet(
+            tableView.tableColumns.indices.filter { dataColumn(forTableColumnIndex: $0) != nil }
+        )
         tableView.reloadData(
             forRowIndexes: IndexSet(
                 integersIn: visible.location..<(visible.location + visible.length)
             ),
-            columnIndexes: IndexSet(integersIn: 1..<tableView.tableColumns.count)
+            columnIndexes: dataColumns
         )
     }
 
@@ -2360,8 +2816,8 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             : pendingScrollTarget.displayedRow
         guard visibleRow >= 0, visibleRow < Int64(numberOfRows(in: tableView)) else { return }
         tableView.scrollRowToVisible(Int(visibleRow))
-        if pendingScrollTarget.column + 1 < tableView.tableColumns.count {
-            tableView.scrollColumnToVisible(pendingScrollTarget.column + 1)
+        if let tableColumn = tableColumnIndex(forDataColumn: pendingScrollTarget.column) {
+            tableView.scrollColumnToVisible(tableColumn)
         }
         self.pendingScrollTarget = nil
     }
@@ -2426,26 +2882,75 @@ private struct CSVFilterDraft: Equatable {
     var predicate: Predicate
     var value: String
     var isCaseSensitive: Bool
+    var selectedValues: Set<String>
+
+    init(
+        predicate: Predicate,
+        value: String,
+        isCaseSensitive: Bool,
+        selectedValues: Set<String> = []
+    ) {
+        self.predicate = predicate
+        self.value = value
+        self.isCaseSensitive = isCaseSensitive
+        self.selectedValues = selectedValues
+    }
+
+    var isEmpty: Bool { value.isEmpty && selectedValues.isEmpty }
+
+    var shortSummary: String {
+        let typed = value.isEmpty ? nil : value
+        let selected: String? = {
+            guard !selectedValues.isEmpty else { return nil }
+            let first = selectedValues.sorted(by: CSVFilterDraft.localizedValueOrder).first ?? ""
+            let label = first.isEmpty ? "Empty" : first
+            return selectedValues.count == 1 ? label : "\(label) +\(selectedValues.count - 1)"
+        }()
+        return [typed, selected].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    func accessibilityDescription(columnTitle: String) -> String {
+        var pieces: [String] = ["Filter \(columnTitle)"]
+        if !value.isEmpty { pieces.append("contains \(value)") }
+        if !selectedValues.isEmpty {
+            pieces.append("\(selectedValues.count) selected value\(selectedValues.count == 1 ? "" : "s")")
+        }
+        return pieces.joined(separator: ", ")
+    }
+
+    static func localizedValueOrder(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.localizedStandardCompare(rhs) == .orderedAscending
+    }
 }
 
 @MainActor
-private final class CSVFilterPopoverViewController: NSViewController, NSSearchFieldDelegate {
-    var onApply: ((CSVFilterDraft) -> Void)?
+private final class CSVFilterPopoverViewController: NSViewController,
+    NSSearchFieldDelegate,
+    NSTableViewDataSource,
+    NSTableViewDelegate
+{
+    var onCommit: ((CSVFilterDraft) -> Void)?
     var onClear: (() -> Void)?
 
     private let columnTitle: String
-    private let initialFilter: CSVFilterDraft?
-    private let predicateButton = NSPopUpButton()
+    private var committedFilter: CSVFilterDraft
     private let valueField = NSSearchField()
-    private let caseButton = NSButton(checkboxWithTitle: "Case sensitive", target: nil, action: nil)
-    private lazy var applyButton = NSButton(title: "Apply", target: self, action: #selector(apply(_:)))
+    private let valuesStatus = NSTextField(labelWithString: "Loading values…")
+    private let valuesTable = NSTableView()
+    private let valuesScroll = NSScrollView()
     private lazy var clearButton = NSButton(title: "Clear", target: self, action: #selector(clear(_:)))
+    private var allUniqueValues: [String] = []
+    private var visibleUniqueValues: [String] = []
 
     init(columnTitle: String, filter: CSVFilterDraft?) {
         self.columnTitle = columnTitle
-        self.initialFilter = filter
+        self.committedFilter = filter ?? CSVFilterDraft(
+            predicate: .contains,
+            value: "",
+            isCaseSensitive: false
+        )
         super.init(nibName: nil, bundle: nil)
-        preferredContentSize = NSSize(width: 326, height: 190)
+        preferredContentSize = NSSize(width: 350, height: 390)
     }
 
     @available(*, unavailable)
@@ -2456,108 +2961,251 @@ private final class CSVFilterPopoverViewController: NSViewController, NSSearchFi
         root.translatesAutoresizingMaskIntoConstraints = false
         view = root
 
-        let title = NSTextField(labelWithString: "Filter \u{201c}\(columnTitle)\u{201d}")
+        let title = NSTextField(labelWithString: columnTitle)
         title.font = .systemFont(ofSize: 14, weight: .semibold)
         title.lineBreakMode = .byTruncatingTail
+        title.toolTip = columnTitle
         title.setAccessibilityLabel("Filter column \(columnTitle)")
 
-        predicateButton.addItems(withTitles: CSVFilterDraft.Predicate.allCases.map(\.title))
-        predicateButton.target = self
-        predicateButton.action = #selector(predicateChanged(_:))
-        predicateButton.setAccessibilityLabel("Filter condition")
-
-        valueField.placeholderString = "Value"
+        valueField.placeholderString = "Contains"
         valueField.delegate = self
         valueField.target = self
-        valueField.action = #selector(apply(_:))
-        valueField.setAccessibilityLabel("Filter value")
+        valueField.action = #selector(commitText(_:))
+        valueField.sendsSearchStringImmediately = false
+        valueField.sendsWholeSearchString = true
+        valueField.stringValue = committedFilter.value
+        valueField.setAccessibilityLabel("Contains text for \(columnTitle)")
+        valueField.setAccessibilityHelp("Type freely, then press Return or click elsewhere to apply")
 
-        caseButton.setAccessibilityHelp("Match uppercase and lowercase letters exactly")
+        valuesStatus.font = .systemFont(ofSize: 11)
+        valuesStatus.textColor = .secondaryLabelColor
+        valuesStatus.lineBreakMode = .byTruncatingTail
+        valuesStatus.maximumNumberOfLines = 1
 
-        applyButton.bezelStyle = .rounded
-        applyButton.keyEquivalent = "\r"
-        applyButton.setAccessibilityLabel("Apply column filter")
+        valuesTable.headerView = nil
+        valuesTable.delegate = self
+        valuesTable.dataSource = self
+        valuesTable.rowHeight = 27
+        valuesTable.intercellSpacing = NSSize(width: 0, height: 1)
+        valuesTable.selectionHighlightStyle = .none
+        valuesTable.setAccessibilityLabel("Unique values for \(columnTitle)")
+        let valueColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("filter-value"))
+        valueColumn.resizingMask = .autoresizingMask
+        valueColumn.width = 316
+        valuesTable.addTableColumn(valueColumn)
+        valuesScroll.documentView = valuesTable
+        valuesScroll.hasVerticalScroller = true
+        valuesScroll.autohidesScrollers = true
+        valuesScroll.borderType = .bezelBorder
+
         clearButton.bezelStyle = .rounded
-        clearButton.isEnabled = initialFilter != nil
-        clearButton.setAccessibilityLabel("Clear column filter")
+        clearButton.isEnabled = !committedFilter.isEmpty
+        clearButton.setAccessibilityLabel("Clear filter for \(columnTitle)")
 
-        let buttons = NSStackView(views: [clearButton, NSView(), applyButton])
-        buttons.orientation = .horizontal
-        buttons.alignment = .centerY
-        buttons.spacing = 8
+        let hint = NSTextField(labelWithString: "Check one or more exact values")
+        hint.font = .systemFont(ofSize: 11, weight: .medium)
+        hint.textColor = .secondaryLabelColor
+        let heading = NSStackView(views: [hint, NSView(), clearButton])
+        heading.orientation = .horizontal
+        heading.alignment = .centerY
+        heading.spacing = 8
 
-        let content = NSStackView(views: [title, predicateButton, valueField, caseButton, buttons])
+        let content = NSStackView(views: [title, valueField, heading, valuesStatus, valuesScroll])
         content.translatesAutoresizingMaskIntoConstraints = false
         content.orientation = .vertical
         content.alignment = .leading
-        content.spacing = 10
+        content.spacing = 8
         root.addSubview(content)
 
-        predicateButton.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-        valueField.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-        buttons.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        [valueField, heading, valuesStatus, valuesScroll].forEach {
+            $0.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        }
+        valuesScroll.heightAnchor.constraint(equalToConstant: 246).isActive = true
         NSLayoutConstraint.activate([
             root.widthAnchor.constraint(equalToConstant: preferredContentSize.width),
             root.heightAnchor.constraint(equalToConstant: preferredContentSize.height),
-            content.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            content.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
-            content.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
-            content.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -14),
+            content.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            content.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+            content.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            content.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
         ])
-
-        let filter = initialFilter ?? CSVFilterDraft(
-            predicate: .contains,
-            value: "",
-            isCaseSensitive: false
-        )
-        predicateButton.selectItem(at: filter.predicate.rawValue)
-        valueField.stringValue = filter.value
-        caseButton.state = filter.isCaseSensitive ? .on : .off
-        updateValueControls()
     }
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        if selectedPredicate.needsValue { view.window?.makeFirstResponder(valueField) }
+        view.window?.makeFirstResponder(valueField)
     }
 
-    private var selectedPredicate: CSVFilterDraft.Predicate {
-        CSVFilterDraft.Predicate(rawValue: predicateButton.indexOfSelectedItem) ?? .contains
+    func showUniqueValuesLoading() {
+        valuesStatus.stringValue = "Loading unique values…"
+        valuesStatus.setAccessibilityValue(valuesStatus.stringValue)
     }
 
-    @objc private func predicateChanged(_ sender: Any?) { updateValueControls() }
-
-    private func updateValueControls() {
-        let predicate = selectedPredicate
-        let needsValue = predicate.needsValue
-        valueField.isEnabled = needsValue
-        valueField.placeholderString = predicate.needsNumber ? "Number" : "Value"
-        caseButton.isEnabled = needsValue
-            && !predicate.needsNumber
-        let hasValidValue = !valueField.stringValue.isEmpty
-            && (!predicate.needsNumber || Double(valueField.stringValue)?.isFinite == true)
-        applyButton.isEnabled = !needsValue || hasValidValue
+    func showUniqueValues(progress: CSVUniqueValuesProgress) {
+        let total = progress.totalRecordCount.map { " of \($0.formatted())" } ?? ""
+        valuesStatus.stringValue = "Scanned \(progress.scannedRecordCount.formatted())\(total) rows · \(progress.uniqueValueCount.formatted()) values…"
+        valuesStatus.setAccessibilityValue(valuesStatus.stringValue)
     }
 
-    func controlTextDidChange(_ notification: Notification) { updateValueControls() }
+    func showUniqueValues(_ result: CSVUniqueValuesResult) {
+        // Keep checked values visible even when a bounded scan reached its
+        // cap before rediscovering one of them.
+        allUniqueValues = Array(Set(result.values).union(committedFilter.selectedValues))
+            .sorted(by: CSVFilterDraft.localizedValueOrder)
+        valuesStatus.stringValue = result.isTruncated
+            ? "Showing \(allUniqueValues.count.formatted()) values; more available"
+            : "\(allUniqueValues.count.formatted()) unique values"
+        valuesStatus.setAccessibilityValue(valuesStatus.stringValue)
+        updateVisibleUniqueValues()
+    }
 
-    @objc private func apply(_ sender: Any?) {
-        let predicate = selectedPredicate
-        let validValue = !valueField.stringValue.isEmpty
-            && (!predicate.needsNumber || Double(valueField.stringValue)?.isFinite == true)
-        guard !predicate.needsValue || validValue else {
-            NSSound.beep()
-            view.window?.makeFirstResponder(valueField)
+    func showUniqueValues(error: Error) {
+        valuesStatus.stringValue = "Couldn’t load values"
+        valuesStatus.toolTip = error.localizedDescription
+        valuesStatus.setAccessibilityValue(error.localizedDescription)
+        allUniqueValues = committedFilter.selectedValues.sorted(by: CSVFilterDraft.localizedValueOrder)
+        updateVisibleUniqueValues()
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        // Live typing narrows only the local picker. It never mutates the CSV
+        // query, reloads the table, or dismisses this popover.
+        updateVisibleUniqueValues()
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        let movement = (notification.userInfo?["NSTextMovement"] as? NSNumber)?.intValue
+        if movement == NSCancelTextMovement {
+            valueField.stringValue = committedFilter.value
+            updateVisibleUniqueValues()
             return
         }
-        onApply?(CSVFilterDraft(
-            predicate: predicate,
-            value: valueField.stringValue,
-            isCaseSensitive: caseButton.state == .on
-        ))
+        commitTypedValue()
     }
 
-    @objc private func clear(_ sender: Any?) { onClear?() }
+    func numberOfRows(in tableView: NSTableView) -> Int { visibleUniqueValues.count }
+
+    func tableView(
+        _ tableView: NSTableView,
+        viewFor tableColumn: NSTableColumn?,
+        row: Int
+    ) -> NSView? {
+        guard let value = visibleUniqueValues[safe: row] else { return nil }
+        let identifier = NSUserInterfaceItemIdentifier("filter-value-checkbox")
+        let button = (tableView.makeView(withIdentifier: identifier, owner: self) as? NSButton)
+            ?? NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleValue(_:)))
+        button.identifier = identifier
+        button.target = self
+        button.action = #selector(toggleValue(_:))
+        button.tag = row
+        button.title = value.isEmpty ? "(Empty)" : value
+        button.toolTip = value
+        button.state = committedFilter.selectedValues.contains(value) ? .on : .off
+        button.lineBreakMode = .byTruncatingMiddle
+        button.setAccessibilityLabel(value.isEmpty ? "Empty value" : value)
+        return button
+    }
+
+    @objc private func commitText(_ sender: Any?) { commitTypedValue() }
+
+    private func commitTypedValue() {
+        let next = CSVFilterDraft(
+            predicate: .contains,
+            value: valueField.stringValue,
+            isCaseSensitive: false,
+            selectedValues: committedFilter.selectedValues
+        )
+        guard next != committedFilter else { return }
+        committedFilter = next
+        clearButton.isEnabled = !next.isEmpty
+        onCommit?(next)
+    }
+
+    @objc private func toggleValue(_ sender: NSButton) {
+        guard let value = visibleUniqueValues[safe: sender.tag] else { return }
+        if sender.state == .on {
+            committedFilter.selectedValues.insert(value)
+        } else {
+            committedFilter.selectedValues.remove(value)
+        }
+        clearButton.isEnabled = !committedFilter.isEmpty
+        onCommit?(committedFilter)
+    }
+
+    @objc private func clear(_ sender: Any?) {
+        committedFilter = CSVFilterDraft(
+            predicate: .contains,
+            value: "",
+            isCaseSensitive: false
+        )
+        valueField.stringValue = ""
+        clearButton.isEnabled = false
+        updateVisibleUniqueValues()
+        onClear?()
+        view.window?.makeFirstResponder(valueField)
+    }
+
+    private func updateVisibleUniqueValues() {
+        let needle = valueField.stringValue
+        visibleUniqueValues = needle.isEmpty
+            ? allUniqueValues
+            : allUniqueValues.filter { $0.localizedCaseInsensitiveContains(needle) }
+        valuesTable.reloadData()
+    }
+
+
+#if LIGHTXT_STANDALONE_CSV_QA
+    func qaType(_ value: String) {
+        valueField.stringValue = value
+        valueField.currentEditor()?.string = value
+        updateVisibleUniqueValues()
+    }
+
+    func qaCommit() { commitTypedValue() }
+    func qaEndEditingByFocusLoss() {
+        // Move focus to another real control inside the still-open popover so
+        // AppKit delivers controlTextDidEndEditing without transient-popover
+        // dismissal obscuring the commit path.
+        view.window?.makeFirstResponder(valuesTable)
+    }
+    var qaHasFocus: Bool { valueField.currentEditor() != nil }
+    var qaUniqueValues: [String] { allUniqueValues }
+
+    func qaPrepareCaptureBackground() {
+        view.wantsLayer = true
+        view.layer?.backgroundColor = LighTxtTheme.resolved(
+            NSColor.windowBackgroundColor,
+            for: view.effectiveAppearance
+        ).cgColor
+    }
+
+    func qaToggle(_ value: String) {
+        if committedFilter.selectedValues.contains(value) {
+            committedFilter.selectedValues.remove(value)
+        } else {
+            committedFilter.selectedValues.insert(value)
+        }
+        clearButton.isEnabled = !committedFilter.isEmpty
+        valuesTable.reloadData()
+        onCommit?(committedFilter)
+    }
+#endif
+}
+
+@MainActor
+private final class CSVUniqueValuesProgressRelay: @unchecked Sendable {
+    private weak var controller: CSVFilterPopoverViewController?
+
+    init(controller: CSVFilterPopoverViewController) {
+        self.controller = controller
+    }
+
+    nonisolated func report(_ progress: CSVUniqueValuesProgress) {
+        Task { @MainActor [weak self] in
+            guard let self, let controller else { return }
+            controller.showUniqueValues(progress: progress)
+        }
+    }
 }
 
 private struct CSVColumnSummaryPresentation {
@@ -2744,6 +3392,36 @@ private final class CSVColumnSummaryPopoverViewController: NSViewController {
 /// in both appearances.
 private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
     var isFiltered = false
+    var showsFilterControls = true
+    var filterText = ""
+
+    func titleRect(in cellFrame: NSRect, controlView: NSView) -> NSRect {
+        guard showsFilterControls else { return cellFrame.insetBy(dx: 5, dy: 0) }
+        if controlView.isFlipped {
+            return NSRect(x: cellFrame.minX + 5, y: cellFrame.minY, width: cellFrame.width - 10, height: 25)
+        }
+        return NSRect(x: cellFrame.minX + 5, y: cellFrame.maxY - 25, width: cellFrame.width - 10, height: 25)
+    }
+
+    func filterControlRect(in cellFrame: NSRect, controlView: NSView) -> NSRect {
+        guard showsFilterControls else { return .zero }
+        if controlView.isFlipped {
+            return NSRect(x: cellFrame.minX + 3, y: cellFrame.minY + 27, width: cellFrame.width - 6, height: 24)
+        }
+        return NSRect(x: cellFrame.minX + 3, y: cellFrame.minY + 3, width: cellFrame.width - 6, height: 24)
+    }
+
+    func funnelRect(in cellFrame: NSRect, controlView: NSView) -> NSRect {
+        let row = filterControlRect(in: cellFrame, controlView: controlView)
+        // Keep a dedicated resize gutter at the trailing edge so the filter
+        // affordance never steals native column-resize drags.
+        return NSRect(x: row.maxX - 29, y: row.minY, width: 24, height: row.height)
+    }
+
+    func filterInputRect(in cellFrame: NSRect, controlView: NSView) -> NSRect {
+        let row = filterControlRect(in: cellFrame, controlView: controlView)
+        return NSRect(x: row.minX, y: row.minY, width: max(0, row.width - 25), height: row.height)
+    }
 
     override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
         let paragraph = NSMutableParagraphStyle()
@@ -2760,8 +3438,8 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
                 .paragraphStyle: paragraph,
             ]
         )
-        let indicatorWidth: CGFloat = isFiltered ? 18 : 0
-        var titleFrame = cellFrame.insetBy(dx: 4, dy: 0)
+        let indicatorWidth: CGFloat = isFiltered ? 15 : 0
+        var titleFrame = titleRect(in: cellFrame, controlView: controlView)
         titleFrame.size.width = max(0, titleFrame.width - indicatorWidth)
         let titleHeight = attributedTitle.size().height
         let verticallyCentered = NSRect(
@@ -2787,19 +3465,152 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
 
         if isFiltered,
            let indicator = NSImage(
-               systemSymbolName: "line.3.horizontal.decrease",
+               systemSymbolName: "line.3.horizontal.decrease.circle.fill",
                accessibilityDescription: "Filtered"
            )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)) {
             indicator.isTemplate = true
             let frame = NSRect(
-                x: cellFrame.maxX - 17,
-                y: cellFrame.midY - 6,
+                x: titleFrame.maxX + 2,
+                y: titleFrame.midY - 6,
                 width: 12,
                 height: 12
             )
             NSColor.controlAccentColor.set()
             indicator.draw(in: frame)
         }
+
+        guard showsFilterControls else { return }
+        let input = filterInputRect(in: cellFrame, controlView: controlView)
+        let funnel = funnelRect(in: cellFrame, controlView: controlView)
+        NSColor.separatorColor.withAlphaComponent(0.65).setStroke()
+        let separatorY = controlView.isFlipped ? input.minY - 1 : input.maxY + 1
+        NSBezierPath.strokeLine(
+            from: NSPoint(x: cellFrame.minX, y: separatorY),
+            to: NSPoint(x: cellFrame.maxX, y: separatorY)
+        )
+
+        if isFiltered {
+            NSColor.controlAccentColor.withAlphaComponent(0.10).setFill()
+            NSBezierPath(roundedRect: input.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5).fill()
+        }
+        // Directly drawing a template NSImage here can resolve to black when
+        // an attached window switches to dark appearance. Draw the compact
+        // search mark ourselves with a concrete semantic color instead.
+        let affordanceColor = LighTxtTheme.resolved(
+            LighTxtTheme.secondaryText,
+            for: controlView.effectiveAppearance
+        )
+        affordanceColor.setStroke()
+        let searchCenter = NSPoint(x: input.minX + 11.5, y: input.midY - 1)
+        let search = NSBezierPath(ovalIn: NSRect(
+            x: searchCenter.x - 4,
+            y: searchCenter.y - 4,
+            width: 8,
+            height: 8
+        ))
+        search.lineWidth = 1.35
+        search.stroke()
+        let handle = NSBezierPath()
+        handle.move(to: NSPoint(x: searchCenter.x + 3.1, y: searchCenter.y + 3.1))
+        handle.line(to: NSPoint(x: searchCenter.x + 6.4, y: searchCenter.y + 6.4))
+        handle.lineWidth = 1.35
+        handle.lineCapStyle = .round
+        handle.stroke()
+        if !filterText.isEmpty {
+            let textRect = NSRect(
+                x: input.minX + 23,
+                y: input.minY + 4,
+                width: max(0, input.width - 27),
+                height: 16
+            )
+            NSAttributedString(
+                string: filterText,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11),
+                    .foregroundColor: NSColor.labelColor,
+                ]
+            ).draw(with: textRect, options: [.truncatesLastVisibleLine])
+        }
+        _ = funnel // The accessible overlay button draws the funnel glyph.
+    }
+}
+
+/// A lightweight, visible-only proxy for the inline contains editor. Keeping
+/// these controls virtualized to the visible columns preserves the 512-column
+/// bound while making the filter row discoverable and keyboard accessible.
+@MainActor
+private final class LighTxtCSVContainsButton: NSButton {
+    var filterText = "" { didSet { needsDisplay = true } }
+    var isFilterActive = false { didSet { needsDisplay = true } }
+
+    init() {
+        super.init(frame: .zero)
+        title = ""
+        isBordered = false
+        focusRingType = .default
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let appearance = effectiveAppearance
+        let fieldRect = bounds.insetBy(dx: 0.5, dy: 1.5)
+        let path = NSBezierPath(roundedRect: fieldRect, xRadius: 5, yRadius: 5)
+        let fill = isFilterActive
+            ? LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance).withAlphaComponent(0.13)
+            : LighTxtTheme.resolved(NSColor.controlBackgroundColor, for: appearance).withAlphaComponent(0.34)
+        fill.setFill()
+        path.fill()
+        LighTxtTheme.resolved(LighTxtTheme.separator, for: appearance)
+            .withAlphaComponent(isEnabled ? 0.72 : 0.38)
+            .setStroke()
+        path.lineWidth = 0.75
+        path.stroke()
+
+        let color = LighTxtTheme.resolved(
+            filterText.isEmpty ? LighTxtTheme.secondaryText : LighTxtTheme.primaryText,
+            for: appearance
+        ).withAlphaComponent(isEnabled ? 1 : 0.48)
+        color.setStroke()
+        let center = NSPoint(x: fieldRect.minX + 11, y: fieldRect.midY)
+        let glass = NSBezierPath(ovalIn: NSRect(
+            x: center.x - 3.7,
+            y: center.y - 3.7,
+            width: 7.4,
+            height: 7.4
+        ))
+        glass.lineWidth = 1.25
+        glass.stroke()
+        let direction: CGFloat = isFlipped ? 1 : -1
+        let handle = NSBezierPath()
+        handle.move(to: NSPoint(x: center.x + 2.8, y: center.y + 2.8 * direction))
+        handle.line(to: NSPoint(x: center.x + 5.8, y: center.y + 5.8 * direction))
+        handle.lineWidth = 1.25
+        handle.lineCapStyle = .round
+        handle.stroke()
+
+        let text = filterText.isEmpty ? (bounds.width >= 78 ? "Contains" : "") : filterText
+        guard !text.isEmpty else { return }
+        let textColor = filterText.isEmpty
+            ? LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
+            : LighTxtTheme.resolved(LighTxtTheme.primaryText, for: appearance)
+        let attributed = NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 11),
+            .foregroundColor: textColor.withAlphaComponent(isEnabled ? 1 : 0.48),
+        ])
+        let textRect = NSRect(
+            x: fieldRect.minX + 22,
+            y: fieldRect.midY - attributed.size().height / 2,
+            width: max(0, fieldRect.width - 26),
+            height: attributed.size().height
+        )
+        attributed.draw(with: textRect, options: [.truncatesLastVisibleLine])
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
     }
 }
 
@@ -2807,10 +3618,324 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
 /// materials, but our opaque editor surface has no material backdrop and dark
 /// vibrancy can suppress custom header titles almost completely. A non-vibrant
 /// header keeps native resizing/dragging while drawing predictable contrast.
-private final class LighTxtCSVHeaderView: NSTableHeaderView {
+@MainActor
+private final class LighTxtCSVHeaderView: NSTableHeaderView, NSSearchFieldDelegate {
     var menuProvider: ((Int) -> NSMenu?)?
+    var onCommitContainsFilter: ((Int, String) -> Void)?
+    var onShowFilterValues: ((Int) -> Void)?
+    var filterTextProvider: ((Int) -> String)?
+    var filterEditingEnabledProvider: (() -> Bool)?
+
+    private var editingColumn: Int?
+    private var originalText = ""
+    private var containsButtons: [Int: LighTxtCSVContainsButton] = [:]
+    private var filterButtons: [Int: NSButton] = [:]
+    private var boundsObserver: NSObjectProtocol?
+    private lazy var inlineField: NSSearchField = {
+        let field = NSSearchField()
+        field.placeholderString = "Contains"
+        field.controlSize = .small
+        field.delegate = self
+        field.target = self
+        field.action = #selector(commitInlineField(_:))
+        field.sendsSearchStringImmediately = false
+        field.sendsWholeSearchString = true
+        field.setAccessibilityHelp("Press Return or click elsewhere to apply; press Escape to cancel")
+        return field
+    }()
 
     override var allowsVibrancy: Bool { false }
+
+    deinit {
+        if let boundsObserver { NotificationCenter.default.removeObserver(boundsObserver) }
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        if let boundsObserver { NotificationCenter.default.removeObserver(boundsObserver) }
+        boundsObserver = nil
+        guard let clipView = superview as? NSClipView else { return }
+        clipView.postsBoundsChangedNotifications = true
+        boundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: clipView,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.synchronizeVisibleFilterButtons()
+                self?.repositionInlineField()
+            }
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let tableView else { return super.mouseDown(with: event) }
+        let point = convert(event.locationInWindow, from: nil)
+        let tableColumnIndex = tableView.column(at: point)
+        guard tableColumnIndex >= 0,
+              let tableColumn = tableView.tableColumns[safe: tableColumnIndex],
+              let column = Self.dataColumn(from: tableColumn),
+              let cell = tableColumn.headerCell as? LighTxtCSVHeaderCell else {
+            return super.mouseDown(with: event)
+        }
+        let frame = headerRect(ofColumn: tableColumnIndex)
+        guard filterEditingEnabledProvider?() != false else {
+            NSSound.beep()
+            return
+        }
+        if cell.funnelRect(in: frame, controlView: self).contains(point) {
+            window?.makeFirstResponder(nil)
+            onShowFilterValues?(column)
+            return
+        }
+        if cell.filterInputRect(in: frame, controlView: self).contains(point) {
+            beginEditing(column: column, tableColumnIndex: tableColumnIndex, cell: cell)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func layout() {
+        super.layout()
+        synchronizeVisibleFilterButtons()
+        repositionInlineField()
+    }
+
+    func refreshFilterDisplay() {
+        if filterEditingEnabledProvider?() == false, editingColumn != nil {
+            inlineField.stringValue = originalText
+            finishInlineField(commit: false)
+        }
+        if editingColumn == nil { inlineField.removeFromSuperview() }
+        synchronizeVisibleFilterButtons()
+        needsDisplay = true
+    }
+
+    private func beginEditing(
+        column: Int,
+        tableColumnIndex: Int,
+        cell: LighTxtCSVHeaderCell
+    ) {
+        if editingColumn != column { finishInlineField(commit: true) }
+        editingColumn = column
+        originalText = filterTextProvider?(column) ?? ""
+        inlineField.stringValue = originalText
+        let title = tableView?.tableColumns[safe: tableColumnIndex]?.title ?? "column"
+        inlineField.setAccessibilityLabel("Contains text for \(title)")
+        if inlineField.superview !== self { addSubview(inlineField) }
+        containsButtons[column]?.isHidden = true
+        inlineField.frame = cell.filterInputRect(
+            in: headerRect(ofColumn: tableColumnIndex),
+            controlView: self
+        ).insetBy(dx: 1, dy: 0)
+        window?.makeFirstResponder(inlineField)
+    }
+
+    private func repositionInlineField() {
+        guard let editingColumn,
+              let tableView,
+              let index = tableView.tableColumns.firstIndex(where: {
+                  Self.dataColumn(from: $0) == editingColumn
+              }),
+              let cell = tableView.tableColumns[index].headerCell as? LighTxtCSVHeaderCell else {
+            return
+        }
+        inlineField.frame = cell.filterInputRect(
+            in: headerRect(ofColumn: index),
+            controlView: self
+        ).insetBy(dx: 1, dy: 0)
+    }
+
+    @objc private func commitInlineField(_ sender: Any?) {
+        finishInlineField(commit: true)
+        window?.makeFirstResponder(nil)
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        let movement = (notification.userInfo?["NSTextMovement"] as? NSNumber)?.intValue
+        finishInlineField(commit: movement != NSCancelTextMovement)
+    }
+
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        guard commandSelector == #selector(NSResponder.cancelOperation(_:)) else { return false }
+        inlineField.stringValue = originalText
+        finishInlineField(commit: false)
+        window?.makeFirstResponder(nil)
+        return true
+    }
+
+    private func finishInlineField(commit: Bool) {
+        guard let column = editingColumn else { return }
+        let value = inlineField.stringValue
+        editingColumn = nil
+        inlineField.removeFromSuperview()
+        synchronizeVisibleFilterButtons()
+        needsDisplay = true
+        if commit, value != originalText { onCommitContainsFilter?(column, value) }
+    }
+
+    private func synchronizeVisibleFilterButtons() {
+        guard let tableView else { return }
+        let viewport = visibleRect.width > 0 && visibleRect.height > 0
+            ? visibleRect
+            : NSRect(x: bounds.minX, y: bounds.minY, width: max(1_000, bounds.width), height: max(54, bounds.height))
+        let visible = viewport.insetBy(dx: -30, dy: 0)
+        var retained = Set<Int>()
+        for (index, tableColumn) in tableView.tableColumns.enumerated() {
+            guard let column = Self.dataColumn(from: tableColumn),
+                  let cell = tableColumn.headerCell as? LighTxtCSVHeaderCell else { continue }
+            let columnFrame = headerRect(ofColumn: index)
+            guard columnFrame.intersects(visible) else { continue }
+            retained.insert(column)
+            let containsButton: LighTxtCSVContainsButton
+            if let existing = containsButtons[column] {
+                containsButton = existing
+            } else {
+                containsButton = LighTxtCSVContainsButton()
+                containsButton.target = self
+                containsButton.action = #selector(beginContainsFromButton(_:))
+                containsButtons[column] = containsButton
+                addSubview(containsButton)
+            }
+            containsButton.tag = column
+            containsButton.frame = cell.filterInputRect(
+                in: columnFrame,
+                controlView: self
+            ).insetBy(dx: 1, dy: 0)
+            containsButton.filterText = filterTextProvider?(column) ?? ""
+            containsButton.isFilterActive = cell.isFiltered
+            containsButton.toolTip = "Contains filter for \(tableColumn.title)"
+            containsButton.setAccessibilityLabel("Contains filter for \(tableColumn.title)")
+            containsButton.setAccessibilityHelp("Type text, then press Return or click elsewhere to apply")
+            containsButton.isEnabled = filterEditingEnabledProvider?() != false
+            containsButton.isHidden = editingColumn == column
+
+            let button: NSButton
+            if let existing = filterButtons[column] {
+                button = existing
+            } else {
+                button = NSButton()
+                button.image = NSImage(
+                    systemSymbolName: "line.3.horizontal.decrease",
+                    accessibilityDescription: nil
+                )?.withSymbolConfiguration(NSImage.SymbolConfiguration(
+                    pointSize: 11,
+                    weight: .medium
+                ))
+                button.imagePosition = .imageOnly
+                button.isBordered = false
+                button.focusRingType = .default
+                button.target = self
+                button.action = #selector(showValuesFromButton(_:))
+                filterButtons[column] = button
+                addSubview(button)
+            }
+            button.tag = column
+            button.frame = cell.funnelRect(in: columnFrame, controlView: self)
+            button.toolTip = "Choose values for \(tableColumn.title)"
+            button.setAccessibilityLabel("Filter values for \(tableColumn.title)")
+            button.setAccessibilityHelp("Opens unique values and a contains field")
+            button.contentTintColor = LighTxtTheme.resolved(
+                cell.isFiltered ? LighTxtTheme.accent : LighTxtTheme.secondaryText,
+                for: effectiveAppearance
+            )
+            button.isEnabled = filterEditingEnabledProvider?() != false
+        }
+        let removed = filterButtons.keys.filter { !retained.contains($0) }
+        for column in removed {
+            filterButtons.removeValue(forKey: column)?.removeFromSuperview()
+            containsButtons.removeValue(forKey: column)?.removeFromSuperview()
+        }
+    }
+
+    @objc private func beginContainsFromButton(_ sender: NSButton) {
+        guard filterEditingEnabledProvider?() != false,
+              let tableView,
+              let index = tableView.tableColumns.firstIndex(where: {
+                  Self.dataColumn(from: $0) == sender.tag
+              }),
+              let cell = tableView.tableColumns[index].headerCell as? LighTxtCSVHeaderCell else {
+            NSSound.beep()
+            return
+        }
+        beginEditing(column: sender.tag, tableColumnIndex: index, cell: cell)
+    }
+
+    @objc private func showValuesFromButton(_ sender: NSButton) {
+        guard filterEditingEnabledProvider?() != false else {
+            NSSound.beep()
+            return
+        }
+        window?.makeFirstResponder(nil)
+        onShowFilterValues?(sender.tag)
+    }
+
+    private static func dataColumn(from tableColumn: NSTableColumn) -> Int? {
+        let raw = tableColumn.identifier.rawValue
+        guard raw.hasPrefix("csv-column-") else { return nil }
+        return Int(raw.dropFirst("csv-column-".count))
+    }
+
+#if LIGHTXT_STANDALONE_CSV_QA
+    func qaBeginEditing(dataColumn column: Int) {
+        guard filterEditingEnabledProvider?() != false,
+              let tableView,
+              let index = tableView.tableColumns.firstIndex(where: {
+                  Self.dataColumn(from: $0) == column
+              }),
+              let cell = tableView.tableColumns[index].headerCell as? LighTxtCSVHeaderCell else { return }
+        beginEditing(column: column, tableColumnIndex: index, cell: cell)
+    }
+
+    func qaType(_ value: String) {
+        inlineField.stringValue = value
+        inlineField.currentEditor()?.string = value
+    }
+
+    func qaCommit() { commitInlineField(nil) }
+    func qaCancel() {
+        inlineField.stringValue = originalText
+        finishInlineField(commit: false)
+        window?.makeFirstResponder(nil)
+    }
+    var qaHasFocus: Bool { editingColumn != nil && inlineField.currentEditor() != nil }
+    var qaFilterButtonColumns: Set<Int> { Set(filterButtons.keys) }
+    func qaSynchronizeFilterButtons() { synchronizeVisibleFilterButtons() }
+
+    var qaMinimumFilterAffordanceContrast: CGFloat {
+        let background = LighTxtTheme.resolved(
+            LighTxtTheme.editorBackground,
+            for: effectiveAppearance
+        )
+        let search = LighTxtTheme.resolved(
+            LighTxtTheme.secondaryText,
+            for: effectiveAppearance
+        )
+        let colors = [search] + filterButtons.values.compactMap(\.contentTintColor)
+        return colors.map { Self.contrastRatio($0, background) }.min() ?? 0
+    }
+
+    private static func contrastRatio(_ lhs: NSColor, _ rhs: NSColor) -> CGFloat {
+        func luminance(_ color: NSColor) -> CGFloat {
+            guard let rgb = color.usingColorSpace(.deviceRGB) else { return 0 }
+            func linear(_ component: CGFloat) -> CGFloat {
+                component <= 0.04045
+                    ? component / 12.92
+                    : pow((component + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * linear(rgb.redComponent)
+                + 0.7152 * linear(rgb.greenComponent)
+                + 0.0722 * linear(rgb.blueComponent)
+        }
+        let light = max(luminance(lhs), luminance(rhs))
+        let dark = min(luminance(lhs), luminance(rhs))
+        return (light + 0.05) / (dark + 0.05)
+    }
+#endif
 
     override func menu(for event: NSEvent) -> NSMenu? {
         guard let tableView else { return nil }
@@ -2820,8 +3945,98 @@ private final class LighTxtCSVHeaderView: NSTableHeaderView {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        synchronizeVisibleFilterButtons()
         needsDisplay = true
     }
+}
+
+@MainActor
+private final class LighTxtCSVTableView: NSTableView {
+    var bodyMenuProvider: ((Int, Int) -> NSMenu?)?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        let row = self.row(at: point)
+        let column = self.column(at: point)
+        return bodyMenuProvider?(column, row) ?? super.menu(for: event)
+    }
+}
+
+@MainActor
+private final class CSVFilterChipView: NSView {
+    var onOpen: (() -> Void)?
+    var onClear: (() -> Void)?
+    let sourceColumn: Int
+
+    private let openButton = NSButton()
+    private let clearButton = NSButton()
+
+    init(sourceColumn: Int, title: String, summary: String, fullDescription: String) {
+        self.sourceColumn = sourceColumn
+        let displaySummary = summary.isEmpty ? "Filtered" : summary
+        let display = "\(title)  \(displaySummary)"
+        let measured = (display as NSString).size(withAttributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+        ]).width
+        super.init(frame: NSRect(x: 0, y: 0, width: min(210, max(105, measured + 48)), height: 28))
+        wantsLayer = true
+        layer?.cornerRadius = 7
+
+        openButton.title = display
+        openButton.font = .systemFont(ofSize: 12, weight: .medium)
+        openButton.isBordered = false
+        openButton.alignment = .left
+        openButton.lineBreakMode = .byTruncatingTail
+        openButton.target = self
+        openButton.action = #selector(open(_:))
+        openButton.toolTip = fullDescription
+        openButton.setAccessibilityLabel(fullDescription)
+
+        clearButton.image = NSImage(
+            systemSymbolName: "xmark.circle.fill",
+            accessibilityDescription: "Remove filter"
+        )
+        clearButton.imagePosition = .imageOnly
+        clearButton.isBordered = false
+        clearButton.target = self
+        clearButton.action = #selector(clear(_:))
+        clearButton.toolTip = "Remove this filter"
+        clearButton.setAccessibilityLabel("Remove filter for \(title)")
+
+        addSubview(openButton)
+        addSubview(clearButton)
+        applyAppearance()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layout() {
+        super.layout()
+        clearButton.frame = NSRect(x: bounds.maxX - 28, y: 0, width: 28, height: bounds.height)
+        openButton.frame = NSRect(x: 8, y: 0, width: max(0, bounds.width - 36), height: bounds.height)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyAppearance()
+    }
+
+    private func applyAppearance() {
+        layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.10).cgColor
+        layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.32).cgColor
+        layer?.borderWidth = 1
+        openButton.contentTintColor = .labelColor
+        clearButton.contentTintColor = .controlAccentColor
+    }
+
+    @objc private func open(_ sender: Any?) { onOpen?() }
+    @objc private func clear(_ sender: Any?) { onClear?() }
+
+#if LIGHTXT_STANDALONE_CSV_QA
+    func qaOpen() { onOpen?() }
+    func qaClear() { onClear?() }
+#endif
 }
 
 private enum CSVTableViewOperationError: LocalizedError {

@@ -62,6 +62,7 @@ struct CSVTableRuntimeQA {
         let fixtureDelegate = try QACSVDelegate(url: fixtureURL)
         let fixtureView = CSVTableView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 720))
         let fixtureWindow = makeWindow(containing: fixtureView, appearance: .aqua)
+        fixtureWindow.makeKeyAndOrderFront(nil)
         var fixtureComplete = false
         fixtureView.onStatusChange = { _, busy in fixtureComplete = !busy }
         fixtureView.editorDelegate = fixtureDelegate
@@ -71,13 +72,187 @@ struct CSVTableRuntimeQA {
               fixtureTable.numberOfColumns == 5 else {
             throw QAError.failed("CSV table did not detect a four-row/four-column fixture with fixed header")
         }
+        fixtureView.layoutSubtreeIfNeeded()
+        fixtureTable.headerView?.layoutSubtreeIfNeeded()
 
         let accessibilityLabels = descendants(of: fixtureView, as: NSButton.self)
             .compactMap { $0.accessibilityLabel() }
-        guard accessibilityLabels.contains("Add CSV row or column"),
-              accessibilityLabels.contains("Delete CSV row or column"),
-              accessibilityLabels.contains("Clear all CSV filters") else {
-            throw QAError.failed("CSV table actions are missing accessible labels")
+        guard !accessibilityLabels.contains("Add CSV row or column"),
+              !accessibilityLabels.contains("Delete CSV row or column"),
+              fixtureView.qaAccessibleFilterButtonColumns.count >= 4 else {
+            throw QAError.failed("CSV filter buttons are not accessible, or removed global Add/Delete controls remain")
+        }
+        guard fixtureView.qaRowContextMenuTitles(row: 0) == [
+            "Add Row Above", "Add Row Below", "Delete Row",
+        ] else {
+            throw QAError.failed("Row mutations did not move to the table body context menu")
+        }
+
+        let pristineFixture = try documentString(fixtureDelegate.engine)
+
+        // The header's contains editor owns a draft. Human-paced typing must
+        // neither install a filter nor surrender focus; Escape restores the
+        // committed value without touching the document or row projection.
+        fixtureView.qaBeginInlineContainsFilter(column: 1)
+        fixtureView.qaTypeInlineContainsFilter("G")
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.22))
+        fixtureView.qaTypeInlineContainsFilter("Grace")
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.35))
+        guard fixtureView.qaCommittedFilter(column: 1) == nil,
+              fixtureTable.numberOfRows == 4,
+              fixtureView.qaInlineFilterHasFocus else {
+            throw QAError.failed("Inline contains typing applied early or lost focus")
+        }
+        fixtureView.qaCancelInlineContainsFilter()
+        guard fixtureView.qaCommittedFilter(column: 1) == nil,
+              fixtureTable.numberOfRows == 4 else {
+            throw QAError.failed("Escape committed an inline contains draft")
+        }
+
+        // The unique-values picker keeps its search field alive while typing.
+        // It commits text only on Return/focus loss and exact checkboxes as OR.
+        fixtureView.qaShowFilterPopover(column: 1)
+        try wait(
+            until: { fixtureView.qaPopoverUniqueValues.count == 4 },
+            timeout: 5,
+            failure: "Unique-value picker did not discover the complete name column"
+        )
+        fixtureView.qaTypePopoverContains("A")
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.22))
+        fixtureView.qaTypePopoverContains("Ad")
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.35))
+        guard fixtureView.qaCommittedFilter(column: 1) == nil,
+              fixtureTable.numberOfRows == 4,
+              fixtureView.qaPopoverFilterHasFocus else {
+            throw QAError.failed(
+                "Popover typing state: committed=\(String(describing: fixtureView.qaCommittedFilter(column: 1))), rows=\(fixtureTable.numberOfRows), focus=\(fixtureView.qaPopoverFilterHasFocus)"
+            )
+        }
+        fixtureComplete = false
+        fixtureView.qaCommitPopoverContains()
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 1 },
+            timeout: 5,
+            failure: "Committed full contains query did not finish"
+        )
+        guard fixtureView.qaCommittedFilter(column: 1)?.contains == "Ad",
+              fixtureView.qaPopoverFilterHasFocus,
+              fixtureView.qaFilterChipCount == 1 else {
+            throw QAError.failed("Query launch stole filter focus or active chip did not reflect the full query")
+        }
+        fixtureComplete = false
+        fixtureView.qaClearFilterChip(column: 1)
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 4 },
+            timeout: 5,
+            failure: "Clearing the typed filter chip did not restore rows"
+        )
+
+        // Clicking to another control follows AppKit's end-editing delegate
+        // path. The complete draft must commit once—not once per keystroke and
+        // not again when the field editor resigns.
+        fixtureView.qaShowFilterPopover(column: 1)
+        try wait(
+            until: { fixtureView.qaPopoverUniqueValues.count == 4 },
+            timeout: 5,
+            failure: "Focus-loss picker did not load unique values"
+        )
+        fixtureView.qaTypePopoverContains("Grace")
+        let queriesBeforeFocusLoss = fixtureView.qaQueryLaunchCount
+        fixtureComplete = false
+        fixtureView.qaEndPopoverContainsEditingByFocusLoss()
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 1 },
+            timeout: 5,
+            failure: "Focus loss did not commit the full contains query"
+        )
+        guard fixtureView.qaCommittedFilter(column: 1)?.contains == "Grace",
+              fixtureView.qaQueryLaunchCount == queriesBeforeFocusLoss + 1 else {
+            throw QAError.failed("Focus loss committed more than one filter query")
+        }
+        fixtureComplete = false
+        fixtureView.qaClearFilterChip(column: 1)
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 4 },
+            timeout: 5,
+            failure: "Clearing the focus-loss filter did not restore rows"
+        )
+
+        fixtureView.qaShowFilterPopover(column: 3)
+        try wait(
+            until: { Set(fixtureView.qaPopoverUniqueValues) == ["false", "true"] },
+            timeout: 5,
+            failure: "Boolean unique values were not shown"
+        )
+        fixtureComplete = false
+        fixtureView.qaTogglePopoverValue("true")
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 3 },
+            timeout: 5,
+            failure: "Exact checkbox selection did not filter rows"
+        )
+        guard fixtureView.qaPopoverFilterHasFocus,
+              fixtureView.qaCommittedFilter(column: 3)?.selected == ["true"] else {
+            throw QAError.failed("Checkbox query closed the picker, stole focus, or lost its exact value")
+        }
+        fixtureComplete = false
+        fixtureView.qaTogglePopoverValue("false")
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 4 },
+            timeout: 5,
+            failure: "Multi-select values were not ORed within one column"
+        )
+        guard fixtureView.qaCommittedFilter(column: 3)?.selected == ["false", "true"],
+              fixtureView.qaFilterChipCount == 1 else {
+            throw QAError.failed("Filter chip lost the multi-select state")
+        }
+
+        // Replacing a filter popover with Summary must cancel discovery; the
+        // chip then reopens the same logical source column. Reorder first to
+        // prove visual position never changes its target.
+        fixtureView.qaShowColumnSummary(column: 3)
+        fixtureView.qaMoveDataColumn(3, toVisualIndex: 1)
+        fixtureView.qaOpenFilterChip(column: 3)
+        try wait(
+            until: { Set(fixtureView.qaPopoverUniqueValues) == ["false", "true"] },
+            timeout: 5,
+            failure: "Chip did not reopen its source column after reorder"
+        )
+        fixtureView.qaTypePopoverContains("t")
+        fixtureComplete = false
+        fixtureView.qaCommitPopoverContains()
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 3 },
+            timeout: 5,
+            failure: "Commit from a chip-anchored popover did not finish"
+        )
+        guard fixtureView.qaHasPresentedPopover,
+              fixtureView.qaPopoverAnchoredToFilterChip,
+              fixtureView.qaPopoverFilterHasFocus else {
+            throw QAError.failed("Chip rebuild detached its open filter popover")
+        }
+        fixtureComplete = false
+        fixtureView.qaTogglePopoverValue("false")
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 3 },
+            timeout: 5,
+            failure: "Checkbox commit from the rebuilt chip popover did not finish"
+        )
+        guard fixtureView.qaHasPresentedPopover,
+              fixtureView.qaPopoverAnchoredToFilterChip,
+              fixtureView.qaPopoverFilterHasFocus else {
+            throw QAError.failed("Checkbox commit detached the chip-anchored popover")
+        }
+        fixtureComplete = false
+        fixtureView.qaClearFilterChip(column: 3)
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 4 },
+            timeout: 5,
+            failure: "Clearing reordered-column chip did not restore rows"
+        )
+        fixtureView.qaMoveDataColumn(3, toVisualIndex: 4)
+        guard try documentString(fixtureDelegate.engine) == pristineFixture else {
+            throw QAError.failed("Filter UI interactions mutated CSV document bytes")
         }
 
         // Drive the real header delegate cycle: ascending, descending, then
@@ -126,12 +301,59 @@ struct CSVTableRuntimeQA {
             throw QAError.failed("Column Summary did not report complete sampling and top values: \(summaryText)")
         }
 
+        // Capture the requested UX in a meaningful state: a contains draft
+        // and an exact-value selection are both active, their chip is visible,
+        // and the unique-value picker remains open.
+        fixtureView.qaShowFilterPopover(column: 1)
+        try wait(
+            until: { fixtureView.qaPopoverUniqueValues.count == 4 },
+            timeout: 5,
+            failure: "Capture picker did not load unique values"
+        )
+        fixtureView.qaTypePopoverContains("a")
+        fixtureComplete = false
+        fixtureView.qaCommitPopoverContains()
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 2 },
+            timeout: 5,
+            failure: "Capture contains filter did not finish"
+        )
+        fixtureComplete = false
+        fixtureView.qaTogglePopoverValue("Ada")
+        try wait(
+            until: { fixtureComplete && fixtureTable.numberOfRows == 1 },
+            timeout: 5,
+            failure: "Capture exact-value filter did not finish"
+        )
+        guard fixtureView.qaFilterChipCount == 1,
+              fixtureView.qaHasPresentedPopover,
+              let capturePopover = fixtureView.qaPopoverContentView else {
+            throw QAError.failed("Active filter capture did not retain its chip and picker")
+        }
+
         fixtureWindow.appearance = NSAppearance(named: .aqua)
+        capturePopover.appearance = fixtureWindow.appearance
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        fixtureView.qaPreparePopoverCaptureBackground()
         fixtureView.layoutSubtreeIfNeeded()
-        try render(fixtureView, to: outputDirectory.appendingPathComponent("csv-light.png"))
+        try render(
+            fixtureView,
+            overlay: capturePopover,
+            to: outputDirectory.appendingPathComponent("csv-light.png")
+        )
         fixtureWindow.appearance = NSAppearance(named: .darkAqua)
+        capturePopover.appearance = fixtureWindow.appearance
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        fixtureView.qaPreparePopoverCaptureBackground()
         fixtureView.layoutSubtreeIfNeeded()
-        try render(fixtureView, to: outputDirectory.appendingPathComponent("csv-dark.png"))
+        guard fixtureView.qaFilterAffordanceContrast >= 3 else {
+            throw QAError.failed("Dark CSV filter magnifier/funnel contrast fell below 3:1")
+        }
+        try render(
+            fixtureView,
+            overlay: capturePopover,
+            to: outputDirectory.appendingPathComponent("csv-dark.png")
+        )
 
         // Mutations use a private fixture copy and the same delegate contract
         // as the document session. Every operation must publish one undoable
@@ -156,6 +378,38 @@ struct CSVTableRuntimeQA {
         guard let mutationTable = descendant(of: mutationView, as: NSTableView.self) else {
             throw QAError.failed("Mutation fixture table was not available")
         }
+
+        // A structural rewrite owns column coordinates until publication.
+        // Filter affordances must reject drafts during that interval, then
+        // resume against the freshly indexed schema.
+        mutationDelegate.deferColumnMutations = true
+        mutationReady = false
+        mutationView.qaAddColumn(at: 1, name: "delayed")
+        try wait(
+            until: { mutationView.qaStructuralMutationInFlight },
+            timeout: 2,
+            failure: "Delayed column mutation never entered its guarded phase"
+        )
+        mutationView.qaShowFilterPopover(column: 1)
+        mutationView.qaBeginInlineContainsFilter(column: 1)
+        guard !mutationView.qaHasPresentedPopover,
+              !mutationView.qaInlineFilterHasFocus,
+              mutationView.qaCommittedFilter(column: 1) == nil else {
+            throw QAError.failed("Filter committed stale coordinates during a structural mutation")
+        }
+        mutationDelegate.deferColumnMutations = false
+        mutationDelegate.completeDeferredColumnMutation()
+        try wait(
+            until: { mutationReady && mutationView.qaColumnTitles.contains("delayed") },
+            timeout: 5,
+            failure: "Delayed column mutation did not publish and reindex"
+        )
+        guard mutationDelegate.engine.undo(), try documentString(mutationDelegate.engine) == baseline else {
+            throw QAError.failed("Could not restore baseline after delayed-mutation filter guard")
+        }
+        mutationReady = false
+        mutationView.reloadDocument()
+        try wait(until: { mutationReady }, timeout: 5, failure: "Delayed mutation undo did not reindex")
 
         // Editing a projected key must discard the pre-edit row map and run a
         // generation-safe replacement query. Membership and order both need
@@ -327,6 +581,42 @@ struct CSVTableRuntimeQA {
             throw QAError.failed("Sampled summary did not disclose its strategy and row count: \(sampledText)")
         }
 
+        // A header-only file has no body row to right-click. Empty table
+        // space must still expose and execute the first Add Row action.
+        let headerOnlyURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "LighTxt-CSV-header-only-QA-\(UUID().uuidString).csv"
+        )
+        try Data("id,name\n".utf8).write(to: headerOnlyURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: headerOnlyURL) }
+        let headerOnlyDelegate = try QACSVDelegate(url: headerOnlyURL)
+        let headerOnlyView = CSVTableView(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+        let headerOnlyWindow = makeWindow(containing: headerOnlyView, appearance: .aqua)
+        _ = headerOnlyWindow
+        var headerOnlyReady = false
+        headerOnlyView.onStatusChange = { _, busy in headerOnlyReady = !busy }
+        headerOnlyDelegate.onDocumentChange = { [weak headerOnlyView] in
+            headerOnlyView?.reloadDocument()
+        }
+        headerOnlyView.editorDelegate = headerOnlyDelegate
+        try wait(until: { headerOnlyReady }, timeout: 5, failure: "Header-only CSV did not index")
+        guard let headerOnlyTable = descendant(of: headerOnlyView, as: NSTableView.self),
+              headerOnlyTable.numberOfRows == 0,
+              headerOnlyView.qaEmptySpaceContextMenuTitles == ["Add Row"] else {
+            throw QAError.failed("Header-only CSV did not expose Add Row from empty table space")
+        }
+        headerOnlyReady = false
+        guard headerOnlyView.qaPerformEmptySpaceContextMenuItem(named: "Add Row") else {
+            throw QAError.failed("Header-only Add Row context-menu action was disabled")
+        }
+        try wait(
+            until: { headerOnlyReady && headerOnlyTable.numberOfRows == 1 },
+            timeout: 5,
+            failure: "Header-only context-menu Add Row did not finish"
+        )
+        guard try documentString(headerOnlyDelegate.engine) == "id,name\n,\n" else {
+            throw QAError.failed("Header-only context-menu Add Row wrote the wrong record")
+        }
+
         let emptyURL = FileManager.default.temporaryDirectory.appendingPathComponent(
             "LighTxt-CSV-empty-QA-\(UUID().uuidString).csv"
         )
@@ -335,7 +625,7 @@ struct CSVTableRuntimeQA {
         let emptyDelegate = try QACSVDelegate(url: emptyURL)
         let emptyView = CSVTableView(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
         let emptyWindow = makeWindow(containing: emptyView, appearance: .aqua)
-        _ = emptyWindow
+        emptyWindow.makeKeyAndOrderFront(nil)
         var emptyReady = false
         emptyView.onStatusChange = { _, busy in emptyReady = !busy }
         emptyDelegate.onDocumentChange = { [weak emptyView] in emptyView?.reloadDocument() }
@@ -343,11 +633,14 @@ struct CSVTableRuntimeQA {
         try wait(until: { emptyReady }, timeout: 5, failure: "Empty CSV did not initialize")
         guard let emptyTable = descendant(of: emptyView, as: NSTableView.self),
               emptyTable.numberOfRows == 0,
-              emptyTable.numberOfColumns == 1 else {
+              emptyTable.numberOfColumns == 1,
+              emptyView.qaEmptySpaceContextMenuTitles == ["Add Row", "Add Column…"] else {
             throw QAError.failed("Zero-byte CSV did not begin with an empty table")
         }
         emptyReady = false
-        emptyView.qaAddRow(beforeSourceRecord: 0)
+        guard emptyView.qaPerformEmptySpaceContextMenuItem(named: "Add Row") else {
+            throw QAError.failed("Zero-byte Add Row context-menu action was disabled")
+        }
         try wait(until: { emptyReady }, timeout: 5, failure: "Empty CSV Add Row did not finish")
         guard try documentString(emptyDelegate.engine) == "\n",
               emptyTable.numberOfRows == 1,
@@ -362,7 +655,12 @@ struct CSVTableRuntimeQA {
         try wait(until: { emptyReady }, timeout: 5, failure: "Empty row undo reload did not finish")
 
         emptyReady = false
-        emptyView.qaAddColumn(at: 0, name: "title")
+        guard emptyView.qaPerformEmptySpaceContextMenuItem(
+            named: "Add Column…",
+            columnName: "title"
+        ) else {
+            throw QAError.failed("Zero-byte Add Column context-menu action was disabled")
+        }
         try wait(until: { emptyReady }, timeout: 5, failure: "Empty CSV Add Column did not finish")
         let bootstrappedColumn = try documentString(emptyDelegate.engine)
         guard bootstrappedColumn == "title\n",
@@ -398,6 +696,25 @@ struct CSVTableRuntimeQA {
               wideView.qaColumnTitles.count == 512 else {
             throw QAError.failed("Add Column After rewrote a hidden 513th View column")
         }
+        wideView.qaScrollDataColumnToVisible(511)
+        try wait(
+            until: { wideView.qaAccessibleFilterButtonColumns.contains(511) },
+            timeout: 2,
+            failure: "Horizontal scrolling did not materialize the far-column filter button"
+        )
+        wideReady = false
+        wideView.qaApplyContainsFilter(column: 511, value: "511")
+        try wait(until: { wideReady }, timeout: 5, failure: "Far-column filter did not finish")
+        wideView.qaScrollDataColumnToVisible(0)
+        let offsetBeforeChip = wideView.qaHorizontalOffset
+        wideView.qaOpenFilterChip(column: 511)
+        guard wideView.qaPopoverAnchoredToFilterChip,
+              wideView.qaHorizontalOffset == offsetBeforeChip else {
+            throw QAError.failed("Off-screen filter chip navigated back to its column instead of anchoring locally")
+        }
+        wideReady = false
+        wideView.qaClearFilterChip(column: 511)
+        try wait(until: { wideReady }, timeout: 5, failure: "Far-column chip did not clear")
 
         let stressURL = FileManager.default.temporaryDirectory.appendingPathComponent(
             "LighTxt-CSV-page-QA-\(UUID().uuidString).csv"
@@ -703,12 +1020,66 @@ struct CSVTableRuntimeQA {
         }
     }
 
-    private static func render(_ view: NSView, to url: URL) throws {
+    private static func render(_ view: NSView, overlay: NSView? = nil, to url: URL) throws {
         view.layoutSubtreeIfNeeded()
-        guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+        guard let baseBitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
             throw QAError.failed("Could not create CSV capture buffer")
         }
-        view.cacheDisplay(in: view.bounds, to: bitmap)
+        view.cacheDisplay(in: view.bounds, to: baseBitmap)
+
+        let bitmap: NSBitmapImageRep
+        if let overlay {
+            overlay.layoutSubtreeIfNeeded()
+            guard let overlayBitmap = overlay.bitmapImageRepForCachingDisplay(in: overlay.bounds),
+                  let composite = NSBitmapImageRep(
+                      bitmapDataPlanes: nil,
+                      pixelsWide: Int(view.bounds.width.rounded(.up)),
+                      pixelsHigh: Int(view.bounds.height.rounded(.up)),
+                      bitsPerSample: 8,
+                      samplesPerPixel: 4,
+                      hasAlpha: true,
+                      isPlanar: false,
+                      colorSpaceName: .deviceRGB,
+                      bytesPerRow: 0,
+                      bitsPerPixel: 0
+                  ),
+                  let context = NSGraphicsContext(bitmapImageRep: composite) else {
+                throw QAError.failed("Could not create active-filter capture buffer")
+            }
+            overlay.cacheDisplay(in: overlay.bounds, to: overlayBitmap)
+            composite.size = view.bounds.size
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = context
+            baseBitmap.draw(in: view.bounds)
+
+            let panelRect = NSRect(
+                x: min(max(150, view.bounds.width * 0.18), view.bounds.width - overlay.bounds.width - 18),
+                y: max(18, view.bounds.height - overlay.bounds.height - 72),
+                width: overlay.bounds.width,
+                height: overlay.bounds.height
+            )
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.24)
+            shadow.shadowBlurRadius = 12
+            shadow.shadowOffset = NSSize(width: 0, height: -3)
+            NSGraphicsContext.saveGraphicsState()
+            shadow.set()
+            LighTxtTheme.resolved(
+                NSColor.windowBackgroundColor,
+                for: overlay.effectiveAppearance
+            ).setFill()
+            NSBezierPath(roundedRect: panelRect, xRadius: 10, yRadius: 10).fill()
+            NSGraphicsContext.restoreGraphicsState()
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(roundedRect: panelRect, xRadius: 10, yRadius: 10).addClip()
+            overlayBitmap.draw(in: panelRect)
+            NSGraphicsContext.restoreGraphicsState()
+            NSGraphicsContext.restoreGraphicsState()
+            bitmap = composite
+        } else {
+            bitmap = baseBitmap
+        }
+
         guard let png = bitmap.representation(using: .png, properties: [:]) else {
             throw QAError.failed("Could not encode CSV capture")
         }
@@ -772,6 +1143,8 @@ private final class QACSVDelegate: CSVMutationEditorDelegate {
     private(set) var commitCount = 0
     var onCommit: (() -> Void)?
     var onDocumentChange: (() -> Void)?
+    var deferColumnMutations = false
+    private var deferredColumnMutation: (() -> Void)?
 
     init(url: URL) throws { engine = try FileBackedPieceTable(opening: url) }
 
@@ -802,16 +1175,29 @@ private final class QACSVDelegate: CSVMutationEditorDelegate {
         progress: @escaping (CSVColumnRewriteProgress) -> Void,
         completion: @escaping (Result<CSVColumnRewriteResult, Error>) -> Void
     ) {
-        let result = Result {
-            try engine.applyCSVColumnMutation(
-                mutation,
-                snapshot: snapshot,
-                index: index,
-                progress: progress
-            )
+        let perform = { [weak self] in
+            guard let self else { return }
+            let result = Result {
+                try self.engine.applyCSVColumnMutation(
+                    mutation,
+                    snapshot: snapshot,
+                    index: index,
+                    progress: progress
+                )
+            }
+            if case .success = result { self.onDocumentChange?() }
+            completion(result)
         }
-        if case .success = result { onDocumentChange?() }
-        completion(result)
+        if deferColumnMutations {
+            deferredColumnMutation = perform
+        } else {
+            perform()
+        }
+    }
+    func completeDeferredColumnMutation() {
+        let pending = deferredColumnMutation
+        deferredColumnMutation = nil
+        pending?()
     }
     func editorCancelCSVMutation() {}
     func editorLineLocation(at byteOffset: Int64) -> EditorLineLocation {

@@ -42,6 +42,17 @@ public nonisolated enum CSVFilterPredicate: Sendable, Equatable {
     case isEmpty
     case isNotEmpty
     case numeric(CSVNumericComparison, Double)
+    /// The compact View-mode filter used by the CSV table. A nonempty text
+    /// fragment and a nonempty selected-value set are independent constraints:
+    /// both must match. Values within the selected set are alternatives (OR).
+    /// An empty selected set means "all values" so clearing every checkbox
+    /// clears that part of the filter instead of hiding every row.
+    case containsAndSelectedValues(
+        text: String,
+        selectedValues: Set<String>,
+        containsCaseSensitive: Bool,
+        selectedValuesCaseSensitive: Bool
+    )
 
     fileprivate func matches(_ value: String) -> Bool {
         switch self {
@@ -81,6 +92,24 @@ public nonisolated enum CSVFilterPredicate: Sendable, Equatable {
             case .greaterThanOrEqual: return actual >= expected
             case .greaterThan: return actual > expected
             }
+        case let .containsAndSelectedValues(
+            text,
+            selectedValues,
+            containsCaseSensitive,
+            selectedValuesCaseSensitive
+        ):
+            if !text.isEmpty,
+               value.range(
+                   of: text,
+                   options: containsCaseSensitive ? [] : [.caseInsensitive]
+               ) == nil {
+                return false
+            }
+            guard !selectedValues.isEmpty else { return true }
+            if selectedValuesCaseSensitive { return selectedValues.contains(value) }
+            return selectedValues.contains { expected in
+                compare(value, expected, caseSensitive: false) == .orderedSame
+            }
         }
     }
 
@@ -101,6 +130,118 @@ public nonisolated struct CSVColumnFilter: Sendable, Equatable {
         self.column = column
         self.predicate = predicate
     }
+
+    /// Creates one column filter for the CSV View UI. The contains constraint
+    /// and selected-value constraint are ANDed. Selected values are ORed.
+    public init(
+        column: Int,
+        containsText: String,
+        selectedValues: Set<String> = [],
+        containsCaseSensitive: Bool = false,
+        selectedValuesCaseSensitive: Bool = true
+    ) {
+        self.init(
+            column: column,
+            predicate: .containsAndSelectedValues(
+                text: containsText,
+                selectedValues: selectedValues,
+                containsCaseSensitive: containsCaseSensitive,
+                selectedValuesCaseSensitive: selectedValuesCaseSensitive
+            )
+        )
+    }
+
+    /// Compatibility shorthand for callers that intentionally want one
+    /// comparison mode for both the text and checkbox constraints.
+    public init(
+        column: Int,
+        containsText: String,
+        selectedValues: Set<String>,
+        caseSensitive: Bool
+    ) {
+        self.init(
+            column: column,
+            containsText: containsText,
+            selectedValues: selectedValues,
+            containsCaseSensitive: caseSensitive,
+            selectedValuesCaseSensitive: caseSensitive
+        )
+    }
+}
+
+/// Query-time representation that folds one-of values once rather than doing
+/// a linear scan of every selected checkbox for every source record.
+private nonisolated struct CSVCompiledFilterPredicate {
+    let predicate: CSVFilterPredicate
+    let normalizedSelectedValues: Set<String>?
+
+    init(_ predicate: CSVFilterPredicate) {
+        self.predicate = predicate
+        if case let .containsAndSelectedValues(
+            _,
+            values,
+            _,
+            selectedValuesCaseSensitive
+        ) = predicate,
+           !values.isEmpty,
+           !selectedValuesCaseSensitive {
+            self.normalizedSelectedValues = Set(values.map(csvCaseFold))
+        } else {
+            self.normalizedSelectedValues = nil
+        }
+    }
+
+    func matches(_ value: String) -> Bool {
+        guard case let .containsAndSelectedValues(
+            text,
+            selectedValues,
+            containsCaseSensitive,
+            selectedValuesCaseSensitive
+        ) = predicate else {
+            return predicate.matches(value)
+        }
+        if !text.isEmpty,
+           value.range(
+               of: text,
+               options: containsCaseSensitive ? [] : [.caseInsensitive]
+           ) == nil {
+            return false
+        }
+        guard !selectedValues.isEmpty else { return true }
+        if selectedValuesCaseSensitive { return selectedValues.contains(value) }
+        return normalizedSelectedValues?.contains(csvCaseFold(value)) == true
+    }
+}
+
+private nonisolated struct CSVCompiledColumnFilterGroup {
+    let column: Int
+    let predicates: [CSVCompiledFilterPredicate]
+
+    func matches(_ value: String) -> Bool {
+        predicates.allSatisfy { $0.matches(value) }
+    }
+}
+
+private nonisolated func compileCSVColumnFilterGroups(
+    _ filters: [CSVColumnFilter]
+) -> [CSVCompiledColumnFilterGroup] {
+    let grouped = Dictionary(grouping: filters, by: \.column)
+    return grouped.keys
+        .sorted()
+        .map { column in
+            CSVCompiledColumnFilterGroup(
+                column: column,
+                predicates: grouped[column, default: []]
+                    .map { CSVCompiledFilterPredicate($0.predicate) }
+            )
+        }
+}
+
+private nonisolated func csvCaseFold(_ value: String) -> String {
+    value.folding(
+        options: [.caseInsensitive],
+        locale: Locale(identifier: "en_US_POSIX")
+    )
 }
 
 public nonisolated enum CSVSortOrder: Sendable, Equatable {
@@ -247,8 +388,9 @@ public nonisolated enum CSVRowQueryEngine {
         }
         if cancellation?() == true { throw CancellationError() }
 
+        let filterGroups = compileCSVColumnFilterGroups(query.filters)
         let columns = Set(
-            query.filters.map(\.column) + query.sortDescriptors.map(\.column)
+            filterGroups.map(\.column) + query.sortDescriptors.map(\.column)
         )
         let directStore = try CSVTemporaryOrdinalStore()
         var sortEntries: [CSVSortEntry] = []
@@ -301,16 +443,16 @@ public nonisolated enum CSVRowQueryEngine {
                     )
                 }
                 var matches = true
-                for filter in query.filters {
-                    let field = selected.fields[filter.column]
+                for group in filterGroups {
+                    let field = selected.fields[group.column]
                     if field?.wasTruncated == true {
                         throw CSVDataOperationError.queryValueTooLarge(
                             record: location.record,
-                            column: filter.column,
+                            column: group.column,
                             limit: configuration.maximumValueBytesPerField
                         )
                     }
-                    if !filter.predicate.matches(field?.value ?? "") {
+                    if !group.matches(field?.value ?? "") {
                         matches = false
                         break
                     }
@@ -622,6 +764,314 @@ public nonisolated enum CSVRowQueryEngine {
         guard let number = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)),
               number.isFinite else { return nil }
         return number
+    }
+}
+
+public nonisolated struct CSVUniqueValuesProgress: Sendable, Equatable {
+    public let indexedFractionCompleted: Double
+    public let scannedRecordCount: Int64
+    /// Records that matched every supplied filter on other columns.
+    public let eligibleRecordCount: Int64
+    public let uniqueValueCount: Int
+    /// Candidate records at or after `firstRecord`, once the sparse index has
+    /// reached EOF. This remains nil while the total is not yet known.
+    public let totalRecordCount: Int64?
+
+    public var scannedFractionCompleted: Double? {
+        guard let totalRecordCount, totalRecordCount > 0 else { return nil }
+        return min(1, Double(scannedRecordCount) / Double(totalRecordCount))
+    }
+}
+
+public nonisolated enum CSVUniqueValuesTruncationReason: Sendable, Equatable {
+    /// More distinct values exist than the picker is configured to retain.
+    case uniqueValueCountLimit
+    /// Retaining another distinct string would exceed the aggregate heap cap.
+    case retainedValueBytesLimit
+    /// A logical value is too large to be an exact, selectable picker item.
+    case valueByteLimit
+}
+
+public nonisolated struct CSVUniqueValuesResult: Sendable, Equatable {
+    public let column: Int
+    /// Exact, unmodified logical CSV values in deterministic display order.
+    /// The empty string is retained as an ordinary selectable value.
+    public let values: [String]
+    public let scannedRecordCount: Int64
+    public let eligibleRecordCount: Int64
+    /// Candidate records at or after `firstRecord`, if EOF was observed.
+    public let totalRecordCount: Int64?
+    /// True only when every candidate record was inspected and `values`
+    /// contains the complete distinct set.
+    public let isCompleteDataset: Bool
+    /// Explains why discovery returned an explicitly incomplete value set.
+    /// Every returned string is exact; an overlong partial preview is never
+    /// exposed as a selectable value.
+    public let truncationReason: CSVUniqueValuesTruncationReason?
+    public let maximumUniqueValueCount: Int
+    public let maximumRetainedValueBytes: Int
+
+    public var isTruncated: Bool { truncationReason != nil }
+}
+
+/// Exact unique-value discovery for a CSV filter picker. Heap use is bounded
+/// by both a value-count cap and an aggregate byte cap: discovery stops as soon
+/// as it proves the column has more data than the UI can safely show.
+/// No row-map or temporary file is created by this operation.
+public nonisolated enum CSVUniqueValueProvider {
+    public struct Configuration: Sendable, Equatable {
+        public let pageRecordCount: Int
+        public let maximumUniqueValueCount: Int
+        public let maximumValueBytes: Int
+        public let maximumRetainedValueBytes: Int
+        public let maximumFilterValueBytesPerField: Int
+        public let maximumRetainedValueBytesPerRecord: Int
+
+        public init(
+            pageRecordCount: Int = 4_096,
+            maximumUniqueValueCount: Int = 500,
+            maximumValueBytes: Int = 64 << 10,
+            maximumRetainedValueBytes: Int = 4 << 20,
+            maximumFilterValueBytesPerField: Int = 1 << 20,
+            maximumRetainedValueBytesPerRecord: Int = 4 << 20
+        ) {
+            self.pageRecordCount = min(4_096, max(1, pageRecordCount))
+            self.maximumUniqueValueCount = min(10_000, max(1, maximumUniqueValueCount))
+            self.maximumValueBytes = min(1 << 20, max(0, maximumValueBytes))
+            self.maximumRetainedValueBytes = min(64 << 20, max(0, maximumRetainedValueBytes))
+            self.maximumFilterValueBytesPerField = min(
+                4 << 20,
+                max(0, maximumFilterValueBytesPerField)
+            )
+            self.maximumRetainedValueBytesPerRecord = min(
+                64 << 20,
+                max(0, maximumRetainedValueBytesPerRecord)
+            )
+        }
+    }
+
+    /// Runs discovery away from the caller's actor. Cancelling the surrounding
+    /// Task is observed between records and while parsing unusually long rows.
+    public static func values(
+        snapshot: DocumentSnapshot,
+        index: CSVRowIndex,
+        column: Int,
+        firstRecord: Int64 = 0,
+        baseFilters: [CSVColumnFilter] = [],
+        configuration: Configuration = .init(),
+        progress: (@Sendable (CSVUniqueValuesProgress) -> Void)? = nil
+    ) async throws -> CSVUniqueValuesResult {
+        let worker = Task.detached(priority: .userInitiated) {
+            try collect(
+                snapshot: snapshot,
+                index: index,
+                column: column,
+                firstRecord: firstRecord,
+                baseFilters: baseFilters,
+                configuration: configuration,
+                cancellation: { Task.isCancelled },
+                progress: progress
+            )
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
+    /// Synchronous engine for deterministic tests and callers already running
+    /// on a background executor. Cancellation never returns a partial result.
+    public static func collect(
+        snapshot: DocumentSnapshot,
+        index: CSVRowIndex,
+        column: Int,
+        firstRecord: Int64 = 0,
+        baseFilters: [CSVColumnFilter] = [],
+        configuration: Configuration = .init(),
+        cancellation: CSVRowIndex.CancellationCheck? = nil,
+        progress: (@Sendable (CSVUniqueValuesProgress) -> Void)? = nil
+    ) throws -> CSVUniqueValuesResult {
+        guard column >= 0 else { throw CSVDataOperationError.invalidColumn(column) }
+        guard firstRecord >= 0 else { throw CSVDataOperationError.invalidRecord(firstRecord) }
+        for filter in baseFilters where filter.column < 0 {
+            throw CSVDataOperationError.invalidColumn(filter.column)
+        }
+        if cancellation?() == true { throw CancellationError() }
+
+        // Faceting intentionally ignores the target column's own committed
+        // filter, while honoring all other columns. This lets a reopened chip
+        // offer alternatives instead of only its current selection.
+        let filterGroups = compileCSVColumnFilterGroups(
+            baseFilters.filter { $0.column != column }
+        )
+        let selectedColumns = Set([column] + filterGroups.map(\.column))
+        var uniqueValues = Set<String>()
+        uniqueValues.reserveCapacity(configuration.maximumUniqueValueCount)
+        var retainedUniqueValueBytes = 0
+        var nextRecord = firstRecord
+        var scannedRecordCount: Int64 = 0
+        var eligibleRecordCount: Int64 = 0
+        var lastProgressUpdate: ContinuousClock.Instant?
+
+        func candidateTotal(_ indexProgress: CSVRowIndex.Progress) -> Int64? {
+            guard let sourceTotal = indexProgress.totalRecordCount else { return nil }
+            return max(0, sourceTotal - firstRecord)
+        }
+
+        /// Multi-gigabyte, low-cardinality columns may require tens of
+        /// thousands of pages. Coalescing intermediate reports prevents those
+        /// pages from becoming tens of thousands of queued main-thread blocks.
+        /// Initial and terminal states are always delivered exactly.
+        func report(force: Bool = false) {
+            guard progress != nil else { return }
+            let now = ContinuousClock.now
+            if !force,
+               let lastProgressUpdate,
+               lastProgressUpdate.duration(to: now) < .milliseconds(125) {
+                return
+            }
+            lastProgressUpdate = now
+            let indexProgress = index.progress
+            progress?(CSVUniqueValuesProgress(
+                indexedFractionCompleted: indexProgress.fractionCompleted,
+                scannedRecordCount: scannedRecordCount,
+                eligibleRecordCount: eligibleRecordCount,
+                uniqueValueCount: uniqueValues.count,
+                totalRecordCount: candidateTotal(indexProgress)
+            ))
+        }
+
+        func makeResult(
+            isCompleteDataset: Bool,
+            truncationReason: CSVUniqueValuesTruncationReason?
+        ) -> CSVUniqueValuesResult {
+            CSVUniqueValuesResult(
+                column: column,
+                values: uniqueValues.sorted(by: uniqueValueDisplayOrder),
+                scannedRecordCount: scannedRecordCount,
+                eligibleRecordCount: eligibleRecordCount,
+                totalRecordCount: candidateTotal(index.progress),
+                isCompleteDataset: isCompleteDataset,
+                truncationReason: truncationReason,
+                maximumUniqueValueCount: configuration.maximumUniqueValueCount,
+                maximumRetainedValueBytes: configuration.maximumRetainedValueBytes
+            )
+        }
+
+        report(force: true)
+        while true {
+            if cancellation?() == true { throw CancellationError() }
+            let locations = try index.recordLocations(
+                startingAt: nextRecord,
+                limit: configuration.pageRecordCount,
+                cancellation: cancellation
+            )
+            guard !locations.isEmpty else { break }
+
+            for location in locations {
+                if cancellation?() == true { throw CancellationError() }
+                let selected = try CSVRecordParser.selectedFields(
+                    snapshot: snapshot,
+                    location: location,
+                    columns: selectedColumns,
+                    maximumValueBytesPerField: max(
+                        configuration.maximumValueBytes,
+                        configuration.maximumFilterValueBytesPerField
+                    ),
+                    maximumRetainedValueBytes: configuration.maximumRetainedValueBytesPerRecord,
+                    cancellation: cancellation
+                )
+                scannedRecordCount += 1
+                nextRecord = location.record + 1
+
+                var matchesOtherFilters = true
+                for group in filterGroups {
+                    let field = selected.fields[group.column]
+                    if field?.wasTruncated == true
+                        || (field?.value.utf8.count ?? 0)
+                            > configuration.maximumFilterValueBytesPerField {
+                        throw CSVDataOperationError.queryValueTooLarge(
+                            record: location.record,
+                            column: group.column,
+                            limit: configuration.maximumFilterValueBytesPerField
+                        )
+                    }
+                    if !group.matches(field?.value ?? "") {
+                        matchesOtherFilters = false
+                        break
+                    }
+                }
+                guard matchesOtherFilters else { continue }
+
+                eligibleRecordCount += 1
+                let field = selected.fields[column]
+                guard field?.wasTruncated != true else {
+                    report(force: true)
+                    return makeResult(
+                        isCompleteDataset: false,
+                        truncationReason: .valueByteLimit
+                    )
+                }
+                let value = field?.value ?? ""
+                let valueByteCount = value.utf8.count
+                guard valueByteCount <= configuration.maximumValueBytes else {
+                    report(force: true)
+                    return makeResult(
+                        isCompleteDataset: false,
+                        truncationReason: .valueByteLimit
+                    )
+                }
+                if !uniqueValues.contains(value) {
+                    guard uniqueValues.count < configuration.maximumUniqueValueCount else {
+                        report(force: true)
+                        return makeResult(
+                            isCompleteDataset: false,
+                            truncationReason: .uniqueValueCountLimit
+                        )
+                    }
+                    let projectedBytes = retainedUniqueValueBytes.addingReportingOverflow(valueByteCount)
+                    guard !projectedBytes.overflow,
+                          projectedBytes.partialValue <= configuration.maximumRetainedValueBytes else {
+                        report(force: true)
+                        return makeResult(
+                            isCompleteDataset: false,
+                            truncationReason: .retainedValueBytesLimit
+                        )
+                    }
+                    uniqueValues.insert(value)
+                    retainedUniqueValueBytes = projectedBytes.partialValue
+                }
+            }
+            report()
+            if locations.count < configuration.pageRecordCount, index.progress.isComplete {
+                break
+            }
+        }
+
+        let indexProgress = index.progress
+        let isComplete = indexProgress.isComplete
+            && nextRecord >= (indexProgress.totalRecordCount ?? nextRecord)
+        report(force: true)
+        return makeResult(isCompleteDataset: isComplete, truncationReason: nil)
+    }
+
+    /// POSIX-locale, case-insensitive/numeric ordering is pleasant for a value
+    /// picker and stable across machines. A literal comparison breaks folds
+    /// such as `A`/`a` deterministically. Empty sorts first.
+    private static func uniqueValueDisplayOrder(_ lhs: String, _ rhs: String) -> Bool {
+        if lhs.isEmpty || rhs.isEmpty {
+            if lhs.isEmpty, rhs.isEmpty { return false }
+            return lhs.isEmpty
+        }
+        let comparison = lhs.compare(
+            rhs,
+            options: [.caseInsensitive, .numeric],
+            range: nil,
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        if comparison != .orderedSame { return comparison == .orderedAscending }
+        return lhs < rhs
     }
 }
 
