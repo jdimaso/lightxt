@@ -120,6 +120,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 #if LIGHTXT_STANDALONE_CSV_QA
     private var qaQueryLaunchCountStorage = 0
     private var qaNextColumnName: String?
+    private var qaHeaderRetileCountStorage = 0
 #endif
 
     override init(frame frameRect: NSRect) {
@@ -128,6 +129,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         configureTable()
         configureLayout()
         applyAppearance()
+    }
+
+    override func layout() {
+        super.layout()
+        enforceTwoRowHeaderHeight()
     }
 
     @available(*, unavailable)
@@ -362,7 +368,6 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             guard let self else { return false }
             return self.latestProgress?.isComplete == true && self.mutationCancellation == nil
         }
-        headerView.frame.size.height = 54
         tableView.headerView = headerView
         tableView.bodyMenuProvider = { [weak self] tableColumn, row in
             self?.rowMenu(forTableColumn: tableColumn, row: row)
@@ -381,11 +386,30 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         tableView.addTableColumn(rowNumber)
 
         scrollView.documentView = tableView
+        // Assigning an NSTableView as the document view causes NSScrollView
+        // to tile its header clip. Set the custom height after that ownership
+        // transfer, then retile so both header rows are actually visible.
+        headerView.frame.size.height = LighTxtCSVHeaderView.preferredHeight
+        scrollView.tile()
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = true
+    }
+
+    private func enforceTwoRowHeaderHeight() {
+        guard let header = tableView.headerView else { return }
+        let target = LighTxtCSVHeaderView.preferredHeight
+        let clipHeight = (header.superview as? NSClipView)?.bounds.height ?? 0
+        guard abs(header.frame.height - target) > 0.5 || abs(clipHeight - target) > 0.5 else {
+            return
+        }
+#if LIGHTXT_STANDALONE_CSV_QA
+        qaHeaderRetileCountStorage += 1
+#endif
+        header.frame.size.height = target
+        scrollView.tile()
     }
 
     private func configureLayout() {
@@ -2556,13 +2580,91 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     func qaScrollDataColumnToVisible(_ column: Int) {
         guard let index = tableColumnIndex(forDataColumn: column) else { return }
         tableView.scrollColumnToVisible(index)
+        let target = tableView.rect(ofColumn: index)
+        let clipView = scrollView.contentView
+        if !clipView.bounds.contains(target) {
+            let x = target.minX < clipView.bounds.minX
+                ? target.minX
+                : target.maxX - clipView.bounds.width
+            clipView.scroll(to: NSPoint(x: max(0, x), y: clipView.bounds.minY))
+            scrollView.reflectScrolledClipView(clipView)
+        }
+        // An offscreen titled QA window does not receive WindowServer-driven
+        // header synchronization. Scroll the real header clip to the same
+        // document coordinate so its visible-only controls exercise the same
+        // geometry as an onscreen horizontal scroll.
+        if let headerClip = tableView.headerView?.superview as? NSClipView {
+            headerClip.scroll(to: NSPoint(x: clipView.bounds.minX, y: headerClip.bounds.minY))
+        }
     }
+
+    func qaResizeDataColumn(_ column: Int, width: CGFloat) {
+        guard let tableColumn = tableColumn(forDataColumn: column) else { return }
+        tableColumn.width = width
+        tableView.headerView?.needsLayout = true
+        tableView.headerView?.needsDisplay = true
+    }
+
     var qaHorizontalOffset: CGFloat { tableView.visibleRect.minX }
 
     var qaAccessibleFilterButtonColumns: Set<Int> {
         guard let header = tableView.headerView as? LighTxtCSVHeaderView else { return [] }
         header.qaSynchronizeFilterButtons()
         return header.qaFilterButtonColumns
+    }
+
+    func qaHeaderGeometry(column: Int) -> (
+        header: NSRect,
+        title: NSRect,
+        filter: NSRect,
+        input: NSRect,
+        funnel: NSRect,
+        clipBounds: NSRect,
+        titleInClip: NSRect,
+        filterInClip: NSRect,
+        drawnTitleInClip: NSRect,
+        actualInputInClip: NSRect,
+        actualTextInClip: NSRect,
+        actualFunnelInClip: NSRect,
+        interiorFrame: NSRect,
+        resolvedLayoutFrame: NSRect
+    )? {
+        guard let header = tableView.headerView as? LighTxtCSVHeaderView,
+              let clipView = header.superview as? NSClipView,
+              let visualIndex = tableColumnIndex(forDataColumn: column),
+              let tableColumn = tableView.tableColumns[safe: visualIndex],
+              let cell = tableColumn.headerCell as? LighTxtCSVHeaderCell else { return nil }
+        header.qaSynchronizeFilterButtons()
+        header.needsDisplay = true
+        header.displayIfNeeded()
+        let visibleHeader = header.visibleRect
+        if !visibleHeader.isEmpty,
+           let bitmap = header.bitmapImageRepForCachingDisplay(in: visibleHeader) {
+            // Hidden/offscreen QA windows do not always receive a WindowServer
+            // display pass after scrolling. Caching the actual visible header
+            // exercises drawInterior and records its real presentation rect.
+            header.cacheDisplay(in: visibleHeader, to: bitmap)
+        }
+        guard let actual = header.qaFilterPresentationRects(column: column) else { return nil }
+        let headerRect = header.headerRect(ofColumn: visualIndex)
+        let titleRect = cell.titleRect(in: headerRect, controlView: header)
+        let filterRect = cell.filterControlRect(in: headerRect, controlView: header)
+        return (
+            headerRect,
+            titleRect,
+            filterRect,
+            cell.filterInputRect(in: headerRect, controlView: header),
+            cell.funnelRect(in: headerRect, controlView: header),
+            clipView.bounds,
+            clipView.convert(titleRect, from: header),
+            clipView.convert(filterRect, from: header),
+            clipView.convert(cell.qaLastDrawnTitleRect, from: header),
+            clipView.convert(actual.input, from: header),
+            clipView.convert(actual.text, from: header),
+            clipView.convert(actual.funnel, from: header),
+            cell.qaLastInteriorFrame,
+            cell.qaLastResolvedLayoutFrame
+        )
     }
 
     func qaRowContextMenuTitles(row: Int) -> [String] {
@@ -2601,6 +2703,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     var qaStructuralMutationInFlight: Bool { mutationCancellation != nil }
     var qaQueryLaunchCount: Int { qaQueryLaunchCountStorage }
+    var qaHeaderRetileCount: Int { qaHeaderRetileCountStorage }
     var qaPopoverContentView: NSView? { presentedPopover?.contentViewController?.view }
 
     func qaPreparePopoverCaptureBackground() {
@@ -3394,21 +3497,62 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
     var isFiltered = false
     var showsFilterControls = true
     var filterText = ""
+#if LIGHTXT_STANDALONE_CSV_QA
+    private(set) var qaLastDrawnTitleRect = NSRect.zero
+    private(set) var qaLastInteriorFrame = NSRect.zero
+    private(set) var qaLastResolvedLayoutFrame = NSRect.zero
+#endif
+
+    private func rowRects(
+        in cellFrame: NSRect,
+        controlView: NSView
+    ) -> (title: NSRect, filter: NSRect) {
+        let verticalInset = min(1, cellFrame.height / 8)
+        let gap = min(3, max(1, cellFrame.height / 18))
+        let usableHeight = max(0, cellFrame.height - verticalInset * 2 - gap)
+        let filterHeight = min(24, floor(usableHeight / 2))
+        let titleHeight = max(0, usableHeight - filterHeight)
+        if controlView.isFlipped {
+            let title = NSRect(
+                x: cellFrame.minX,
+                y: cellFrame.minY + verticalInset,
+                width: cellFrame.width,
+                height: titleHeight
+            )
+            return (
+                title,
+                NSRect(
+                    x: cellFrame.minX,
+                    y: title.maxY + gap,
+                    width: cellFrame.width,
+                    height: filterHeight
+                )
+            )
+        }
+        let filter = NSRect(
+            x: cellFrame.minX,
+            y: cellFrame.minY + verticalInset,
+            width: cellFrame.width,
+            height: filterHeight
+        )
+        return (
+            NSRect(
+                x: cellFrame.minX,
+                y: filter.maxY + gap,
+                width: cellFrame.width,
+                height: titleHeight
+            ),
+            filter
+        )
+    }
 
     func titleRect(in cellFrame: NSRect, controlView: NSView) -> NSRect {
-        guard showsFilterControls else { return cellFrame.insetBy(dx: 5, dy: 0) }
-        if controlView.isFlipped {
-            return NSRect(x: cellFrame.minX + 5, y: cellFrame.minY, width: cellFrame.width - 10, height: 25)
-        }
-        return NSRect(x: cellFrame.minX + 5, y: cellFrame.maxY - 25, width: cellFrame.width - 10, height: 25)
+        rowRects(in: cellFrame, controlView: controlView).title.insetBy(dx: 5, dy: 0)
     }
 
     func filterControlRect(in cellFrame: NSRect, controlView: NSView) -> NSRect {
         guard showsFilterControls else { return .zero }
-        if controlView.isFlipped {
-            return NSRect(x: cellFrame.minX + 3, y: cellFrame.minY + 27, width: cellFrame.width - 6, height: 24)
-        }
-        return NSRect(x: cellFrame.minX + 3, y: cellFrame.minY + 3, width: cellFrame.width - 6, height: 24)
+        return rowRects(in: cellFrame, controlView: controlView).filter.insetBy(dx: 3, dy: 0)
     }
 
     func funnelRect(in cellFrame: NSRect, controlView: NSView) -> NSRect {
@@ -3424,6 +3568,25 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
     }
 
     override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
+        // NSTableHeaderCell passes drawInterior a one-line text interior (for
+        // example, y=19/h=15 inside our 54pt header), not the full column
+        // header rectangle. Base both rows on the full header height so the
+        // title cannot be centered into the filter controls.
+        let layoutFrame: NSRect
+        if let headerView = controlView as? NSTableHeaderView,
+           let tableView = headerView.tableView,
+           let columnIndex = tableView.tableColumns.firstIndex(where: {
+               $0.headerCell === self
+           }) {
+            layoutFrame = headerView.headerRect(ofColumn: columnIndex)
+        } else {
+            layoutFrame = NSRect(
+                x: cellFrame.minX,
+                y: controlView.bounds.minY,
+                width: cellFrame.width,
+                height: controlView.bounds.height
+            )
+        }
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineBreakMode = .byTruncatingTail
         paragraph.alignment = alignment
@@ -3439,7 +3602,7 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
             ]
         )
         let indicatorWidth: CGFloat = isFiltered ? 15 : 0
-        var titleFrame = titleRect(in: cellFrame, controlView: controlView)
+        var titleFrame = titleRect(in: layoutFrame, controlView: controlView)
         titleFrame.size.width = max(0, titleFrame.width - indicatorWidth)
         let titleHeight = attributedTitle.size().height
         let verticallyCentered = NSRect(
@@ -3448,6 +3611,11 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
             width: titleFrame.width,
             height: titleHeight
         )
+#if LIGHTXT_STANDALONE_CSV_QA
+        qaLastInteriorFrame = cellFrame
+        qaLastResolvedLayoutFrame = layoutFrame
+        qaLastDrawnTitleRect = verticallyCentered
+#endif
         if let context = NSGraphicsContext.current {
             context.saveGraphicsState()
             context.compositingOperation = .sourceOver
@@ -3480,58 +3648,20 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
         }
 
         guard showsFilterControls else { return }
-        let input = filterInputRect(in: cellFrame, controlView: controlView)
-        let funnel = funnelRect(in: cellFrame, controlView: controlView)
+        let input = filterInputRect(in: layoutFrame, controlView: controlView)
+        let funnel = funnelRect(in: layoutFrame, controlView: controlView)
         NSColor.separatorColor.withAlphaComponent(0.65).setStroke()
         let separatorY = controlView.isFlipped ? input.minY - 1 : input.maxY + 1
         NSBezierPath.strokeLine(
-            from: NSPoint(x: cellFrame.minX, y: separatorY),
-            to: NSPoint(x: cellFrame.maxX, y: separatorY)
+            from: NSPoint(x: layoutFrame.minX, y: separatorY),
+            to: NSPoint(x: layoutFrame.maxX, y: separatorY)
         )
 
         if isFiltered {
             NSColor.controlAccentColor.withAlphaComponent(0.10).setFill()
             NSBezierPath(roundedRect: input.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5).fill()
         }
-        // Directly drawing a template NSImage here can resolve to black when
-        // an attached window switches to dark appearance. Draw the compact
-        // search mark ourselves with a concrete semantic color instead.
-        let affordanceColor = LighTxtTheme.resolved(
-            LighTxtTheme.secondaryText,
-            for: controlView.effectiveAppearance
-        )
-        affordanceColor.setStroke()
-        let searchCenter = NSPoint(x: input.minX + 11.5, y: input.midY - 1)
-        let search = NSBezierPath(ovalIn: NSRect(
-            x: searchCenter.x - 4,
-            y: searchCenter.y - 4,
-            width: 8,
-            height: 8
-        ))
-        search.lineWidth = 1.35
-        search.stroke()
-        let handle = NSBezierPath()
-        handle.move(to: NSPoint(x: searchCenter.x + 3.1, y: searchCenter.y + 3.1))
-        handle.line(to: NSPoint(x: searchCenter.x + 6.4, y: searchCenter.y + 6.4))
-        handle.lineWidth = 1.35
-        handle.lineCapStyle = .round
-        handle.stroke()
-        if !filterText.isEmpty {
-            let textRect = NSRect(
-                x: input.minX + 23,
-                y: input.minY + 4,
-                width: max(0, input.width - 27),
-                height: 16
-            )
-            NSAttributedString(
-                string: filterText,
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 11),
-                    .foregroundColor: NSColor.labelColor,
-                ]
-            ).draw(with: textRect, options: [.truncatesLastVisibleLine])
-        }
-        _ = funnel // The accessible overlay button draws the funnel glyph.
+        _ = funnel // Visible, accessible overlay controls draw both affordances.
     }
 }
 
@@ -3540,7 +3670,13 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
 /// bound while making the filter row discoverable and keyboard accessible.
 @MainActor
 private final class LighTxtCSVContainsButton: NSButton {
-    var filterText = "" { didSet { needsDisplay = true } }
+    private let textLabel = NSTextField(labelWithString: "")
+    var filterText = "" {
+        didSet {
+            needsDisplay = true
+            needsLayout = true
+        }
+    }
     var isFilterActive = false { didSet { needsDisplay = true } }
 
     init() {
@@ -3548,6 +3684,11 @@ private final class LighTxtCSVContainsButton: NSButton {
         title = ""
         isBordered = false
         focusRingType = .default
+        textLabel.font = .systemFont(ofSize: 11)
+        textLabel.lineBreakMode = .byTruncatingTail
+        textLabel.maximumNumberOfLines = 1
+        textLabel.setAccessibilityElement(false)
+        addSubview(textLabel)
     }
 
     @available(*, unavailable)
@@ -3590,28 +3731,40 @@ private final class LighTxtCSVContainsButton: NSButton {
         handle.lineCapStyle = .round
         handle.stroke()
 
-        let text = filterText.isEmpty ? (bounds.width >= 78 ? "Contains" : "") : filterText
-        guard !text.isEmpty else { return }
         let textColor = filterText.isEmpty
             ? LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
             : LighTxtTheme.resolved(LighTxtTheme.primaryText, for: appearance)
-        let attributed = NSAttributedString(string: text, attributes: [
-            .font: NSFont.systemFont(ofSize: 11),
-            .foregroundColor: textColor.withAlphaComponent(isEnabled ? 1 : 0.48),
-        ])
-        let textRect = NSRect(
-            x: fieldRect.minX + 22,
-            y: fieldRect.midY - attributed.size().height / 2,
-            width: max(0, fieldRect.width - 26),
-            height: attributed.size().height
+        textLabel.textColor = textColor.withAlphaComponent(isEnabled ? 1 : 0.48)
+    }
+
+    override func layout() {
+        super.layout()
+        textLabel.stringValue = filterText.isEmpty
+            ? (bounds.width >= 78 ? "Contains" : "")
+            : filterText
+        textLabel.sizeToFit()
+        let height = min(bounds.height, textLabel.frame.height)
+        textLabel.frame = NSRect(
+            x: 22,
+            y: floor((bounds.height - height) / 2),
+            width: max(0, bounds.width - 26),
+            height: height
         )
-        attributed.draw(with: textRect, options: [.truncatesLastVisibleLine])
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, bounds.contains(point) else { return nil }
+        return self
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         needsDisplay = true
     }
+
+#if LIGHTXT_STANDALONE_CSV_QA
+    var qaTextRect: NSRect { convert(textLabel.bounds, from: textLabel) }
+#endif
 }
 
 /// The standard header opts into vibrancy. That is attractive over window
@@ -3620,6 +3773,8 @@ private final class LighTxtCSVContainsButton: NSButton {
 /// header keeps native resizing/dragging while drawing predictable contrast.
 @MainActor
 private final class LighTxtCSVHeaderView: NSTableHeaderView, NSSearchFieldDelegate {
+    static let preferredHeight: CGFloat = 54
+
     var menuProvider: ((Int) -> NSMenu?)?
     var onCommitContainsFilter: ((Int, String) -> Void)?
     var onShowFilterValues: ((Int) -> Void)?
@@ -3905,6 +4060,21 @@ private final class LighTxtCSVHeaderView: NSTableHeaderView, NSSearchFieldDelega
     var qaHasFocus: Bool { editingColumn != nil && inlineField.currentEditor() != nil }
     var qaFilterButtonColumns: Set<Int> { Set(filterButtons.keys) }
     func qaSynchronizeFilterButtons() { synchronizeVisibleFilterButtons() }
+
+    func qaFilterPresentationRects(column: Int) -> (
+        input: NSRect,
+        text: NSRect,
+        funnel: NSRect
+    )? {
+        guard let input = containsButtons[column],
+              let funnel = filterButtons[column] else { return nil }
+        input.layoutSubtreeIfNeeded()
+        return (
+            input.frame,
+            convert(input.qaTextRect, from: input),
+            funnel.frame
+        )
+    }
 
     var qaMinimumFilterAffordanceContrast: CGFloat {
         let background = LighTxtTheme.resolved(

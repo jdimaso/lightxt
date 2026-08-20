@@ -75,6 +75,89 @@ struct CSVTableRuntimeQA {
         fixtureView.layoutSubtreeIfNeeded()
         fixtureTable.headerView?.layoutSubtreeIfNeeded()
 
+        try assertHeaderLayout(fixtureView, column: 0, label: "initial 1000pt fixture")
+
+        // Exercise the exact production hosting path which regressed: a real
+        // titled/resizable window lets NSScrollView take ownership of the
+        // table header, tile it, and tile it again during resize. Verify the
+        // rendered title glyph and the native Contains label—not merely the
+        // ideal cell rectangles—occupy separate, fully visible rows.
+        let headerDelegate = try QACSVDelegate(url: fixtureURL)
+        let headerView = CSVTableView(frame: NSRect(x: 0, y: 0, width: 1_400, height: 900))
+        let headerWindow = makeWindow(
+            containing: headerView,
+            appearance: .aqua,
+            styleMask: [.titled, .closable, .resizable]
+        )
+        var headerReady = false
+        headerView.onStatusChange = { _, busy in headerReady = !busy }
+        headerView.editorDelegate = headerDelegate
+        try wait(until: { headerReady }, timeout: 5, failure: "Header-layout fixture did not index")
+        try settleLayout(window: headerWindow, view: headerView)
+        for column in 0..<4 {
+            try assertHeaderLayout(headerView, column: column, label: "1400pt light column \(column)")
+        }
+        try render(
+            headerView,
+            to: outputDirectory.appendingPathComponent("csv-header-1400-light.png")
+        )
+
+        headerWindow.appearance = NSAppearance(named: .darkAqua)
+        try settleLayout(window: headerWindow, view: headerView)
+        for column in 0..<4 {
+            try assertHeaderLayout(headerView, column: column, label: "1400pt dark column \(column)")
+        }
+        try render(
+            headerView,
+            to: outputDirectory.appendingPathComponent("csv-header-1400-dark.png")
+        )
+
+        // Make the source columns wider than the narrow viewport, resize and
+        // reorder them, then use an actual horizontal scroll. Geometry must
+        // continue to be resolved by stable source-column identifiers.
+        for (column, width) in [CGFloat(300), 360, 320, 340].enumerated() {
+            headerView.qaResizeDataColumn(column, width: width)
+        }
+        headerView.qaMoveDataColumn(3, toVisualIndex: 1)
+        headerWindow.setContentSize(NSSize(width: 1_000, height: 720))
+        headerView.frame = NSRect(x: 0, y: 0, width: 1_000, height: 720)
+        try settleLayout(window: headerWindow, view: headerView)
+        headerView.qaScrollDataColumnToVisible(2)
+        try settleLayout(window: headerWindow, view: headerView)
+        try wait(
+            until: { headerView.qaAccessibleFilterButtonColumns.contains(2) },
+            timeout: 2,
+            failure: "Scrolled dark header column did not materialize its filter controls; "
+                + "offset=\(headerView.qaHorizontalOffset), "
+                + "controls=\(headerView.qaAccessibleFilterButtonColumns.sorted())"
+        )
+        try assertHeaderLayout(headerView, column: 2, label: "1000pt reordered/scrolled dark")
+        try render(
+            headerView,
+            to: outputDirectory.appendingPathComponent("csv-header-1000-dark.png")
+        )
+
+        headerWindow.appearance = NSAppearance(named: .aqua)
+        headerView.qaScrollDataColumnToVisible(3)
+        try settleLayout(window: headerWindow, view: headerView)
+        try wait(
+            until: { headerView.qaAccessibleFilterButtonColumns.contains(3) },
+            timeout: 2,
+            failure: "Scrolled light header column did not materialize its filter controls"
+        )
+        try assertHeaderLayout(headerView, column: 3, label: "1000pt reordered/scrolled light")
+        try render(
+            headerView,
+            to: outputDirectory.appendingPathComponent("csv-header-1000-light.png")
+        )
+
+        let retileCountAfterResize = headerView.qaHeaderRetileCount
+        try settleLayout(window: headerWindow, view: headerView)
+        guard headerView.qaHeaderRetileCount == retileCountAfterResize else {
+            throw QAError.failed("CSV header-height enforcement did not settle after window retile")
+        }
+        headerWindow.orderOut(nil)
+
         let accessibilityLabels = descendants(of: fixtureView, as: NSButton.self)
             .compactMap { $0.accessibilityLabel() }
         guard !accessibilityLabels.contains("Add CSV row or column"),
@@ -932,18 +1015,81 @@ struct CSVTableRuntimeQA {
 
     private static func makeWindow(
         containing view: NSView,
-        appearance: NSAppearance.Name
+        appearance: NSAppearance.Name,
+        styleMask: NSWindow.StyleMask = [.borderless]
     ) -> NSWindow {
+        let requestedSize = view.frame.size
         let window = NSWindow(
             contentRect: view.bounds,
-            styleMask: [.borderless],
+            styleMask: styleMask,
             backing: .buffered,
             defer: false
         )
         window.appearance = NSAppearance(named: appearance)
+        view.autoresizingMask = [.width, .height]
         window.contentView = view
+        window.setContentSize(requestedSize)
+        view.frame = NSRect(origin: .zero, size: requestedSize)
         window.layoutIfNeeded()
         return window
+    }
+
+    private static func settleLayout(window: NSWindow, view: CSVTableView) throws {
+        for _ in 0..<3 {
+            window.layoutIfNeeded()
+            view.needsLayout = true
+            view.layoutSubtreeIfNeeded()
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.025))
+        }
+    }
+
+    private static func assertHeaderLayout(
+        _ view: CSVTableView,
+        column: Int,
+        label: String
+    ) throws {
+        guard let geometry = view.qaHeaderGeometry(column: column) else {
+            throw QAError.failed("CSV header geometry unavailable for \(label)")
+        }
+
+        let tolerance: CGFloat = 0.75
+        func contains(_ outer: NSRect, _ inner: NSRect) -> Bool {
+            outer.insetBy(dx: -tolerance, dy: -tolerance).contains(inner)
+        }
+        func separatedVertically(_ lhs: NSRect, _ rhs: NSRect) -> Bool {
+            lhs.maxY <= rhs.minY + tolerance || rhs.maxY <= lhs.minY + tolerance
+        }
+
+        guard abs(geometry.header.height - 54) <= tolerance,
+              abs(geometry.clipBounds.height - 54) <= tolerance,
+              !geometry.title.intersects(geometry.filter),
+              contains(geometry.clipBounds, geometry.titleInClip),
+              contains(geometry.clipBounds, geometry.filterInClip),
+              !geometry.drawnTitleInClip.isEmpty,
+              !geometry.actualInputInClip.isEmpty,
+              !geometry.actualTextInClip.isEmpty,
+              !geometry.actualFunnelInClip.isEmpty,
+              contains(geometry.clipBounds, geometry.drawnTitleInClip),
+              contains(geometry.clipBounds, geometry.actualInputInClip),
+              contains(geometry.clipBounds, geometry.actualTextInClip),
+              contains(geometry.clipBounds, geometry.actualFunnelInClip),
+              contains(geometry.filterInClip, geometry.actualInputInClip),
+              contains(geometry.actualInputInClip, geometry.actualTextInClip),
+              contains(geometry.filterInClip, geometry.actualFunnelInClip),
+              geometry.interiorFrame.height < geometry.resolvedLayoutFrame.height,
+              abs(geometry.resolvedLayoutFrame.height - geometry.header.height) <= tolerance,
+              separatedVertically(geometry.drawnTitleInClip, geometry.actualInputInClip),
+              separatedVertically(geometry.drawnTitleInClip, geometry.actualFunnelInClip),
+              separatedVertically(geometry.drawnTitleInClip, geometry.actualTextInClip) else {
+            throw QAError.failed(
+                "CSV two-row header presentation failed for \(label): "
+                    + "header=\(geometry.header), clip=\(geometry.clipBounds), "
+                    + "title=\(geometry.titleInClip), drawnTitle=\(geometry.drawnTitleInClip), "
+                    + "filter=\(geometry.filterInClip), input=\(geometry.actualInputInClip), "
+                    + "text=\(geometry.actualTextInClip), funnel=\(geometry.actualFunnelInClip), "
+                    + "interior=\(geometry.interiorFrame), resolved=\(geometry.resolvedLayoutFrame)"
+            )
+        }
     }
 
     private static func writeStressCSV(to url: URL) throws {
