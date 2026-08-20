@@ -97,6 +97,11 @@ struct CSVTableRuntimeQA {
         for column in 0..<4 {
             try assertHeaderLayout(headerView, column: column, label: "1400pt light column \(column)")
         }
+        try assertNoHorizontalFilterRule(
+            headerView,
+            column: 3,
+            label: "1400pt inactive light"
+        )
         try render(
             headerView,
             to: outputDirectory.appendingPathComponent("csv-header-1400-light.png")
@@ -107,6 +112,11 @@ struct CSVTableRuntimeQA {
         for column in 0..<4 {
             try assertHeaderLayout(headerView, column: column, label: "1400pt dark column \(column)")
         }
+        try assertNoHorizontalFilterRule(
+            headerView,
+            column: 3,
+            label: "1400pt inactive dark"
+        )
         try render(
             headerView,
             to: outputDirectory.appendingPathComponent("csv-header-1400-dark.png")
@@ -132,6 +142,11 @@ struct CSVTableRuntimeQA {
                 + "controls=\(headerView.qaAccessibleFilterButtonColumns.sorted())"
         )
         try assertHeaderLayout(headerView, column: 2, label: "1000pt reordered/scrolled dark")
+        try assertNoHorizontalFilterRule(
+            headerView,
+            column: 2,
+            label: "1000pt reordered/scrolled inactive dark"
+        )
         try render(
             headerView,
             to: outputDirectory.appendingPathComponent("csv-header-1000-dark.png")
@@ -146,9 +161,80 @@ struct CSVTableRuntimeQA {
             failure: "Scrolled light header column did not materialize its filter controls"
         )
         try assertHeaderLayout(headerView, column: 3, label: "1000pt reordered/scrolled light")
+        try assertNoHorizontalFilterRule(
+            headerView,
+            column: 3,
+            label: "1000pt reordered/scrolled inactive light"
+        )
         try render(
             headerView,
             to: outputDirectory.appendingPathComponent("csv-header-1000-light.png")
+        )
+
+        // The overlay owns active fill as well as its ordinary border. Keep a
+        // real filter active while capturing both sort directions so the band
+        // mask cannot regress active state or native sorting chrome.
+        guard let headerTable = descendant(of: headerView, as: NSTableView.self) else {
+            throw QAError.failed("Active header-line fixture table was unavailable")
+        }
+        headerReady = false
+        headerView.qaApplyContainsFilter(column: 3, value: "true")
+        try wait(
+            until: { headerReady && headerTable.numberOfRows == 3 },
+            timeout: 5,
+            failure: "Active header-line filter did not finish"
+        )
+        headerReady = false
+        headerView.qaCycleHeaderSort(column: 0)
+        try wait(until: { headerReady }, timeout: 5, failure: "Active ascending header sort did not finish")
+        guard let idVisualColumn = headerTable.tableColumns.firstIndex(where: {
+            $0.identifier.rawValue == "csv-column-0"
+        }),
+              try cellValues(in: headerTable, column: idVisualColumn, rows: 0..<3)
+                == ["1", "2", "4"] else {
+            throw QAError.failed("Active ascending header sort did not preserve source-column targeting")
+        }
+        headerView.qaScrollDataColumnToVisible(3)
+        try settleLayout(window: headerWindow, view: headerView)
+        try assertHeaderLayout(headerView, column: 3, label: "active ascending light")
+        try assertNoHorizontalFilterRule(
+            headerView,
+            column: 3,
+            label: "active ascending light",
+            captureURL: outputDirectory.appendingPathComponent(
+                "csv-header-closeup-active-ascending-light.png"
+            )
+        )
+
+        headerReady = false
+        headerView.qaCycleHeaderSort(column: 0)
+        try wait(until: { headerReady }, timeout: 5, failure: "Active descending header sort did not finish")
+        guard try cellValues(in: headerTable, column: idVisualColumn, rows: 0..<3)
+                == ["4", "2", "1"] else {
+            throw QAError.failed("Active descending header sort did not preserve source-column targeting")
+        }
+        headerView.qaScrollDataColumnToVisible(3)
+        try settleLayout(window: headerWindow, view: headerView)
+        try assertHeaderLayout(headerView, column: 3, label: "active descending light")
+        try assertNoHorizontalFilterRule(
+            headerView,
+            column: 3,
+            label: "active descending light",
+            captureURL: outputDirectory.appendingPathComponent(
+                "csv-header-closeup-active-descending-light.png"
+            )
+        )
+
+        headerWindow.appearance = NSAppearance(named: .darkAqua)
+        try settleLayout(window: headerWindow, view: headerView)
+        try assertHeaderLayout(headerView, column: 3, label: "active descending dark")
+        try assertNoHorizontalFilterRule(
+            headerView,
+            column: 3,
+            label: "active descending dark",
+            captureURL: outputDirectory.appendingPathComponent(
+                "csv-header-closeup-active-descending-dark.png"
+            )
         )
 
         let retileCountAfterResize = headerView.qaHeaderRetileCount
@@ -1089,6 +1175,139 @@ struct CSVTableRuntimeQA {
                     + "text=\(geometry.actualTextInClip), funnel=\(geometry.actualFunnelInClip), "
                     + "interior=\(geometry.interiorFrame), resolved=\(geometry.resolvedLayoutFrame)"
             )
+        }
+    }
+
+    /// Rasterizes the actual hosted header at 1x and 2x, then rejects a long horizontal
+    /// luminance discontinuity inside the open filter-control interior. The
+    /// inherited NSTableHeaderCell bezel that caused the installed regression
+    /// scores near 1.0 here in both appearances; text and glyph pixels remain
+    /// sparse and score far below the threshold.
+    private static func assertNoHorizontalFilterRule(
+        _ view: CSVTableView,
+        column: Int,
+        label: String,
+        captureURL: URL? = nil
+    ) throws {
+        guard let geometry = view.qaHeaderGeometry(column: column),
+              let table = descendant(of: view, as: NSTableView.self),
+              let header = table.headerView,
+              let clip = header.superview as? NSClipView else {
+            throw QAError.failed("Header pixels unavailable for \(label)")
+        }
+        header.needsDisplay = true
+        clip.needsDisplay = true
+        header.display()
+
+        let bounds = clip.bounds
+        guard bounds.width > 0, bounds.height > 0 else {
+            throw QAError.failed("Header bounds were empty for \(label)")
+        }
+        for scale in [CGFloat(1), CGFloat(2)] {
+            guard
+              let bitmap = NSBitmapImageRep(
+                  bitmapDataPlanes: nil,
+                  pixelsWide: Int(ceil(bounds.width * scale)),
+                  pixelsHigh: Int(ceil(bounds.height * scale)),
+                  bitsPerSample: 8,
+                  samplesPerPixel: 4,
+                  hasAlpha: true,
+                  isPlanar: false,
+                  colorSpaceName: .deviceRGB,
+                  bytesPerRow: 0,
+                  bitsPerPixel: 0
+              ) else {
+                throw QAError.failed("Could not allocate \(Int(scale))x header pixels for \(label)")
+            }
+            bitmap.size = bounds.size
+            clip.cacheDisplay(in: bounds, to: bitmap)
+
+            if scale == 2, let captureURL {
+                guard let png = bitmap.representation(using: .png, properties: [:]) else {
+                    throw QAError.failed("Could not encode header close-up for \(label)")
+                }
+                try png.write(to: captureURL, options: .atomic)
+            }
+
+            let localInput = geometry.actualInputInClip.offsetBy(
+                dx: -bounds.minX,
+                dy: -bounds.minY
+            )
+            let localFunnel = geometry.actualFunnelInClip.offsetBy(
+                dx: -bounds.minX,
+                dy: -bounds.minY
+            )
+            var sampleX: [Int] = []
+            for rect in [localInput, localFunnel] {
+                let lower = max(0, Int(ceil((rect.minX + 5) * scale)))
+                let upper = min(bitmap.pixelsWide, Int(floor((rect.maxX - 5) * scale)))
+                if lower < upper { sampleX.append(contentsOf: lower..<upper) }
+            }
+
+            // A wide fixture leaves a quiet tail after the final column. Sampling
+            // it makes this sensitive to any full-width native bezel rule while
+            // avoiding placeholder text and funnel glyphs entirely.
+            let tailStart = Int(ceil((geometry.header.maxX - bounds.minX + 10) * scale))
+            if bitmap.pixelsWide - tailStart >= Int(120 * scale) {
+                sampleX.append(contentsOf: max(0, tailStart)..<max(0, bitmap.pixelsWide - Int(10 * scale)))
+            }
+            sampleX = Array(Set(sampleX)).sorted()
+            guard sampleX.count >= Int(30 * scale) else {
+                throw QAError.failed("Header pixel sample was too narrow at \(Int(scale))x for \(label)")
+            }
+
+            let localInterior = NSRect(
+                x: 0,
+                y: localInput.minY + 5,
+                width: 1,
+                height: max(0, localInput.height - 10)
+            )
+            let referenceDistance = max(2, Int(round(2 * scale)))
+            func luminance(x: Int, y: Int) -> CGFloat? {
+                guard x >= 0,
+                      x < bitmap.pixelsWide,
+                      y >= 0,
+                      y < bitmap.pixelsHigh,
+                      let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
+                    return nil
+                }
+                return 0.2126 * color.redComponent
+                    + 0.7152 * color.greenComponent
+                    + 0.0722 * color.blueComponent
+            }
+
+            var maximumRunRatio: CGFloat = 0
+            var maximumRunRow = -1
+            for y in referenceDistance..<(bitmap.pixelsHigh - referenceDistance) {
+                let pointY = CGFloat(y) / scale
+                let mirroredPointY = bounds.height - pointY
+                guard localInterior.contains(NSPoint(x: 0.5, y: pointY))
+                        || localInterior.contains(NSPoint(x: 0.5, y: mirroredPointY)) else {
+                    continue
+                }
+                var discontinuities = 0
+                var sampled = 0
+                for x in sampleX {
+                    guard let current = luminance(x: x, y: y),
+                          let before = luminance(x: x, y: y - referenceDistance),
+                          let after = luminance(x: x, y: y + referenceDistance) else { continue }
+                    sampled += 1
+                    let surrounding = (before + after) / 2
+                    if abs(current - surrounding) > 0.025 { discontinuities += 1 }
+                }
+                guard sampled > 0 else { continue }
+                let ratio = CGFloat(discontinuities) / CGFloat(sampled)
+                if ratio > maximumRunRatio {
+                    maximumRunRatio = ratio
+                    maximumRunRow = y
+                }
+            }
+            guard maximumRunRatio < 0.65 else {
+                throw QAError.failed(
+                    "Horizontal rule crosses filter controls for \(label) at \(Int(scale))x: "
+                        + "row=\(maximumRunRow), run=\(String(format: "%.3f", maximumRunRatio))"
+                )
+            }
         }
     }
 

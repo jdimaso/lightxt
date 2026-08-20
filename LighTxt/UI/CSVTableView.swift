@@ -2636,7 +2636,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
               let cell = tableColumn.headerCell as? LighTxtCSVHeaderCell else { return nil }
         header.qaSynchronizeFilterButtons()
         header.needsDisplay = true
-        header.displayIfNeeded()
+        header.display()
         let visibleHeader = header.visibleRect
         if !visibleHeader.isEmpty,
            let bitmap = header.bitmapImageRepForCachingDisplay(in: visibleHeader) {
@@ -2645,8 +2645,15 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             // exercises drawInterior and records its real presentation rect.
             header.cacheDisplay(in: visibleHeader, to: bitmap)
         }
-        guard let actual = header.qaFilterPresentationRects(column: column) else { return nil }
         let headerRect = header.headerRect(ofColumn: visualIndex)
+        if abs(cell.qaLastResolvedLayoutFrame.minX - headerRect.minX) > 0.5
+            || abs(cell.qaLastResolvedLayoutFrame.width - headerRect.width) > 0.5 {
+            // Offscreen hosted windows can suppress AppKit's cell display pass
+            // even after their real header clip scrolls. Refresh only the QA
+            // presentation record through the same full-row geometry.
+            cell.qaRefreshPresentationGeometry(in: headerRect, controlView: header)
+        }
+        guard let actual = header.qaFilterPresentationRects(column: column) else { return nil }
         let titleRect = cell.titleRect(in: headerRect, controlView: header)
         let filterRect = cell.filterControlRect(in: headerRect, controlView: header)
         return (
@@ -3550,9 +3557,13 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
         rowRects(in: cellFrame, controlView: controlView).title.insetBy(dx: 5, dy: 0)
     }
 
+    func filterBandRect(in cellFrame: NSRect, controlView: NSView) -> NSRect {
+        rowRects(in: cellFrame, controlView: controlView).filter
+    }
+
     func filterControlRect(in cellFrame: NSRect, controlView: NSView) -> NSRect {
         guard showsFilterControls else { return .zero }
-        return rowRects(in: cellFrame, controlView: controlView).filter.insetBy(dx: 3, dy: 0)
+        return filterBandRect(in: cellFrame, controlView: controlView).insetBy(dx: 3, dy: 0)
     }
 
     func funnelRect(in cellFrame: NSRect, controlView: NSView) -> NSRect {
@@ -3647,22 +3658,34 @@ private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
             indicator.draw(in: frame)
         }
 
-        guard showsFilterControls else { return }
-        let input = filterInputRect(in: layoutFrame, controlView: controlView)
-        let funnel = funnelRect(in: layoutFrame, controlView: controlView)
-        NSColor.separatorColor.withAlphaComponent(0.65).setStroke()
-        let separatorY = controlView.isFlipped ? input.minY - 1 : input.maxY + 1
-        NSBezierPath.strokeLine(
-            from: NSPoint(x: layoutFrame.minX, y: separatorY),
-            to: NSPoint(x: layoutFrame.maxX, y: separatorY)
-        )
-
-        if isFiltered {
-            NSColor.controlAccentColor.withAlphaComponent(0.10).setFill()
-            NSBezierPath(roundedRect: input.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5).fill()
-        }
-        _ = funnel // Visible, accessible overlay controls draw both affordances.
+        // Visible, accessible overlay controls own the complete filter-row
+        // surface. Avoid stacking a second separator or active fill beneath
+        // them; the header view masks the unrelated native bezel rule.
     }
+
+#if LIGHTXT_STANDALONE_CSV_QA
+    func qaRefreshPresentationGeometry(in layoutFrame: NSRect, controlView: NSView) {
+        var titleFrame = titleRect(in: layoutFrame, controlView: controlView)
+        titleFrame.size.width = max(0, titleFrame.width - (isFiltered ? 15 : 0))
+        let titleHeight = NSAttributedString(
+            string: stringValue,
+            attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium)]
+        ).size().height
+        qaLastInteriorFrame = NSRect(
+            x: layoutFrame.minX,
+            y: floor(layoutFrame.midY - titleHeight / 2),
+            width: layoutFrame.width,
+            height: titleHeight
+        )
+        qaLastResolvedLayoutFrame = layoutFrame
+        qaLastDrawnTitleRect = NSRect(
+            x: titleFrame.minX,
+            y: titleFrame.midY - titleHeight / 2,
+            width: titleFrame.width,
+            height: titleHeight
+        )
+    }
+#endif
 }
 
 /// A lightweight, visible-only proxy for the inline contains editor. Keeping
@@ -3800,6 +3823,80 @@ private final class LighTxtCSVHeaderView: NSTableHeaderView, NSSearchFieldDelega
     }()
 
     override var allowsVibrancy: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let tableView,
+              let cell = tableView.tableColumns.compactMap({
+                  $0.headerCell as? LighTxtCSVHeaderCell
+              }).first else { return }
+
+        // NSTableHeaderCell's stock bezel draws an internal horizontal rule
+        // for its native one-line header. In our 54pt, two-row header that
+        // rule lands through the middle of Contains fields. Mask only the
+        // filter band in header coordinates, then restore the useful bottom
+        // seam and vertical column dividers. Overlay controls draw afterward.
+        let referenceFrame = NSRect(
+            x: bounds.minX,
+            y: bounds.minY,
+            width: max(1, bounds.width),
+            height: bounds.height
+        )
+        let band = cell.filterBandRect(in: referenceFrame, controlView: self)
+        let mask = NSRect(
+            x: dirtyRect.minX,
+            y: band.minY,
+            width: dirtyRect.width,
+            height: band.height
+        ).intersection(bounds)
+        guard !mask.isEmpty else { return }
+
+        LighTxtTheme.resolved(
+            LighTxtTheme.editorBackground,
+            for: effectiveAppearance
+        ).setFill()
+        mask.fill()
+
+        let separator = LighTxtTheme.resolved(
+            LighTxtTheme.separator,
+            for: effectiveAppearance
+        )
+        separator.setStroke()
+        for index in tableView.tableColumns.indices {
+            let column = headerRect(ofColumn: index)
+            let x = column.maxX - 0.5
+            guard x >= dirtyRect.minX - 1, x <= dirtyRect.maxX + 1 else { continue }
+            NSBezierPath.strokeLine(
+                from: NSPoint(x: x, y: band.minY),
+                to: NSPoint(x: x, y: band.maxY)
+            )
+        }
+        let bottomY = isFlipped ? bounds.maxY - 0.5 : bounds.minY + 0.5
+        NSBezierPath.strokeLine(
+            from: NSPoint(x: dirtyRect.minX, y: bottomY),
+            to: NSPoint(x: dirtyRect.maxX, y: bottomY)
+        )
+
+        // The stock indicator can descend into the filter band and therefore
+        // be partially covered by the mask. Redraw it in the dedicated title
+        // row, retaining AppKit's native ascending/descending artwork.
+        if let descriptor = tableView.sortDescriptors.first,
+           let key = descriptor.key,
+           let sortedIndex = tableView.tableColumns.firstIndex(where: {
+               $0.sortDescriptorPrototype?.key == key
+           }),
+           let sortedCell = tableView.tableColumns[sortedIndex].headerCell
+                as? LighTxtCSVHeaderCell {
+            let columnFrame = headerRect(ofColumn: sortedIndex)
+            let titleFrame = sortedCell.titleRect(in: columnFrame, controlView: self)
+            sortedCell.drawSortIndicator(
+                withFrame: titleFrame,
+                in: self,
+                ascending: descriptor.ascending,
+                priority: 0
+            )
+        }
+    }
 
     deinit {
         if let boundsObserver { NotificationCenter.default.removeObserver(boundsObserver) }
