@@ -9,6 +9,19 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Secure LighTxt application updates</description>
         <language>en</language>
         <item>
+            <title>1.3.1</title>
+            <pubDate>Thu, 20 Aug 2026 16:19:23 -0400</pubDate>
+            <link>https://github.com/jdimaso/lightxt</link>
+            <sparkle:version>7</sparkle:version>
+            <sparkle:shortVersionString>1.3.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[# LighTxt 1.3.1
+
+- Fixed the CSV table header so column titles and filter controls stay fully visible, aligned, and clickable while scrolling or resizing columns.
+]]></description>
+            <enclosure url="https://github.com/jdimaso/lightxt/releases/download/v1.3.1/LighTxt-1.3.1-macOS-universal.zip" length="5213173" type="application/octet-stream" sparkle:edSignature="bbV7UklQUHnxcMYD346oX9r8jXGM95WBdnHsMtCcrYnvVk7ClhHbZ2GLeoC8VU1dl0xlz3KRnoHpa9zfIwQfDw=="/>
+        </item>
+        <item>
             <title>1.3</title>
             <pubDate>Thu, 20 Aug 2026 14:05:07 -0400</pubDate>
             <link>https://github.com/jdimaso/lightxt</link>
@@ -59,6 +72,6 @@ This release also includes the large-file JSON, CSV, Markdown, navigation, and p
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: 9GFTO9p8s+oW9Pq1HQ20BN2vzYMjmxGILDsnd27Yg3Dvx7341c9ExF3snFPtLuviObRBRLbqKuoktdVf7XUiBw==
-length: 3966
+edSignature: a9Q/OAqnK0siUjfBEd0mYpJ1LTOepcW/70igHn/o7P6XJhvUli4LR9xAw+5qy6lRyA44xIcOFLQhcuTOEi64Bg==
+length: 4881
 -->
