@@ -9,6 +9,20 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Secure LighTxt application updates</description>
         <language>en</language>
         <item>
+            <title>1.3.2</title>
+            <pubDate>Thu, 20 Aug 2026 18:47:47 -0400</pubDate>
+            <link>https://github.com/jdimaso/lightxt</link>
+            <sparkle:version>8</sparkle:version>
+            <sparkle:shortVersionString>1.3.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[# LighTxt 1.3.2
+
+- Fixed a faint horizontal divider that could run through CSV filter fields.
+- Kept column titles, filter controls, active-filter styling, and sort indicators cleanly separated across light and dark appearances, resizing, reordering, and horizontal scrolling.
+]]></description>
+            <enclosure url="https://github.com/jdimaso/lightxt/releases/download/v1.3.2/LighTxt-1.3.2-macOS-universal.zip" length="5216507" type="application/octet-stream" sparkle:edSignature="UlKQ7aa+u5IM+hMzGgwNIdAXtnSeZDo9jw8VQY7EbK3C2VaQqBn5KcNt1EZZzsjn9575PYz7HnrJPai2Ak8BBQ=="/>
+        </item>
+        <item>
             <title>1.3.1</title>
             <pubDate>Thu, 20 Aug 2026 16:19:23 -0400</pubDate>
             <link>https://github.com/jdimaso/lightxt</link>
@@ -72,6 +86,6 @@ This release also includes the large-file JSON, CSV, Markdown, navigation, and p
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: a9Q/OAqnK0siUjfBEd0mYpJ1LTOepcW/70igHn/o7P6XJhvUli4LR9xAw+5qy6lRyA44xIcOFLQhcuTOEi64Bg==
-length: 4881
+edSignature: skXAVl4rbjrgAmbadUYaCwAWZHm1RaR2VJaTv3+sNNW5d3ePg1elh6r7iCztiyP1565YtXn7C2/tBJIGKl87Dg==
+length: 5910
 -->
