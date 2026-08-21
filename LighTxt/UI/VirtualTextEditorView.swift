@@ -5,6 +5,16 @@ struct EditorLineLocation: Sendable {
     let lineStartByteOffset: Int64
 }
 
+/// Immutable, bounded bytes currently materialized by the virtual editor.
+/// Consumers may render this snapshot but must never treat it as an edit.
+struct EditorViewportPresentationSnapshot: Sendable {
+    let data: Data
+    let byteRange: Range<Int64>
+    let documentByteCount: Int64
+    let leadingContext: Data
+    let leadingContextStartByteOffset: Int64
+}
+
 @MainActor
 protocol VirtualTextEditorDelegate: AnyObject {
     var editorDocumentByteCount: Int64 { get }
@@ -340,6 +350,28 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
         let lower = decoder.byteOffset(forUTF16Offset: characterRange.location, bias: .leading)
         let upper = decoder.byteOffset(forUTF16Offset: NSMaxRange(characterRange), bias: .trailing)
         return (viewportRange.lowerBound + Int64(lower))..<(viewportRange.lowerBound + Int64(upper))
+    }
+
+    func presentationSnapshot() throws -> EditorViewportPresentationSnapshot {
+        let contextStart = max(
+            0,
+            viewportRange.lowerBound - Int64(Self.maximumViewportBytes)
+        )
+        let leadingContext: Data
+        if contextStart < viewportRange.lowerBound, let editorDelegate {
+            leadingContext = try editorDelegate.editorReadBytes(
+                in: contextStart..<viewportRange.lowerBound
+            )
+        } else {
+            leadingContext = Data()
+        }
+        return EditorViewportPresentationSnapshot(
+            data: sourceBytes,
+            byteRange: viewportRange,
+            documentByteCount: editorDelegate?.editorDocumentByteCount ?? Int64(sourceBytes.count),
+            leadingContext: leadingContext,
+            leadingContextStartByteOffset: contextStart
+        )
     }
 
     func reloadPreservingSelection() {

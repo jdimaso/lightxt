@@ -173,14 +173,15 @@ final class LighTxtDocumentController: NSDocumentController {
         case .markdown: "net.daringfireball.markdown"
         case .yaml: "public.yaml"
         case .sql: "public.sql"
+        case .parquet: "org.apache.parquet"
         case .plainText: "public.plain-text"
         }
     }
 
     @objc func openLighTxtDocument(_ sender: Any?) {
         let panel = NSOpenPanel()
-        panel.title = "Open a Text File"
-        panel.message = "Choose TXT, JSON, Markdown, SQL, XML, CSV, or YAML files."
+        panel.title = "Open a File"
+        panel.message = "Choose TXT, SCRIPT, JSON, Markdown, SQL, XML, CSV, YAML, or Parquet files."
         panel.prompt = "Open"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -228,6 +229,7 @@ final class LighTxtDocumentController: NSDocumentController {
 
     @objc func saveCurrentLighTxtDocument(_ sender: Any?) {
         guard let document = currentDocument as? LighTxtDocument,
+              !document.session.isReadOnly,
               !document.isSaving,
               !document.session.isBulkEditing else {
             NSSound.beep()
@@ -239,6 +241,7 @@ final class LighTxtDocumentController: NSDocumentController {
 
     @objc func saveAsCurrentLighTxtDocument(_ sender: Any?) {
         guard let document = currentDocument as? LighTxtDocument,
+              !document.session.isReadOnly,
               !document.isSaving,
               !document.session.isBulkEditing else {
             NSSound.beep()
@@ -261,6 +264,7 @@ final class LighTxtDocumentController: NSDocumentController {
 
     @objc func duplicateCurrentLighTxtDocument(_ sender: Any?) {
         guard let document = currentDocument as? LighTxtDocument,
+              !document.session.isReadOnly,
               !document.isSaving,
               !document.session.isBulkEditing else {
             NSSound.beep()
@@ -321,7 +325,7 @@ final class LighTxtDocumentController: NSDocumentController {
         }
         let alert = NSAlert()
         alert.messageText = "LighTxt"
-        alert.informativeText = "Open TXT, JSON, Markdown, SQL, XML, CSV, or YAML. Only a bounded editing viewport is decoded; the source remains file-backed."
+        alert.informativeText = "Open TXT, SCRIPT, JSON, Markdown, SQL, XML, CSV, YAML, or Parquet. Text stays file-backed, and Parquet opens in a read-only table."
         alert.addButton(withTitle: "Done")
         alert.runModal()
     }
@@ -334,10 +338,18 @@ final class LighTxtDocumentController: NSDocumentController {
         case #selector(openLighTxtDocument(_:)):
             return true
         case #selector(saveCurrentLighTxtDocument(_:)),
-             #selector(saveAsCurrentLighTxtDocument(_:)),
-             #selector(saveCopyOfCurrentLighTxtDocument(_:)),
-             #selector(duplicateCurrentLighTxtDocument(_:)):
+             #selector(saveAsCurrentLighTxtDocument(_:)):
             return document != nil
+                && document?.session.isReadOnly == false
+                && document?.isSaving == false
+                && document?.session.isBulkEditing == false
+        case #selector(saveCopyOfCurrentLighTxtDocument(_:)):
+            return document != nil
+                && document?.isSaving == false
+                && document?.session.isBulkEditing == false
+        case #selector(duplicateCurrentLighTxtDocument(_:)):
+            return document != nil
+                && document?.session.isReadOnly == false
                 && document?.isSaving == false
                 && document?.session.isBulkEditing == false
         case #selector(undoCurrentLighTxtDocument(_:)):
@@ -346,14 +358,16 @@ final class LighTxtDocumentController: NSDocumentController {
             return document?.session.canRedo == true && document?.session.isBulkEditing == false
         case #selector(findNextInCurrentLighTxtDocument(_:)),
              #selector(findPreviousInCurrentLighTxtDocument(_:)):
-            return editor != nil && document?.session.searchQuery.isEmpty == false
+            return editor != nil
+                && document?.session.isReadOnly == false
+                && document?.session.searchQuery.isEmpty == false
         case #selector(showFindForCurrentLighTxtDocument(_:)),
              #selector(useSelectionForFindInCurrentLighTxtDocument(_:)),
              #selector(showGoToLineForCurrentLighTxtDocument(_:)),
              #selector(increaseFontSizeInCurrentLighTxtDocument(_:)),
              #selector(decreaseFontSizeInCurrentLighTxtDocument(_:)),
              #selector(resetFontSizeInCurrentLighTxtDocument(_:)):
-            return editor != nil
+            return editor != nil && document?.session.isReadOnly == false
         case #selector(toggleStructureForCurrentLighTxtDocument(_:)):
             return editor?.canToggleStructure == true
         case #selector(showHelpForCurrentLighTxtDocument(_:)):
@@ -374,7 +388,7 @@ final class LighTxtDocumentController: NSDocumentController {
     }
 
     private static let supportedFilenameExtensions = [
-        "txt", "text", "log", "json", "md", "markdown", "sql", "xml", "csv", "yml", "yaml",
+        "txt", "text", "log", "script", "json", "md", "markdown", "sql", "xml", "csv", "yml", "yaml", "parquet",
     ]
 
 }
@@ -502,7 +516,16 @@ final class LighTxtDocument: NSDocument {
         originalContentsURL absoluteOriginalContentsURL: URL?
     ) throws {
         let engine = MainActor.assumeIsolated { session.engine }
-        switch Self.route(for: saveOperation) {
+        let route = Self.route(for: saveOperation)
+        let isReadOnly = MainActor.assumeIsolated { session.isReadOnly }
+        if isReadOnly, route != .copy {
+            throw LighTxtSessionError.readOnlyDocument
+        }
+        if route == .saveAs,
+           SyntaxFileTypeDetector.knownType(forPathExtension: url.pathExtension) == .parquet {
+            throw LighTxtSessionError.parquetExportUnsupported
+        }
+        switch route {
         case .copy:
             try engine.saveCopy(to: url)
         case .saveAs:
@@ -518,6 +541,16 @@ final class LighTxtDocument: NSDocument {
         for saveOperation: NSDocument.SaveOperationType,
         completionHandler: @escaping (Error?) -> Void
     ) {
+        let requestedRoute = Self.route(for: saveOperation)
+        guard !session.isReadOnly || requestedRoute == .copy else {
+            completionHandler(LighTxtSessionError.readOnlyDocument)
+            return
+        }
+        if requestedRoute == .saveAs,
+           SyntaxFileTypeDetector.knownType(forPathExtension: url.pathExtension) == .parquet {
+            completionHandler(LighTxtSessionError.parquetExportUnsupported)
+            return
+        }
         guard !session.isBulkEditing else {
             session.cancelBulkOperation()
             completionHandler(LighTxtSessionError.bulkOperationInProgress)
@@ -528,7 +561,7 @@ final class LighTxtDocument: NSDocument {
             return
         }
         let engine = session.engine
-        let saveRoute = Self.route(for: saveOperation)
+        let saveRoute = requestedRoute
         if saveRoute == .inPlace {
             do {
                 try engine.validateCurrentDocumentURL(url)

@@ -33,6 +33,8 @@ public enum SyntaxDiagnostics {
         switch fileType {
         case .plainText:
             return utf8Diagnostics(bytes, baseByteOffset: baseByteOffset, limits: limits)
+        case .parquet:
+            return []
         case .json:
             var validator = JSONValidator(
                 bytes: bytes, baseByteOffset: baseByteOffset, limits: limits

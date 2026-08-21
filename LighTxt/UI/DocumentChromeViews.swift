@@ -16,6 +16,7 @@ enum DocumentPresentationMode: Int, CaseIterable {
 final class DocumentHeaderView: NSView {
     var onFind: (() -> Void)?
     var onStructure: (() -> Void)?
+    var onPrettifyChanged: ((Bool) -> Void)?
     var onOpenFolder: ((URL) -> Void)?
     var onPresentationModeChanged: ((DocumentPresentationMode) -> Void)?
 
@@ -32,6 +33,7 @@ final class DocumentHeaderView: NSView {
         target: nil,
         action: nil
     )
+    private let prettifyButton = NSButton(checkboxWithTitle: "Prettify", target: nil, action: nil)
     private let structureButton = HeaderIconButton(
         symbolName: "sidebar.right",
         accessibilityLabel: "Toggle structure sidebar"
@@ -41,6 +43,7 @@ final class DocumentHeaderView: NSView {
         accessibilityLabel: "Find"
     )
     private var currentFileURL: URL?
+    private var trailingWidthConstraint: NSLayoutConstraint?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -106,6 +109,40 @@ final class DocumentHeaderView: NSView {
             ? "Show or hide the structure sidebar"
             : "Structure is available for JSON, XML, and YAML files"
         if !available { setStructureVisible(false) }
+    }
+
+    /// Binary table formats have a rendered, read-only presentation only.
+    /// Keep View visible and selected while making the unavailable Edit path
+    /// explicit to mouse, keyboard, and accessibility users.
+    func setEditingAvailable(_ available: Bool) {
+        modeControl.setEnabled(available, forSegment: DocumentPresentationMode.edit.rawValue)
+        if !available {
+            modeControl.selectedSegment = DocumentPresentationMode.view.rawValue
+        }
+        modeControl.toolTip = available
+            ? "Switch between a rendered view and byte-window editing"
+            : "This document is available in read-only View mode"
+        modeControl.setAccessibilityHelp(modeControl.toolTip)
+    }
+
+    func setFindAvailable(_ available: Bool) {
+        findButton.isEnabled = available
+        findButton.toolTip = available
+            ? "Find in document (Command-F)"
+            : "Use the column filters to find Parquet rows"
+        findButton.setAccessibilityHelp(findButton.toolTip)
+    }
+
+    func setPrettifyAvailable(_ available: Bool) {
+        prettifyButton.isHidden = !available
+        prettifyButton.isEnabled = available
+        if !available { prettifyButton.state = .off }
+        trailingWidthConstraint?.constant = available ? 281 : 197
+    }
+
+    func setPrettifyOn(_ enabled: Bool) {
+        prettifyButton.state = enabled ? .on : .off
+        prettifyButton.setAccessibilityValue(enabled ? "On" : "Off")
     }
 
     private func configure() {
@@ -191,6 +228,15 @@ final class DocumentHeaderView: NSView {
         modeControl.setAccessibilityLabel("Document mode")
         modeControl.setContentHuggingPriority(.required, for: .horizontal)
 
+        prettifyButton.target = self
+        prettifyButton.action = #selector(prettifyChanged(_:))
+        prettifyButton.controlSize = .small
+        prettifyButton.toolTip = "Show this bounded JSON or YAML viewport formatted in a read-only preview"
+        prettifyButton.setAccessibilityLabel("Prettify read-only preview")
+        prettifyButton.setAccessibilityHelp("Shows formatted source without changing or saving any document bytes.")
+        prettifyButton.isHidden = true
+        prettifyButton.setContentHuggingPriority(.required, for: .horizontal)
+
         structureButton.toolTip = "Show or hide the structure sidebar"
         structureButton.onActivate = { [weak self] in self?.onStructure?() }
         findButton.toolTip = "Find in document (Command-F)"
@@ -198,7 +244,7 @@ final class DocumentHeaderView: NSView {
         findButton.keyEquivalentModifierMask = [.command]
         findButton.onActivate = { [weak self] in self?.onFind?() }
 
-        let trailing = NSStackView(views: [modeControl, structureButton, findButton])
+        let trailing = NSStackView(views: [modeControl, prettifyButton, structureButton, findButton])
         trailing.orientation = .horizontal
         trailing.alignment = .centerY
         trailing.spacing = 8
@@ -209,6 +255,8 @@ final class DocumentHeaderView: NSView {
             addSubview($0)
         }
 
+        let trailingWidthConstraint = trailing.widthAnchor.constraint(equalToConstant: 197)
+        self.trailingWidthConstraint = trailingWidthConstraint
         NSLayoutConstraint.activate([
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 82),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -229,7 +277,7 @@ final class DocumentHeaderView: NSView {
 
             trailing.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
             trailing.centerYAnchor.constraint(equalTo: centerYAnchor),
-            trailing.widthAnchor.constraint(equalToConstant: 197),
+            trailingWidthConstraint,
             modeControl.heightAnchor.constraint(equalToConstant: 28)
         ])
     }
@@ -255,6 +303,21 @@ final class DocumentHeaderView: NSView {
         guard let mode = DocumentPresentationMode(rawValue: sender.selectedSegment) else { return }
         onPresentationModeChanged?(mode)
     }
+
+    @objc private func prettifyChanged(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        sender.setAccessibilityValue(enabled ? "On" : "Off")
+        onPrettifyChanged?(enabled)
+    }
+
+#if LIGHTXT_RUNTIME_QA
+    var qaPrettifyIsVisible: Bool { !prettifyButton.isHidden }
+    var qaPrettifyIsEnabled: Bool { prettifyButton.isEnabled }
+    var qaPrettifyIsOn: Bool { prettifyButton.state == .on }
+    var qaPrettifyAccessibilityLabel: String? { prettifyButton.accessibilityLabel() }
+    var qaPrettifyFrame: NSRect { prettifyButton.frame }
+    func qaActivatePrettify() { prettifyButton.performClick(nil) }
+#endif
 
     private func activatePathItem(_ url: URL) {
         let selectedURL = url.standardizedFileURL

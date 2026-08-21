@@ -1,6 +1,22 @@
 LighTxt Third-Party Notices
 ============================
 
+DuckDB 1.4.5 LTS
+Copyright 2018-2025 Stichting DuckDB Foundation
+https://github.com/duckdb/duckdb
+Official archive: https://github.com/duckdb/duckdb/releases/download/v1.4.5/libduckdb-osx-universal.zip
+Archive SHA-256: 33f840404e3b420600936d5b59d342680aa4af41cc06d9a5589711e43cd75766
+
+LighTxt embeds the official universal DuckDB library to provide bounded,
+read-only Parquet viewing. DuckDB is available under the MIT License. A copy
+of that license is included in this application as DuckDB-LICENSE.txt. The
+version-matched licenses and notices for the dependencies statically included
+in the official library are bundled under DuckDB-Licenses. Source copies are
+at:
+
+  LighTxt/DuckDB-LICENSE.txt
+  ThirdParty/DuckDB/Licenses/
+
 Sparkle 2.9.6
 https://github.com/sparkle-project/Sparkle
 

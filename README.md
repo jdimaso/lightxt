@@ -4,12 +4,12 @@ LighTxt is a native macOS text viewer and editor built for files that ordinary e
 
 ## What it supports
 
-- TXT, JSON, Markdown, SQL, XML, CSV, YAML, and YML
-- A purpose-built **View** mode: a whole-document JSON explorer, rendered Markdown, and a virtual CSV table with per-column sort, filter, and summary tools
-- A bounded **Edit** mode for every supported format, with byte-preserving edits, syntax highlighting, and invalid-syntax diagnostics
+- TXT, SCRIPT, JSON, Markdown, SQL, XML, CSV, YAML/YML, and read-only Parquet
+- A purpose-built **View** mode: structured JSON/YAML navigation, rendered Markdown, a virtual CSV table, and a read-only Parquet table with per-column sort, filter, and summary tools
+- A bounded **Edit** mode for supported text formats, with byte-preserving edits, SQL and other syntax highlighting, and invalid-syntax diagnostics
 - A full-path top-bar breadcrumb whose folder segments open in Finder, with safe same-window document navigation
-- A resizable, collapsible JSON explorer with lazy expand/collapse, paged children, and exact jumps back into Edit mode
-- Literal or regular-expression Find, Find All, Replace, and transactional Replace All
+- A resizable JSON explorer with lazy paged children, row-click expansion, double-click collapse, and adjustable View text size
+- View-only Find results that show source context and emphasize the exact matching bytes without switching into Edit; Edit mode also provides Replace and transactional Replace All
 - Save, Save As, Save a Copy, Duplicate, undo, and redo
 - Transactional CSV row and column insertion/deletion, with every operation represented as one Undo step
 - Sparse line indexing and direct byte-position navigation with 64-bit offsets
@@ -19,7 +19,7 @@ LighTxt is a native macOS text viewer and editor built for files that ordinary e
 
 The original file stays behind one read-only descriptor and is fetched with fingerprint-validated, 1 MiB-bounded positional reads. Edits live in a persistent balanced piece table, with a 16 MiB in-memory budget and overflow stored in one private unlinked backing file. Searches, saves, replacements, syntax analysis, and line indexing stream through bounded buffers. Find All retains only a bounded UI result set. Unedited APFS duplicates use clone-on-write.
 
-JSON View validates every byte but never constructs a decoded object graph. On machines with ample headroom, eligible documents are copied into anonymous RAM and indexed there; files through 4 GiB use a parallel simdjson traversal and native record pass, while larger files use an exact 64-bit native grammar/record pass with SIMD UTF-8 validation. Memory-ineligible documents retain the bounded streaming/unlinked-disk fallback. Primitive values are decoded only when their tree page is requested, and both resident source and index memory can be purged without losing navigation. CSV View keeps an adaptive sparse row index rather than one offset per row. Filters stream into an unlinked, temporary row map; stable sorts use bounded external runs with incremental merging, so neither operation constructs a whole-file row array. Column Summary uses a bounded, stratified sample for large tables. Markdown View renders only a bounded document window. No production path constructs a whole-file decoded `String`, `NSAttributedString`, JSON object tree, CSV row array, or line array. Large-file scrolling is coalesced so a drag materializes only its final requested viewport.
+JSON View validates every byte but never constructs a decoded object graph. On machines with ample headroom, eligible documents are copied into anonymous RAM and indexed there; files through 4 GiB use a parallel simdjson traversal and native record pass, while larger files use an exact 64-bit native grammar/record pass with SIMD UTF-8 validation. Memory-ineligible documents retain the bounded streaming/unlinked-disk fallback. Primitive values are decoded only when their tree page is requested, and both resident source and index memory can be purged without losing navigation. CSV View keeps an adaptive sparse row index rather than one offset per row. Filters stream into an unlinked, temporary row map; stable sorts use bounded external runs with incremental merging, so neither operation constructs a whole-file row array. Column Summary uses a bounded, stratified sample for large tables. Parquet View uses the pinned DuckDB LTS library to scan the selected file directly with projection and filter pushdown, stable source-row paging, and hard limits on returned rows and text; it never imports the file into a second database. Markdown View renders only a bounded document window. No production path constructs a whole-file decoded `String`, `NSAttributedString`, JSON object tree, CSV row array, Parquet row array, or line array. Large-file scrolling is coalesced so a drag materializes only its final requested viewport.
 
 ## Measured release behavior
 

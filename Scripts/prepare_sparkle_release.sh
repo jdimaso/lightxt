@@ -7,6 +7,8 @@ readonly KEYCHAIN_ACCOUNT="jdimaso-lighttxt"
 readonly EXPECTED_BUNDLE_ID="app.lightext.LighTxt"
 readonly PROJECT_NAME="LighTxt.xcodeproj"
 readonly SCHEME_NAME="LighTxt"
+readonly EXPECTED_DUCKDB_VERSION="v1.4.5"
+readonly EXPECTED_DUCKDB_LICENSE_SHA256="7e17fd31249fa875cb3b1c5e05c6c3e99b75509f6a2804ca176c217834de1dcb"
 
 usage() {
     print -u2 "Usage: $0 /path/to/LighTxt.app /path/to/release-notes.md [output-directory]"
@@ -80,6 +82,91 @@ APP_ARCHS="$(lipo -archs "$APP_PATH/Contents/MacOS/LighTxt")"
     exit 65
 }
 
+DUCKDB_LIBRARY="$APP_PATH/Contents/Frameworks/libduckdb.dylib"
+DUCKDB_LICENSE="$APP_PATH/Contents/Resources/DuckDB-LICENSE.txt"
+DUCKDB_LICENSE_DIRECTORY="$APP_PATH/Contents/Resources/DuckDB-Licenses"
+THIRD_PARTY_NOTICES="$APP_PATH/Contents/Resources/ThirdPartyNotices.txt"
+[[ -f "$DUCKDB_LIBRARY" ]] || { print -u2 "The DuckDB runtime is missing from the app."; exit 65; }
+[[ -f "$DUCKDB_LICENSE" ]] || { print -u2 "The DuckDB license is missing from the app."; exit 65; }
+[[ -f "$DUCKDB_LICENSE_DIRECTORY/LICENSE" ]] || {
+    print -u2 "The DuckDB dependency license tree is missing from the app."
+    exit 65
+}
+[[ -f "$THIRD_PARTY_NOTICES" ]] || { print -u2 "Third-party notices are missing from the app."; exit 65; }
+/usr/bin/cmp -s "$DUCKDB_LICENSE" "$DUCKDB_LICENSE_DIRECTORY/LICENSE" || {
+    print -u2 "The bundled DuckDB license copies do not match."
+    exit 65
+}
+DUCKDB_LICENSE_SHA256="$(shasum -a 256 "$DUCKDB_LICENSE" | awk '{print $1}')"
+[[ "$DUCKDB_LICENSE_SHA256" == "$EXPECTED_DUCKDB_LICENSE_SHA256" ]] || {
+    print -u2 "The bundled DuckDB license does not match the pinned v1.4.5 license."
+    exit 65
+}
+DUCKDB_LICENSE_FILE_COUNT="$(find "$DUCKDB_LICENSE_DIRECTORY" -type f | wc -l | tr -d ' ')"
+[[ "$DUCKDB_LICENSE_FILE_COUNT" -ge 32 ]] || {
+    print -u2 "The DuckDB dependency license tree is incomplete ($DUCKDB_LICENSE_FILE_COUNT files)."
+    exit 65
+}
+grep -Fq "DuckDB 1.4.5" "$THIRD_PARTY_NOTICES" || {
+    print -u2 "Third-party notices do not identify DuckDB 1.4.5."
+    exit 65
+}
+
+DUCKDB_ARCHS="$(lipo -archs "$DUCKDB_LIBRARY")"
+[[ "$DUCKDB_ARCHS" == *arm64* && "$DUCKDB_ARCHS" == *x86_64* ]] || {
+    print -u2 "DuckDB must contain both arm64 and x86_64: $DUCKDB_ARCHS"
+    exit 65
+}
+[[ "$(print -r -- "$DUCKDB_ARCHS" | wc -w | tr -d ' ')" == "2" ]] || {
+    print -u2 "DuckDB contains unexpected architectures: $DUCKDB_ARCHS"
+    exit 65
+}
+[[ "$(otool -D "$DUCKDB_LIBRARY" | tail -n 1 | xargs)" == "@rpath/libduckdb.dylib" ]] || {
+    print -u2 "DuckDB has an unexpected install name."
+    exit 65
+}
+for architecture in arm64 x86_64; do
+    dependency_count=0
+    while IFS= read -r dependency; do
+        dependency_count=$((dependency_count + 1))
+        case "$dependency" in
+            "@rpath/libduckdb.dylib"|"/usr/lib/libc++.1.dylib"|"/usr/lib/libSystem.B.dylib") ;;
+            *) print -u2 "DuckDB has an unexpected $architecture dependency: $dependency"; exit 65 ;;
+        esac
+    done < <(otool -arch "$architecture" -L "$DUCKDB_LIBRARY" | tail -n +2 | awk '{print $1}')
+    [[ "$dependency_count" == "3" ]] || {
+        print -u2 "DuckDB $architecture has $dependency_count dynamic dependencies; expected 3."
+        exit 65
+    }
+done
+
+codesign --verify --strict --verbose=2 "$DUCKDB_LIBRARY"
+DUCKDB_CODESIGN_DETAILS="$(codesign -dv --verbose=4 "$DUCKDB_LIBRARY" 2>&1)"
+[[ "$DUCKDB_CODESIGN_DETAILS" == *"Timestamp="* ]] || {
+    print -u2 "DuckDB does not have the trusted timestamp required for a Developer ID release."
+    exit 65
+}
+APP_TEAM="$(print -r -- "$CODESIGN_DETAILS" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
+DUCKDB_TEAM="$(print -r -- "$DUCKDB_CODESIGN_DETAILS" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
+[[ -n "$APP_TEAM" && "$DUCKDB_TEAM" == "$APP_TEAM" ]] || {
+    print -u2 "DuckDB is not signed by the same team as the app."
+    exit 65
+}
+
+VERIFY_DIRECTORY="$(mktemp -d "${TMPDIR:-/tmp}/lightxt-duckdb-verify.XXXXXX")"
+trap '/bin/rm -rf "$VERIFY_DIRECTORY"' EXIT
+DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}" \
+    xcrun clang -O2 "$REPOSITORY_ROOT/Scripts/verify_duckdb_runtime.c" \
+    -o "$VERIFY_DIRECTORY/verify-duckdb-runtime"
+"$VERIFY_DIRECTORY/verify-duckdb-runtime" "$DUCKDB_LIBRARY" "$EXPECTED_DUCKDB_VERSION" >/dev/null
+
+SHIPPED_DUCKDB_DEVELOPMENT_FILE="$(find "$APP_PATH" -type f \
+    \( -name 'libduckdb*.zip' -o -name duckdb.h -o -name duckdb.hpp \) -print -quit)"
+[[ -z "$SHIPPED_DUCKDB_DEVELOPMENT_FILE" ]] || {
+    print -u2 "The app ships a DuckDB archive/header: $SHIPPED_DUCKDB_DEVELOPMENT_FILE"
+    exit 65
+}
+
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$INFO_PLIST")" == \
     "https://raw.githubusercontent.com/$REPOSITORY/main/appcast.xml" ]] || {
     print -u2 "The release contains an unexpected Sparkle feed URL."
@@ -122,6 +209,7 @@ grep -q "sparkle-signatures:" "$OUTPUT_DIR/appcast.xml"
 
 print "Prepared Sparkle release v$SHORT_VERSION (build $BUILD_VERSION)"
 print "Sparkle framework: $SPARKLE_VERSION"
+print "DuckDB runtime: $EXPECTED_DUCKDB_VERSION ($DUCKDB_ARCHS)"
 print "Update archive: $ARCHIVE_PATH"
 print "Signed appcast: $OUTPUT_DIR/appcast.xml"
 shasum -a 256 "$ARCHIVE_PATH"

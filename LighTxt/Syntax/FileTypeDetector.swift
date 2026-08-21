@@ -8,13 +8,14 @@ public enum SyntaxFileTypeDetector {
     /// Returns nil for an extension LighTxt does not explicitly support.
     public static func knownType(forPathExtension pathExtension: String) -> SyntaxFileType? {
         switch pathExtension.lowercased() {
-        case "txt": .plainText
+        case "txt", "text", "log", "script": .plainText
         case "json": .json
-        case "md": .markdown
+        case "md", "markdown": .markdown
         case "sql": .sql
         case "xml": .xml
         case "csv": .csv
         case "yaml", "yml": .yaml
+        case "parquet": .parquet
         default: nil
         }
     }
@@ -61,6 +62,12 @@ public enum SyntaxFileTypeDetector {
         }
         guard let first = SyntaxByteUtilities.firstNonWhitespace(bytes, limit: byteCount) else {
             return .plainText
+        }
+
+        if byteCount >= 4,
+           bytes[0] == 0x50, bytes[1] == 0x41,
+           bytes[2] == 0x52, bytes[3] == 0x31 { // PAR1
+            return .parquet
         }
 
         if bytes[first] == 0x7B || bytes[first] == 0x5B { // { or [

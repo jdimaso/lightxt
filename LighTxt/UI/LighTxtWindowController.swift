@@ -110,6 +110,7 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        editorViewController.prepareForWindowClose()
         LighTxtDocumentController.active?.documentWindowDidClose()
     }
 
@@ -196,6 +197,7 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func installFreshEditor(for document: LighTxtDocument) {
+        editorViewController.prepareForWindowClose()
         let replacement = LighTxtEditorViewController(document: document)
         editorViewController = replacement
         let preservedFrame = window?.frame
@@ -245,6 +247,14 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         }
         return table
     }()
+    private lazy var parquetTableView: ParquetTableView = {
+        let table = ParquetTableView()
+        table.onStatusChange = { [weak self] text, busy in
+            self?.statusBar.setState(text, busy: busy)
+        }
+        return table
+    }()
+    private lazy var prettifiedViewportView = PrettifiedViewportView()
     private weak var installedPrimaryContentView: NSView?
     private var findHeightConstraint: NSLayoutConstraint!
     private var structureIsVisible = false
@@ -252,6 +262,11 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private var presentationMode: DocumentPresentationMode = .edit
     private var preferredStructureWidth: CGFloat = 340
     private var sidebarShowsSearchResults = false
+    private var searchPreviewGeneration: UInt64 = 0
+    private var searchPreviewCancellation: CancellationToken?
+    private var viewSearchOriginRange: Range<Int64>?
+    private var structureSearchResultsByRange: [Range<Int64>: StructureSearchResult] = [:]
+    private var focusedStructureSearchRange: Range<Int64>?
     private var lastStructurePayload: (folds: [SyntaxFoldRange], data: Data, base: Int64, type: SyntaxFileType)?
     private var saveObserver: NSObjectProtocol?
     private let jsonStructureController = JSONStructureController()
@@ -270,6 +285,13 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private var lastEditorViewport: Range<Int64> = 0..<0
     private var observedSyntaxFileType: SyntaxFileType
     private var syntaxChangedDuringSave = false
+    private var prettifyGeneration: UInt64 = 0
+    private var prettifyCancellation: CancellationToken?
+    private var prettifySourceRevision: UInt64?
+
+    private var isPrettifyPreviewActive: Bool {
+        installedPrimaryContentView === prettifiedViewportView
+    }
 
     /// Optional rendered-content integrations can replace the primary pane
     /// after this callback. The chrome and split view do not depend on a JSON,
@@ -291,6 +313,18 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     deinit {
         if let saveObserver { NotificationCenter.default.removeObserver(saveObserver) }
         jsonRebuildWork?.cancel()
+        searchPreviewCancellation?.cancel()
+        prettifyCancellation?.cancel()
+    }
+
+    func prepareForWindowClose() {
+        jsonRebuildWork?.cancel()
+        searchPreviewCancellation?.cancel()
+        prettifyCancellation?.cancel()
+        prettifyGeneration &+= 1
+        (installedPrimaryContentView as? MarkdownPreviewView)?.deactivate()
+        (installedPrimaryContentView as? CSVTableView)?.deactivate()
+        (installedPrimaryContentView as? ParquetTableView)?.deactivate()
     }
 
     override func loadView() {
@@ -327,6 +361,9 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         header.onPresentationModeChanged = { [weak self] mode in
             self?.setPresentationMode(mode, notifyIntegration: true)
         }
+        header.onPrettifyChanged = { [weak self] enabled in
+            self?.setPrettifyPreviewEnabled(enabled)
+        }
         installSessionCallbacks()
         installJSONStructureCallbacks()
         observeSaveProgress()
@@ -357,6 +394,15 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             edited: isEdited,
             structureAvailable: canToggleStructure
         )
+        let textDocument = !session.isReadOnly
+        header.setEditingAvailable(textDocument)
+        header.setFindAvailable(textDocument)
+        header.setPrettifyAvailable(
+            textDocument
+                && presentationMode == .edit
+                && (session.syntaxFileType == .json || session.syntaxFileType == .yaml)
+        )
+        header.setPrettifyOn(isPrettifyPreviewActive)
         view.window?.title = title
         view.window?.representedURL = document.fileURL
         view.window?.isDocumentEdited = isEdited
@@ -418,6 +464,9 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private func installSessionCallbacks() {
         session.callbacks.documentChanged = { [weak self] byteCount, edited in
             guard let self, let document = self.document else { return }
+            if self.isPrettifyPreviewActive {
+                self.endPrettifyPreview(focusEditor: false)
+            }
             if edited, !document.isDocumentEdited {
                 document.updateChangeCount(.changeDone)
             } else if !edited, document.isDocumentEdited {
@@ -467,33 +516,39 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         session.callbacks.matchChanged = { [weak self] match in
             guard let self, let match else { return }
             guard self.presentationMode == .edit else {
-                // Search completion is asynchronous. In View mode the find
-                // field may already contain more input by the time a match is
-                // published, so changing modes here would steal first
-                // responder from that field and send the remaining keystrokes
-                // into the bounded editor. Remember the match for an explicit
-                // switch to Edit, but never let search choose the document's
-                // presentation mode.
-                self.pendingEditRevealRange = match.byteRange
+                self.viewSearchOriginRange = match.byteRange
+                self.presentSearchResults(
+                    [match],
+                    total: 1,
+                    truncated: false,
+                    title: self.searchResultTitle(forFindAll: false),
+                    selecting: match.byteRange
+                )
                 return
             }
             self.editorView.scrollTo(byteRange: match.byteRange)
         }
         session.callbacks.findAllCompleted = { [weak self] summary in
             guard let self else { return }
-            self.sidebarShowsSearchResults = true
-            self.jsonPresentedGeneration = nil
-            self.structureSidebar.updateSearchResults(
+            self.presentSearchResults(
                 summary.retainedMatches,
                 total: summary.totalMatches,
-                truncated: summary.retainedLimitReached
+                truncated: summary.retainedLimitReached,
+                title: self.searchResultTitle(forFindAll: true),
+                selecting: nil
             )
-            self.setStructureVisible(true)
             let noun = summary.totalMatches == 1 ? "match" : "matches"
             self.findBar.setStatus("\(summary.totalMatches.formatted()) \(noun)")
         }
         session.callbacks.searchResultsInvalidated = { [weak self] in
-            guard let self, self.sidebarShowsSearchResults else { return }
+            guard let self else { return }
+            self.searchPreviewGeneration &+= 1
+            self.searchPreviewCancellation?.cancel()
+            self.searchPreviewCancellation = nil
+            self.viewSearchOriginRange = nil
+            self.structureSearchResultsByRange.removeAll(keepingCapacity: true)
+            self.focusedStructureSearchRange = nil
+            guard self.sidebarShowsSearchResults else { return }
             self.sidebarShowsSearchResults = false
             if self.presentationMode == .view, self.session.syntaxFileType == .json {
                 self.restoreJSONStructureAfterSearch()
@@ -531,6 +586,232 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
                 NSApp.presentError(error)
             }
         }
+    }
+
+    private func searchResultTitle(forFindAll: Bool) -> String {
+        if forFindAll { return "Find Results" }
+        switch session.syntaxFileType {
+        case .json: return "JSON Explorer"
+        case .yaml: return "YAML Explorer"
+        case .xml: return "XML Explorer"
+        default: return "Find Results"
+        }
+    }
+
+    private func presentSearchResults(
+        _ matches: [SearchMatch],
+        total: Int,
+        truncated: Bool,
+        title: String,
+        selecting selectedRange: Range<Int64>?
+    ) {
+        searchPreviewGeneration &+= 1
+        searchPreviewCancellation?.cancel()
+        let cancellation = CancellationToken()
+        searchPreviewCancellation = cancellation
+        let generation = searchPreviewGeneration
+        let query = session.searchQuery
+        let wasViewing = presentationMode == .view
+        let snapshot: DocumentSnapshot
+        do {
+            snapshot = try session.engine.snapshot()
+        } catch {
+            session.callbacks.error?(error)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let results = StructureSearchResultBuilder.build(
+                snapshot: snapshot,
+                matches: matches,
+                cancellation: cancellation
+            )
+            DispatchQueue.main.async {
+                guard let self,
+                      !cancellation.isCancelled,
+                      self.searchPreviewGeneration == generation,
+                      self.session.searchQuery == query,
+                      self.presentationMode == (wasViewing ? .view : .edit) else { return }
+                self.searchPreviewCancellation = nil
+                self.sidebarShowsSearchResults = true
+                self.structureSearchResultsByRange = Dictionary(
+                    uniqueKeysWithValues: results.map { ($0.match.byteRange, $0) }
+                )
+                self.focusedStructureSearchRange = nil
+                self.jsonPresentedGeneration = nil
+                self.structureSidebar.updateSearchResults(
+                    results,
+                    total: total,
+                    truncated: truncated,
+                    title: title
+                )
+                self.setStructureVisible(true)
+                if let selectedRange {
+                    self.structureSidebar.selectSearchResult(matching: selectedRange)
+                }
+            }
+        }
+    }
+
+    private func revealJSONSearchResult(_ result: StructureSearchResult) {
+        guard presentationMode == .view,
+              session.syntaxFileType == .json,
+              let index = jsonStructureController.index,
+              index.isOpen else { return }
+        searchPreviewGeneration &+= 1
+        searchPreviewCancellation?.cancel()
+        let cancellation = CancellationToken()
+        searchPreviewCancellation = cancellation
+        let generation = searchPreviewGeneration
+        let query = session.searchQuery
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let payload: Result<(JSONStructureAncestry, [JSONStructureNodePreview?]), Error>
+            do {
+                let ancestry = try index.containerAncestry(
+                    containing: result.match.byteRange,
+                    maximumRecordReads: 4_096,
+                    cancellation: cancellation
+                )
+                if cancellation.isCancelled { throw CancellationError() }
+                let previews = ancestry.nodes.map { node -> JSONStructureNodePreview? in
+                    if cancellation.isCancelled { return nil }
+                    return try? index.preview(for: node)
+                }
+                payload = .success((ancestry, previews))
+            } catch {
+                payload = .failure(error)
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      !cancellation.isCancelled,
+                      self.searchPreviewGeneration == generation,
+                      self.session.searchQuery == query,
+                      self.presentationMode == .view,
+                      self.session.syntaxFileType == .json,
+                      self.jsonStructureController.index === index,
+                      index.isOpen else { return }
+                self.searchPreviewCancellation = nil
+                switch payload {
+                case .failure(is CancellationError):
+                    break
+                case .failure(let error):
+                    self.statusBar.setState(
+                        "Could not reveal JSON match: \(error.localizedDescription)",
+                        busy: false,
+                        isError: true
+                    )
+                case let .success((ancestry, previews)):
+                    self.presentFocusedJSONSearchResult(
+                        result,
+                        ancestry: ancestry,
+                        previews: previews,
+                        index: index
+                    )
+                }
+            }
+        }
+    }
+
+    private func presentFocusedJSONSearchResult(
+        _ result: StructureSearchResult,
+        ancestry: JSONStructureAncestry,
+        previews: [JSONStructureNodePreview?],
+        index: JSONStructureIndex
+    ) {
+        guard sidebarShowsSearchResults,
+              jsonStructureController.index === index,
+              index.isOpen else { return }
+        resetJSONSidebarState()
+        jsonPresentedGeneration = index.generation
+
+        let matchIdentifier = "json-search-focus:\(result.match.byteRange.lowerBound):\(result.match.byteRange.upperBound)"
+        var descendant = StructureSidebarNode(
+            identifier: matchIdentifier,
+            title: result.text,
+            subtitle: "Exact source match  ·  byte \(result.match.byteRange.lowerBound.formatted())  ·  \(result.match.byteRange.count.formatted()) bytes",
+            range: result.match.byteRange,
+            kind: nil,
+            highlightUTF16Range: result.highlightUTF16Range,
+            isSearchMatch: true
+        )
+
+        func wrappingNode(
+            at offset: Int,
+            around child: StructureSidebarNode
+        ) -> StructureSidebarNode {
+            let node = ancestry.nodes[offset]
+            let preview = offset < previews.count ? previews[offset] : nil
+            let identifier = jsonSidebarIdentifier(for: node, index: index)
+            jsonNodeBySidebarIdentifier[identifier] = node
+            let title: String
+            switch node.kind {
+            case .document:
+                title = "JSON document"
+            case .object where node.depth == 0:
+                title = "Root object"
+            case .array where node.depth == 0:
+                title = "Root array"
+            case .object:
+                title = preview?.key ?? "Object at byte \(node.byteRange.lowerBound.formatted())"
+            case .array:
+                title = preview?.key ?? "Array at byte \(node.byteRange.lowerBound.formatted())"
+            case .string, .number, .boolean, .null, .invalid:
+                title = preview?.key ?? "Value at byte \(node.byteRange.lowerBound.formatted())"
+            }
+            let sidebarNode = StructureSidebarNode(
+                identifier: identifier,
+                title: title,
+                subtitle: jsonSubtitle(for: node, preview: preview),
+                range: node.byteRange,
+                kind: syntaxFoldKind(for: node.kind),
+                children: [child],
+                childState: .loaded
+            )
+            jsonParentIdentifierBySidebarIdentifier[child.identifier] = identifier
+            return sidebarNode
+        }
+
+        // The index returns the synthetic document first, followed by a
+        // consecutive proven container suffix. Build the known suffix around
+        // the match before inserting an ellipsis at any depth discontinuity;
+        // placing it below the deepest node would imply a false hierarchy.
+        if ancestry.nodes.count > 1 {
+            for offset in ancestry.nodes.indices.dropFirst().reversed() {
+                descendant = wrappingNode(at: offset, around: descendant)
+            }
+        }
+        if !ancestry.isComplete {
+            let ellipsis = StructureSidebarNode(
+                identifier: "json-search-focus:bounded:\(result.match.byteRange.lowerBound)",
+                title: "… bounded ancestry",
+                subtitle: "Some wide sibling groups were skipped after \(ancestry.recordReadCount.formatted()) index reads",
+                range: result.match.byteRange,
+                kind: nil,
+                children: [descendant],
+                childState: .loaded
+            )
+            jsonParentIdentifierBySidebarIdentifier[descendant.identifier] = ellipsis.identifier
+            descendant = ellipsis
+        }
+        if !ancestry.nodes.isEmpty {
+            descendant = wrappingNode(at: 0, around: descendant)
+        }
+
+        focusedStructureSearchRange = result.match.byteRange
+        structureSidebar.applyTreeSnapshot(
+            [descendant],
+            title: "JSON Explorer",
+            scope: ancestry.isComplete
+                ? "Exact match path  ·  byte \(result.match.byteRange.lowerBound.formatted())"
+                : "Bounded match path  ·  byte \(result.match.byteRange.lowerBound.formatted())",
+            documentByteCount: index.sourceByteCount,
+            preservingExpansion: false
+        )
+        structureSidebar.revealNode(withIdentifier: matchIdentifier)
+        statusBar.setState(
+            "Viewing JSON match at byte \(result.match.byteRange.lowerBound.formatted())",
+            busy: false
+        )
     }
 
     private func installJSONStructureCallbacks() {
@@ -574,7 +855,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     private static func prefersViewMode(for fileType: SyntaxFileType) -> Bool {
-        fileType == .json || fileType == .markdown || fileType == .csv
+        fileType == .json || fileType == .markdown || fileType == .csv || fileType == .parquet
     }
 
     private static func supportsStructure(for fileType: SyntaxFileType) -> Bool {
@@ -589,6 +870,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     /// controller. Release the old renderer's captured snapshots/indexes and
     /// reinstall the presentation for the new format immediately.
     private func handleSyntaxFileTypeChange(to newType: SyntaxFileType) {
+        endPrettifyPreview(focusEditor: false)
         observedSyntaxFileType = newType
         syntaxChangedDuringSave = true
         jsonRebuildWork?.cancel()
@@ -598,6 +880,8 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         resetJSONSidebarState()
         lastStructurePayload = nil
         sidebarShowsSearchResults = false
+        structureSearchResultsByRange.removeAll(keepingCapacity: true)
+        focusedStructureSearchRange = nil
         if !Self.supportsStructure(for: newType) {
             editModeStructureWasVisible = false
             setStructureVisible(false)
@@ -606,6 +890,17 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         // view. Normalize through the editor first so an old CSV/Markdown
         // renderer cannot keep scanning or retain its source invisibly.
         restoreEditorAsPrimaryContent()
+
+        if newType == .parquet {
+            // Parquet has no editable text presentation. Force the actual
+            // table installation as well as the header selection, including
+            // defensive format transitions initiated by document navigation.
+            presentationMode = .edit
+            findBar.query = ""
+            if !findBar.isHidden { findBarDidRequestClose(findBar) }
+            setPresentationMode(.view, notifyIntegration: true)
+            return
+        }
 
         if presentationMode == .view, Self.prefersViewMode(for: newType) {
             // Force the existing logical mode back through its installation
@@ -625,12 +920,14 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         guard let window = view.window else { return }
         switch presentationMode {
         case .edit:
-            window.makeFirstResponder(editorView)
+            window.makeFirstResponder(isPrettifyPreviewActive ? prettifiedViewportView : editorView)
         case .view:
             if session.syntaxFileType == .markdown {
                 window.makeFirstResponder(markdownPreviewView)
             } else if session.syntaxFileType == .csv {
                 window.makeFirstResponder(csvTableView)
+            } else if session.syntaxFileType == .parquet {
+                parquetTableView.focusTable()
             } else {
                 window.makeFirstResponder(structureSidebar)
             }
@@ -857,8 +1154,15 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     @objc func showFindPanel(_ sender: Any?) {
+        if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
+        guard !session.isReadOnly else {
+            NSSound.beep()
+            parquetTableView.focusTable()
+            return
+        }
+        findBar.presentation = presentationMode == .view ? .findOnly : .findAndReplace
         findBar.isHidden = false
-        findHeightConstraint.constant = 104
+        findHeightConstraint.constant = findBar.preferredHeight
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.14
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -868,20 +1172,31 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     @objc func findNext(_ sender: Any?) {
-        session.findNext(backwards: false, from: editorView.selectedGlobalByteRange)
+        if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
+        guard !session.isReadOnly else { return }
+        session.findNext(backwards: false, from: searchOriginRange)
     }
 
     @objc func findPrevious(_ sender: Any?) {
-        session.findNext(backwards: true, from: editorView.selectedGlobalByteRange)
+        if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
+        guard !session.isReadOnly else { return }
+        session.findNext(backwards: true, from: searchOriginRange)
     }
 
     @objc func useSelectionForFind(_ sender: Any?) {
+        if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
+        guard !session.isReadOnly else { return }
         guard let selected = editorView.useSelectionForFind(), !selected.isEmpty else { return }
         showFindPanel(sender)
         findBar.query = selected
     }
 
     @objc func showGoToLine(_ sender: Any?) {
+        if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
+        guard !session.isReadOnly else {
+            NSSound.beep()
+            return
+        }
         let alert = NSAlert()
         alert.messageText = "Go to Line"
         alert.informativeText = session.totalLineCount.map { "Enter a line from 1 to \($0.formatted())." }
@@ -904,12 +1219,15 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     @objc func toggleStructure(_ sender: Any?) {
+        if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
         guard canToggleStructure else { return }
         if presentationMode == .view {
             setPresentationMode(.edit, notifyIntegration: true)
             return
         }
         sidebarShowsSearchResults = false
+        structureSearchResultsByRange.removeAll(keepingCapacity: true)
+        focusedStructureSearchRange = nil
         if let payload = lastStructurePayload {
             structureSidebar.update(
                 folds: payload.folds,
@@ -921,11 +1239,55 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         setStructureVisible(!structureIsVisible)
     }
 
-    @objc func increaseFontSize(_ sender: Any?) { editorView.changeFontSize(by: 1) }
-    @objc func decreaseFontSize(_ sender: Any?) { editorView.changeFontSize(by: -1) }
-    @objc func resetFontSize(_ sender: Any?) { editorView.resetFontSize() }
+    @objc func increaseFontSize(_ sender: Any?) {
+        guard !session.isReadOnly else { return }
+        if isStructuredViewPresentation {
+            structureSidebar.changeFullWorkspaceFontSize(by: 1)
+        } else if isPrettifyPreviewActive {
+            prettifiedViewportView.changeFontSize(by: 1)
+            editorView.changeFontSize(by: 1)
+        } else {
+            editorView.changeFontSize(by: 1)
+        }
+    }
+
+    @objc func decreaseFontSize(_ sender: Any?) {
+        guard !session.isReadOnly else { return }
+        if isStructuredViewPresentation {
+            structureSidebar.changeFullWorkspaceFontSize(by: -1)
+        } else if isPrettifyPreviewActive {
+            prettifiedViewportView.changeFontSize(by: -1)
+            editorView.changeFontSize(by: -1)
+        } else {
+            editorView.changeFontSize(by: -1)
+        }
+    }
+
+    @objc func resetFontSize(_ sender: Any?) {
+        guard !session.isReadOnly else { return }
+        if isStructuredViewPresentation {
+            structureSidebar.resetFullWorkspaceFontSize()
+        } else if isPrettifyPreviewActive {
+            prettifiedViewportView.resetFontSize()
+            editorView.resetFontSize()
+        } else {
+            editorView.resetFontSize()
+        }
+    }
+
+    private var isStructuredViewPresentation: Bool {
+        presentationMode == .view && Self.supportsStructure(for: session.syntaxFileType)
+    }
+
+    private var searchOriginRange: Range<Int64> {
+        if presentationMode == .view {
+            return viewSearchOriginRange ?? session.currentMatch?.byteRange ?? 0..<0
+        }
+        return editorView.selectedGlobalByteRange
+    }
 
     @objc func undoDocumentEdit(_ sender: Any?) {
+        if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
         guard commitPendingPresentationEdit() else { return }
         if session.undo() { editorView.reloadPreservingSelection() }
     }
@@ -933,6 +1295,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     @objc func undo(_ sender: Any?) { undoDocumentEdit(sender) }
 
     @objc func redoDocumentEdit(_ sender: Any?) {
+        if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
         guard commitPendingPresentationEdit() else { return }
         if session.redo() { editorView.reloadPreservingSelection() }
     }
@@ -951,7 +1314,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     @objc func showLighTxtHelp(_ sender: Any?) {
         let alert = NSAlert()
         alert.messageText = "LighTxt"
-        alert.informativeText = "Open TXT, JSON, Markdown, SQL, XML, CSV, or YAML. Only a bounded editing viewport is decoded; the source remains file-backed. Use ⌘F for literal or regex find/replace, ⌘L to jump to a line, and the Structure panel for expandable JSON/XML/YAML groups."
+        alert.informativeText = "Open TXT, SCRIPT, JSON, Markdown, SQL, XML, CSV, YAML, or Parquet. Text stays file-backed, while Parquet opens as a read-only table. Use ⌘F to search and the Structure panel for expandable JSON/XML/YAML groups."
         alert.addButton(withTitle: "Done")
         alert.runModal()
     }
@@ -973,11 +1336,11 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             findBar.setStatus("Search this document")
             return
         }
-        session.findNext(backwards: false, from: editorView.selectedGlobalByteRange)
+        session.findNext(backwards: false, from: searchOriginRange)
     }
 
     func findBarFindNext(_ findBar: FindBarView, backwards: Bool) {
-        session.findNext(backwards: backwards, from: editorView.selectedGlobalByteRange)
+        session.findNext(backwards: backwards, from: searchOriginRange)
     }
 
     func findBarFindAll(_ findBar: FindBarView) {
@@ -985,6 +1348,10 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     func findBarReplaceCurrent(_ findBar: FindBarView, replacement: String) {
+        guard presentationMode == .edit else {
+            NSSound.beep()
+            return
+        }
         do {
             if let range = try session.replaceCurrent(with: replacement)?.byteRange {
                 editorView.reloadPreservingSelection()
@@ -999,6 +1366,10 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     func findBarReplaceAll(_ findBar: FindBarView, replacement: String) {
+        guard presentationMode == .edit else {
+            NSSound.beep()
+            return
+        }
         session.replaceAll(with: replacement) { [weak self] result in
             switch result {
             case .success(let count):
@@ -1012,20 +1383,64 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     func findBarDidRequestClose(_ findBar: FindBarView) {
+        searchPreviewGeneration &+= 1
+        searchPreviewCancellation?.cancel()
+        searchPreviewCancellation = nil
+        structureSearchResultsByRange.removeAll(keepingCapacity: true)
+        focusedStructureSearchRange = nil
+        if presentationMode == .view, sidebarShowsSearchResults {
+            sidebarShowsSearchResults = false
+            if session.syntaxFileType == .json {
+                restoreJSONStructureAfterSearch()
+            } else if let payload = lastStructurePayload {
+                structureSidebar.update(
+                    folds: payload.folds,
+                    viewportData: payload.data,
+                    viewportBaseOffset: payload.base,
+                    fileType: payload.type
+                )
+            }
+        }
         findHeightConstraint.constant = 0
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.12
             view.layoutSubtreeIfNeeded()
         }, completionHandler: { [weak self] in
             self?.findBar.isHidden = true
-            self?.view.window?.makeFirstResponder(self?.editorView)
+            Task { @MainActor [weak self] in self?.focusCurrentPresentation() }
         })
     }
 
     func structureSidebar(_ sidebar: StructureSidebarView, revealByteRange range: Range<Int64>) {
         if sidebarShowsSearchResults {
-            pendingEditRevealRange = range
-            setPresentationMode(.edit, notifyIntegration: true)
+            viewSearchOriginRange = range
+            if presentationMode == .view {
+                if focusedStructureSearchRange == range {
+                    statusBar.setState(
+                        "Viewing match at byte \(range.lowerBound.formatted())",
+                        busy: false
+                    )
+                    return
+                }
+                if session.syntaxFileType == .json,
+                   let result = structureSearchResultsByRange[range] {
+                    revealJSONSearchResult(result)
+                    return
+                }
+                // Keep View authoritative. For the bounded XML/YAML structure
+                // adapters, quietly move the hidden editor window as well so
+                // closing/changing the search can restore the surrounding
+                // off-viewport groups without ever entering Edit.
+                if session.syntaxFileType == .yaml || session.syntaxFileType == .xml {
+                    editorView.scrollTo(byteRange: range, select: false)
+                }
+                statusBar.setState(
+                    "Viewing match at byte \(range.lowerBound.formatted())",
+                    busy: false
+                )
+            } else {
+                revealPendingRangeInEditor(range)
+            }
         } else if presentationMode == .view {
             pendingEditRevealRange = range
             statusBar.setState(
@@ -1507,12 +1922,101 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         editorView.scrollTo(byteRange: target)
     }
 
+    private func setPrettifyPreviewEnabled(_ enabled: Bool) {
+        if enabled {
+            beginPrettifyPreview()
+        } else {
+            endPrettifyPreview(focusEditor: true)
+        }
+    }
+
+    private func beginPrettifyPreview() {
+        let fileType = session.syntaxFileType
+        guard presentationMode == .edit,
+              fileType == .json || fileType == .yaml,
+              !session.isReadOnly else {
+            header.setPrettifyOn(false)
+            NSSound.beep()
+            return
+        }
+
+        if !findBar.isHidden { findBarDidRequestClose(findBar) }
+        let documentSnapshot: DocumentSnapshot
+        let viewport: EditorViewportPresentationSnapshot
+        do {
+            documentSnapshot = try session.editorSnapshot()
+            viewport = try editorView.presentationSnapshot()
+        } catch {
+            header.setPrettifyOn(false)
+            statusBar.setState(error.localizedDescription, busy: false, isError: true)
+            return
+        }
+        prettifyGeneration &+= 1
+        let generation = prettifyGeneration
+        let cancellation = CancellationToken()
+        prettifyCancellation?.cancel()
+        prettifyCancellation = cancellation
+        prettifySourceRevision = documentSnapshot.revision
+
+        prettifiedViewportView.showLoading(fileType: fileType, byteRange: viewport.byteRange)
+        installPrimaryContentView(prettifiedViewportView)
+        header.setPrettifyOn(true)
+        statusBar.setState("Preparing a bounded read-only Prettify preview…", busy: true)
+        view.window?.makeFirstResponder(prettifiedViewportView)
+
+        Task.detached(priority: .userInitiated) { [viewport, fileType, cancellation] in
+            let result = try? ViewportPrettifier.prettify(
+                viewport.data,
+                as: fileType,
+                viewportRange: viewport.byteRange,
+                documentByteCount: viewport.documentByteCount,
+                leadingContext: viewport.leadingContext,
+                leadingContextStartByteOffset: viewport.leadingContextStartByteOffset,
+                cancellation: cancellation
+            )
+            await MainActor.run { [weak self] in
+                guard let self,
+                      !cancellation.isCancelled,
+                      generation == self.prettifyGeneration,
+                      self.isPrettifyPreviewActive,
+                      self.presentationMode == .edit,
+                      self.session.syntaxFileType == fileType,
+                      let currentRevision = try? self.session.editorSnapshot().revision,
+                      currentRevision == documentSnapshot.revision,
+                      self.prettifySourceRevision == currentRevision else { return }
+                guard let result else {
+                    self.statusBar.setState("Prettify preview was cancelled", busy: false)
+                    return
+                }
+                self.prettifiedViewportView.show(result)
+                self.statusBar.setState(result.status, busy: false, isError: !result.didPrettify)
+            }
+        }
+    }
+
+    private func endPrettifyPreview(focusEditor: Bool) {
+        prettifyGeneration &+= 1
+        prettifyCancellation?.cancel()
+        prettifyCancellation = nil
+        prettifySourceRevision = nil
+        header.setPrettifyOn(false)
+        guard isPrettifyPreviewActive else { return }
+        restoreEditorAsPrimaryContent()
+        statusBar.updateByteWindow(
+            lastEditorViewport,
+            totalByteCount: session.byteCount
+        )
+        statusBar.setState("Editing a bounded byte window", busy: false)
+        if focusEditor { view.window?.makeFirstResponder(editorView) }
+    }
+
     /// Installs a format-specific renderer in the primary split pane. Passing
     /// the editor restores the default byte-window editing surface.
     func installPrimaryContentView(_ contentView: NSView) {
         guard installedPrimaryContentView !== contentView else { return }
         (installedPrimaryContentView as? MarkdownPreviewView)?.deactivate()
         (installedPrimaryContentView as? CSVTableView)?.deactivate()
+        (installedPrimaryContentView as? ParquetTableView)?.deactivate()
         primaryContentHost.subviews.forEach { $0.removeFromSuperview() }
         contentView.translatesAutoresizingMaskIntoConstraints = false
         primaryContentHost.addSubview(contentView)
@@ -1524,6 +2028,12 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             contentView.bottomAnchor.constraint(equalTo: primaryContentHost.bottomAnchor)
         ])
     }
+
+#if LIGHTXT_RUNTIME_QA
+    var qaIsPrettifyPreviewActive: Bool { isPrettifyPreviewActive }
+    var qaPrettifyPreviewText: String { prettifiedViewportView.qaText }
+    var qaPrettifyPreviewStatus: String { prettifiedViewportView.qaStatus }
+#endif
 
     func restoreEditorAsPrimaryContent() {
         guard editorView.superview !== primaryContentHost else { return }
@@ -1557,7 +2067,8 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         switch menuItem.action {
         case #selector(undoDocumentEdit(_:)): session.canUndo
         case #selector(redoDocumentEdit(_:)): session.canRedo
-        case #selector(findNext(_:)), #selector(findPrevious(_:)): !session.searchQuery.isEmpty
+        case #selector(findNext(_:)), #selector(findPrevious(_:)):
+            !session.isReadOnly && !session.searchQuery.isEmpty
         case #selector(toggleStructure(_:)): canToggleStructure
         default: true
         }
@@ -1567,8 +2078,17 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         _ mode: DocumentPresentationMode,
         notifyIntegration: Bool
     ) {
+        if isPrettifyPreviewActive, mode != .edit {
+            endPrettifyPreview(focusEditor: false)
+        }
+        if session.isReadOnly, mode == .edit {
+            header.presentationMode = .view
+            NSSound.beep()
+            return
+        }
         guard mode != presentationMode else {
             header.presentationMode = mode
+            refreshChrome()
             if notifyIntegration { presentationModeDidChange?(mode) }
             return
         }
@@ -1581,9 +2101,19 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         }
 
         let previousMode = presentationMode
+        searchPreviewGeneration &+= 1
+        searchPreviewCancellation?.cancel()
+        searchPreviewCancellation = nil
+        structureSearchResultsByRange.removeAll(keepingCapacity: true)
+        focusedStructureSearchRange = nil
         if mode == .view { editModeStructureWasVisible = structureIsVisible }
         presentationMode = mode
         header.presentationMode = mode
+        findBar.presentation = mode == .view ? .findOnly : .findAndReplace
+        if !findBar.isHidden {
+            findHeightConstraint.constant = findBar.preferredHeight
+        }
+        if mode != .view { viewSearchOriginRange = nil }
 
         switch mode {
         case .edit:
@@ -1642,6 +2172,13 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
                 setStructureVisible(false)
                 statusBar.showFileBackedView(totalByteCount: session.byteCount)
                 view.window?.makeFirstResponder(csvTableView)
+            } else if session.syntaxFileType == .parquet {
+                prepareParquetTable()
+                primaryContentHost.isHidden = false
+                structureSidebar.presentation = .sidebar
+                setStructureVisible(false)
+                statusBar.showFileBackedView(totalByteCount: session.byteCount)
+                parquetTableView.focusTable()
             } else {
                 restoreEditorAsPrimaryContent()
                 primaryContentHost.isHidden = false
@@ -1650,6 +2187,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
                 statusBar.showFileBackedView(totalByteCount: session.byteCount)
             }
         }
+        refreshChrome()
         if notifyIntegration { presentationModeDidChange?(mode) }
     }
 
@@ -1674,6 +2212,15 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         } else {
             csvTableView.reloadDocument()
         }
+    }
+
+    private func prepareParquetTable() {
+        installPrimaryContentView(parquetTableView)
+        guard let url = document?.fileURL else {
+            statusBar.setState("Parquet View needs a file on disk.", busy: false, isError: true)
+            return
+        }
+        parquetTableView.load(url: url)
     }
 
     private func showStructureFullWorkspace() {

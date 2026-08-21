@@ -1,5 +1,6 @@
 import AppKit
 
+#if !LIGHTXT_STANDALONE_PARQUET_QA
 /// A virtual NSTableView backed directly by a sparse CSV byte index. AppKit
 /// creates views only for visible rows; the index stores a hard-capped set of
 /// offsets, and individual cells commit exact byte-range piece-table edits.
@@ -2953,8 +2954,9 @@ private final class CSVEditableTextField: NSTextField {
     var originalValue = ""
     var originalFieldCount = 0
 }
+#endif
 
-private struct CSVFilterDraft: Equatable {
+struct CSVFilterDraft: Equatable {
     enum Predicate: Int, CaseIterable {
         case contains
         case equals
@@ -3034,7 +3036,7 @@ private struct CSVFilterDraft: Equatable {
 }
 
 @MainActor
-private final class CSVFilterPopoverViewController: NSViewController,
+final class CSVFilterPopoverViewController: NSViewController,
     NSSearchFieldDelegate,
     NSTableViewDataSource,
     NSTableViewDelegate
@@ -3043,6 +3045,7 @@ private final class CSVFilterPopoverViewController: NSViewController,
     var onClear: (() -> Void)?
 
     private let columnTitle: String
+    private let valueDisplayProvider: (String) -> String
     private var committedFilter: CSVFilterDraft
     private let valueField = NSSearchField()
     private let valuesStatus = NSTextField(labelWithString: "Loading values…")
@@ -3052,8 +3055,13 @@ private final class CSVFilterPopoverViewController: NSViewController,
     private var allUniqueValues: [String] = []
     private var visibleUniqueValues: [String] = []
 
-    init(columnTitle: String, filter: CSVFilterDraft?) {
+    init(
+        columnTitle: String,
+        filter: CSVFilterDraft?,
+        valueDisplayProvider: @escaping (String) -> String = { $0 }
+    ) {
         self.columnTitle = columnTitle
+        self.valueDisplayProvider = valueDisplayProvider
         self.committedFilter = filter ?? CSVFilterDraft(
             predicate: .contains,
             value: "",
@@ -3208,11 +3216,12 @@ private final class CSVFilterPopoverViewController: NSViewController,
         button.target = self
         button.action = #selector(toggleValue(_:))
         button.tag = row
-        button.title = value.isEmpty ? "(Empty)" : value
-        button.toolTip = value
+        let displayedValue = valueDisplayProvider(value)
+        button.title = displayedValue.isEmpty ? "(Empty)" : displayedValue
+        button.toolTip = displayedValue
         button.state = committedFilter.selectedValues.contains(value) ? .on : .off
         button.lineBreakMode = .byTruncatingMiddle
-        button.setAccessibilityLabel(value.isEmpty ? "Empty value" : value)
+        button.setAccessibilityLabel(displayedValue.isEmpty ? "Empty value" : displayedValue)
         return button
     }
 
@@ -3318,7 +3327,7 @@ private final class CSVUniqueValuesProgressRelay: @unchecked Sendable {
     }
 }
 
-private struct CSVColumnSummaryPresentation {
+struct CSVColumnSummaryPresentation {
     struct FrequentValue {
         let value: String
         let count: Int64
@@ -3338,7 +3347,7 @@ private struct CSVColumnSummaryPresentation {
 }
 
 @MainActor
-private final class CSVColumnSummaryPopoverViewController: NSViewController {
+final class CSVColumnSummaryPopoverViewController: NSViewController {
     private let columnTitle: String
     private let content = NSStackView()
     private let progress = NSProgressIndicator()
@@ -3500,7 +3509,7 @@ private final class CSVColumnSummaryPopoverViewController: NSViewController {
 /// foreground after a window changes appearance. Drawing only the title here
 /// preserves AppKit's native header surface while guaranteeing readable text
 /// in both appearances.
-private final class LighTxtCSVHeaderCell: NSTableHeaderCell {
+final class LighTxtCSVHeaderCell: NSTableHeaderCell {
     var isFiltered = false
     var showsFilterControls = true
     var filterText = ""
@@ -3795,7 +3804,7 @@ private final class LighTxtCSVContainsButton: NSButton {
 /// vibrancy can suppress custom header titles almost completely. A non-vibrant
 /// header keeps native resizing/dragging while drawing predictable contrast.
 @MainActor
-private final class LighTxtCSVHeaderView: NSTableHeaderView, NSSearchFieldDelegate {
+final class LighTxtCSVHeaderView: NSTableHeaderView, NSSearchFieldDelegate {
     static let preferredHeight: CGFloat = 54
 
     var menuProvider: ((Int) -> NSMenu?)?
@@ -4218,7 +4227,7 @@ private final class LighTxtCSVHeaderView: NSTableHeaderView, NSSearchFieldDelega
 }
 
 @MainActor
-private final class LighTxtCSVTableView: NSTableView {
+final class LighTxtCSVTableView: NSTableView {
     var bodyMenuProvider: ((Int, Int) -> NSMenu?)?
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -4230,7 +4239,7 @@ private final class LighTxtCSVTableView: NSTableView {
 }
 
 @MainActor
-private final class CSVFilterChipView: NSView {
+final class CSVFilterChipView: NSView {
     var onOpen: (() -> Void)?
     var onClear: (() -> Void)?
     let sourceColumn: Int

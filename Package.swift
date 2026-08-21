@@ -35,6 +35,7 @@ let package = Package(
                 "Core/README.md",
                 "Documents",
                 "Info.plist",
+                "DuckDB-LICENSE.txt",
                 "LighTxt.entitlements",
                 "LighTxt-Bridging-Header.h",
                 "Sparkle-LICENSE.txt",

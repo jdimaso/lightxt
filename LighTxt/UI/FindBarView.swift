@@ -1,5 +1,10 @@
 import AppKit
 
+enum FindBarPresentation {
+    case findOnly
+    case findAndReplace
+}
+
 @MainActor
 protocol FindBarViewDelegate: AnyObject {
     func findBar(
@@ -20,12 +25,29 @@ protocol FindBarViewDelegate: AnyObject {
 final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldDelegate {
     weak var findDelegate: FindBarViewDelegate?
 
+    var presentation: FindBarPresentation = .findAndReplace {
+        didSet {
+            guard oldValue != presentation else { return }
+            applyPresentation()
+        }
+    }
+
     let searchField = NSSearchField()
     private let replaceField = NSTextField()
     private let regexButton = NSButton(checkboxWithTitle: "Regex", target: nil, action: nil)
     private let caseButton = NSButton(checkboxWithTitle: "Match case", target: nil, action: nil)
     private let wholeWordButton = NSButton(checkboxWithTitle: "Whole word", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "Search this document")
+    private let findLabel = NSTextField(labelWithString: "Find")
+    private let replaceLabel = NSTextField(labelWithString: "Replace")
+    private let previousButton = NSButton()
+    private let nextButton = NSButton()
+    private let findAllButton = NSButton()
+    private let replaceButton = NSButton()
+    private let replaceAllButton = NSButton()
+    private let closeButton = NSButton()
+    private let firstRow = NSStackView()
+    private let secondRow = NSStackView()
     private var pendingChange: DispatchWorkItem?
     private var statusIsError = false
 
@@ -70,6 +92,7 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
     var usesRegularExpression: Bool { regexButton.state == .on }
     var isCaseSensitive: Bool { caseButton.state == .on }
     var matchesWholeWords: Bool { wholeWordButton.state == .on }
+    var preferredHeight: CGFloat { presentation == .findOnly ? 56 : 104 }
 
     func focus(selectAll: Bool = false) {
         window?.makeFirstResponder(searchField)
@@ -154,40 +177,42 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
         statusLabel.alignment = .right
         statusLabel.setAccessibilityLabel("Find status")
 
-        let previous = actionButton(
+        configureActionButton(
+            previousButton,
             title: "Previous",
             symbolName: "chevron.up",
             action: #selector(previousMatch(_:))
         )
-        previous.toolTip = "Find previous (⇧⌘G)"
-        let next = actionButton(
+        previousButton.toolTip = "Find previous (⇧⌘G)"
+        configureActionButton(
+            nextButton,
             title: "Next",
             symbolName: "chevron.down",
             action: #selector(nextMatch(_:))
         )
-        next.toolTip = "Find next (⌘G)"
-        let all = actionButton(title: "Find All", action: #selector(findAll(_:)))
-        all.toolTip = "List all matches in the results pane"
-        let replace = actionButton(title: "Replace", action: #selector(replaceCurrent(_:)))
-        replace.toolTip = "Replace the selected match"
-        let replaceAll = actionButton(title: "Replace All", action: #selector(replaceAll(_:)))
-        replaceAll.toolTip = "Replace every match as one undoable edit"
-        let close = actionButton(title: "", symbolName: "xmark", action: #selector(close(_:)))
-        close.toolTip = "Close find and replace"
-        close.setAccessibilityLabel("Close find and replace")
+        nextButton.toolTip = "Find next (⌘G)"
+        configureActionButton(findAllButton, title: "Find All", action: #selector(findAll(_:)))
+        findAllButton.toolTip = "List all matches in the results pane"
+        configureActionButton(replaceButton, title: "Replace", action: #selector(replaceCurrent(_:)))
+        replaceButton.toolTip = "Replace the selected match"
+        configureActionButton(replaceAllButton, title: "Replace All", action: #selector(replaceAll(_:)))
+        replaceAllButton.toolTip = "Replace every match as one undoable edit"
+        configureActionButton(closeButton, title: "", symbolName: "xmark", action: #selector(close(_:)))
+        closeButton.toolTip = "Close find and replace"
+        closeButton.setAccessibilityLabel("Close find and replace")
 
-        let findLabel = fieldLabel("Find")
-        let replaceLabel = fieldLabel("Replace")
+        configureFieldLabel(findLabel)
+        configureFieldLabel(replaceLabel)
 
-        let firstRow = NSStackView(views: [
+        [
             findLabel,
             searchField,
             caseButton,
             wholeWordButton,
             regexButton,
             statusLabel,
-            close,
-        ])
+            closeButton,
+        ].forEach { firstRow.addArrangedSubview($0) }
         firstRow.orientation = .horizontal
         firstRow.alignment = .centerY
         firstRow.spacing = 8
@@ -198,16 +223,16 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
         let replacementSpacer = NSView()
         replacementSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         replacementSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let secondRow = NSStackView(views: [
+        [
             replaceLabel,
             replaceField,
             replacementSpacer,
-            previous,
-            next,
-            all,
-            replace,
-            replaceAll,
-        ])
+            previousButton,
+            nextButton,
+            findAllButton,
+            replaceButton,
+            replaceAllButton,
+        ].forEach { secondRow.addArrangedSubview($0) }
         secondRow.orientation = .horizontal
         secondRow.alignment = .centerY
         secondRow.spacing = 8
@@ -246,29 +271,31 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
             caseButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 30),
             wholeWordButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 30),
             regexButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 30),
-            close.widthAnchor.constraint(greaterThanOrEqualToConstant: 30),
-            close.heightAnchor.constraint(greaterThanOrEqualToConstant: 30),
+            closeButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 30),
+            closeButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 30),
             preferredStatusWidth,
         ])
 
         searchField.nextKeyView = replaceField
         replaceField.nextKeyView = searchField
+        applyPresentation()
     }
 
-    private func fieldLabel(_ title: String) -> NSTextField {
-        let label = NSTextField(labelWithString: title)
+    private func configureFieldLabel(_ label: NSTextField) {
         label.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         label.textColor = LighTxtTheme.primaryText
         label.alignment = .right
-        return label
     }
 
-    private func actionButton(
+    private func configureActionButton(
+        _ button: NSButton,
         title: String,
         symbolName: String? = nil,
         action: Selector
-    ) -> NSButton {
-        let button = NSButton(title: title, target: self, action: action)
+    ) {
+        button.title = title
+        button.target = self
+        button.action = action
         button.bezelStyle = .rounded
         button.controlSize = .regular
         button.font = NSFont.systemFont(ofSize: 12, weight: .medium)
@@ -279,7 +306,61 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
         }
         button.setContentHuggingPriority(.required, for: .horizontal)
         button.heightAnchor.constraint(greaterThanOrEqualToConstant: 30).isActive = true
-        return button
+    }
+
+    private func applyPresentation() {
+        guard !firstRow.arrangedSubviews.isEmpty else { return }
+        let findOnly = presentation == .findOnly
+        if findOnly {
+            previousButton.title = ""
+            previousButton.imagePosition = .imageOnly
+            previousButton.setAccessibilityLabel("Previous match")
+            nextButton.title = ""
+            nextButton.imagePosition = .imageOnly
+            nextButton.setAccessibilityLabel("Next match")
+            findAllButton.title = "All"
+            findAllButton.setAccessibilityLabel("Find all")
+            [previousButton, nextButton, findAllButton].forEach { button in
+                if secondRow.arrangedSubviews.contains(button) {
+                    secondRow.removeArrangedSubview(button)
+                    button.removeFromSuperview()
+                }
+                if !firstRow.arrangedSubviews.contains(button) {
+                    firstRow.insertArrangedSubview(
+                        button,
+                        at: max(0, firstRow.arrangedSubviews.count - 1)
+                    )
+                }
+            }
+        } else {
+            previousButton.title = "Previous"
+            previousButton.imagePosition = .imageLeading
+            previousButton.setAccessibilityLabel("Previous match")
+            nextButton.title = "Next"
+            nextButton.imagePosition = .imageLeading
+            nextButton.setAccessibilityLabel("Next match")
+            findAllButton.title = "Find All"
+            findAllButton.setAccessibilityLabel("Find all")
+            [previousButton, nextButton, findAllButton].forEach { button in
+                if firstRow.arrangedSubviews.contains(button) {
+                    firstRow.removeArrangedSubview(button)
+                    button.removeFromSuperview()
+                }
+                if !secondRow.arrangedSubviews.contains(button) {
+                    let insertionIndex = max(0, secondRow.arrangedSubviews.count - 2)
+                    secondRow.insertArrangedSubview(button, at: insertionIndex)
+                }
+            }
+        }
+        secondRow.isHidden = findOnly
+        replaceField.isEnabled = !findOnly
+        replaceButton.isEnabled = !findOnly
+        replaceAllButton.isEnabled = !findOnly
+        searchField.nextKeyView = findOnly ? searchField : replaceField
+        closeButton.toolTip = findOnly ? "Close find" : "Close find and replace"
+        closeButton.setAccessibilityLabel(findOnly ? "Close find" : "Close find and replace")
+        setAccessibilityLabel(findOnly ? "Find" : "Find and replace")
+        needsLayout = true
     }
 
     private func applyResolvedAppearance() {
@@ -348,4 +429,36 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
     @objc private func close(_ sender: Any?) {
         findDelegate?.findBarDidRequestClose(self)
     }
+
+#if LIGHTXT_STANDALONE_STRUCTURE_QA
+    var qaSecondRowIsHidden: Bool { secondRow.isHidden }
+    var qaReplaceControlsAreEnabled: Bool {
+        replaceField.isEnabled && replaceButton.isEnabled && replaceAllButton.isEnabled
+    }
+    var qaSearchFieldFrame: NSRect { searchField.convert(searchField.bounds, to: self) }
+    var qaFirstRowControlFrames: [NSRect] {
+        firstRow.arrangedSubviews
+            .filter { !$0.isHidden }
+            .map { $0.convert($0.bounds, to: self) }
+    }
+    var qaVisibleActionLabels: [String] {
+        [previousButton, nextButton, findAllButton, replaceButton, replaceAllButton]
+            .filter { !$0.isHidden && !$0.ancestors.contains(where: \.isHidden) }
+            .compactMap { $0.accessibilityLabel() }
+    }
+#endif
 }
+
+#if LIGHTXT_STANDALONE_STRUCTURE_QA
+private extension NSView {
+    var ancestors: [NSView] {
+        var result: [NSView] = []
+        var current = superview
+        while let view = current {
+            result.append(view)
+            current = view.superview
+        }
+        return result
+    }
+}
+#endif

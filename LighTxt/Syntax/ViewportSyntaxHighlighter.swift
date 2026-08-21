@@ -39,7 +39,7 @@ public enum ViewportSyntaxHighlighter {
         )
         let endMode: SyntaxLexicalState.Mode
         switch fileType {
-        case .plainText:
+        case .plainText, .parquet:
             endMode = .normal
         case .json:
             endMode = highlightJSON(bytes, initialMode: initialState.mode, collector: &collector)

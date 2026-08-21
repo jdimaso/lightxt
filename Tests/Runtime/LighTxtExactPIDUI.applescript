@@ -82,6 +82,9 @@ on run argv
             set characterDelay to 0.3
             if (count of argv) > 3 then set characterDelay to (item 4 of argv) as real
             return my assertJSONViewSearch(targetPID, queryText, characterDelay)
+        else if commandName is "assert-json-view-find-navigation" then
+            if (count of argv) < 3 then error "assert-json-view-find-navigation requires a query"
+            return my assertJSONViewFindNavigation(targetPID, item 3 of argv)
         else if commandName is "menu" then
             if (count of argv) < 4 then error "menu requires top-level and item title"
             set targetProcess to first application process whose unix id is targetPID
@@ -156,6 +159,57 @@ on assertJSONViewSearch(targetPID, queryText, characterDelay)
     end tell
 end assertJSONViewSearch
 
+on assertJSONViewFindNavigation(targetPID, queryText)
+    tell application "System Events"
+        set targetProcess to first application process whose unix id is targetPID
+        my assertJSONViewSearch(targetPID, queryText, 0.08)
+
+        set findAllButton to my findElement(targetPID, "Find all")
+        if findAllButton is missing value then error "View Find did not expose Find All"
+        my activateElement(findAllButton, false, false)
+        my waitForText(targetPID, "Find Results", 10, false)
+        if my selectedElementContaining(targetPID, "Search match") is not missing value then
+            error "Find All activated a result before the user selected one"
+        end if
+
+        set firstResult to my findElement(targetPID, "Search match")
+        if firstResult is missing value then error "Find All exposed no source-faithful result row"
+        my activateElement(firstResult, true, false)
+        my waitForText(targetPID, "Exact source match", 10, false)
+        if my findElement(targetPID, "JSON Explorer") is missing value then
+            error "Selecting a Find All row did not reveal a focused JSON Explorer path"
+        end if
+        if my findElement(targetPID, "FILE-BACKED VIEW") is missing value then
+            error "Selecting a Find All row switched into Edit"
+        end if
+
+        set frontmost of targetProcess to true
+        keystroke "g" using command down
+        delay 0.4
+        if my findElement(targetPID, "FILE-BACKED VIEW") is missing value then
+            error "Find Next switched the document out of View"
+        end if
+        if my findElement(targetPID, "Exact source match") is missing value then
+            error "Find Next did not reveal an exact structured match"
+        end if
+        keystroke "g" using {command down, shift down}
+        delay 0.4
+        if my findElement(targetPID, "FILE-BACKED VIEW") is missing value then
+            error "Find Previous switched the document out of View"
+        end if
+
+        set closeFind to my findElement(targetPID, "Close find")
+        if closeFind is missing value then error "View Find has no Close find control"
+        my activateElement(closeFind, false, false)
+        my waitForText(targetPID, "JSON Explorer", 10, false)
+        my waitForText(targetPID, "Exact source match", 10, true)
+        if my findElement(targetPID, "FILE-BACKED VIEW") is missing value then
+            error "Closing Find switched the document out of View"
+        end if
+        return "JSON View Find navigation QA passed: Find All stayed unselected, one result click revealed the exact focused path, Next/Previous retained View, and Close restored Explorer"
+    end tell
+end assertJSONViewFindNavigation
+
 on dumpWindow(targetPID, maximumElements)
     tell application "System Events"
         set targetProcess to first application process whose unix id is targetPID
@@ -195,6 +249,25 @@ on findElement(targetPID, queryText)
     end tell
     return missing value
 end findElement
+
+on selectedElementContaining(targetPID, queryText)
+    tell application "System Events"
+        set targetProcess to first application process whose unix id is targetPID
+        set allElements to entire contents of window 1 of targetProcess
+        repeat with wrappedElement in allElements
+            set elementObject to contents of wrappedElement
+            if my elementContains(elementObject, queryText) then
+                try
+                    if selected of elementObject is true then return elementObject
+                end try
+                try
+                    if value of attribute "AXSelected" of elementObject is true then return elementObject
+                end try
+            end if
+        end repeat
+    end tell
+    return missing value
+end selectedElementContaining
 
 on elementContains(elementObject, queryText)
     tell application "System Events"

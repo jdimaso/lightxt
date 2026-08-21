@@ -68,6 +68,84 @@ final class StreamingJSONStructureIndexTests: XCTestCase {
         XCTAssertNil(arrayPage2.nextCursor)
     }
 
+    func testBoundedContainerAncestryFindsExactNestedPath() throws {
+        let source = #"{"outer":[{"inner":{"needle":"🚀"}}]}"#
+        let index = try makeIndex(source)
+        let bytes = Data(source.utf8)
+        let needle = try XCTUnwrap(bytes.range(of: Data("🚀".utf8)))
+        let ancestry = try index.containerAncestry(
+            containing: Int64(needle.lowerBound)..<Int64(needle.upperBound),
+            maximumRecordReads: 64
+        )
+
+        XCTAssertTrue(ancestry.isComplete)
+        XCTAssertLessThanOrEqual(ancestry.recordReadCount, 64)
+        XCTAssertEqual(
+            ancestry.nodes.map(\.kind),
+            [.document, .object, .array, .object, .object]
+        )
+        for node in ancestry.nodes {
+            XCTAssertLessThanOrEqual(node.byteRange.lowerBound, Int64(needle.lowerBound))
+            XCTAssertGreaterThanOrEqual(node.byteRange.upperBound, Int64(needle.upperBound))
+        }
+    }
+
+    func testBoundedContainerAncestryFallsBackWithoutFalseWideSiblingPath() throws {
+        let siblingCount = 500
+        let source = "[" + Array(repeating: "[]", count: siblingCount).joined(separator: ",") + ",7]"
+        let index = try makeIndex(source)
+        let matchStart = Int64(source.utf8.count - 2)
+        let ancestry = try index.containerAncestry(
+            containing: matchStart..<(matchStart + 1),
+            maximumRecordReads: 16
+        )
+
+        XCTAssertFalse(ancestry.isComplete)
+        XCTAssertEqual(ancestry.recordReadCount, 16)
+        XCTAssertEqual(ancestry.nodes.map(\.kind), [.document])
+        XCTAssertTrue(ancestry.nodes.allSatisfy {
+            $0.byteRange.lowerBound <= matchStart && $0.byteRange.upperBound >= matchStart + 1
+        })
+
+        let cancellation = CancellationToken()
+        cancellation.cancel()
+        XCTAssertThrowsError(
+            try index.containerAncestry(
+                containing: matchStart..<(matchStart + 1),
+                maximumRecordReads: 16,
+                cancellation: cancellation
+            )
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+
+    func testBoundedContainerAncestryMarksKnownDeepSuffixIncomplete() throws {
+        let widePrefix = Array(repeating: "[]", count: 128).joined(separator: ",")
+        let nested = #"[[[{"needle":"target"}]]]"#
+        let source = "[" + widePrefix + "," + nested + "]"
+        let bytes = Data(source.utf8)
+        let match = try XCTUnwrap(bytes.range(of: Data("target".utf8)))
+        let index = try makeIndex(source)
+        let ancestry = try index.containerAncestry(
+            containing: Int64(match.lowerBound)..<Int64(match.upperBound),
+            maximumRecordReads: 11
+        )
+
+        XCTAssertFalse(ancestry.isComplete)
+        XCTAssertEqual(ancestry.recordReadCount, 11)
+        XCTAssertGreaterThan(ancestry.nodes.count, 1)
+        let knownDepths = ancestry.nodes.dropFirst().map(\.depth)
+        XCTAssertGreaterThan(knownDepths.first ?? 0, 0)
+        XCTAssertTrue(zip(knownDepths, knownDepths.dropFirst()).allSatisfy {
+            $1 == $0 + 1
+        })
+        for node in ancestry.nodes {
+            XCTAssertLessThanOrEqual(node.byteRange.lowerBound, Int64(match.lowerBound))
+            XCTAssertGreaterThanOrEqual(node.byteRange.upperBound, Int64(match.upperBound))
+        }
+    }
+
     func testAcceleratedMultiKeyObjectPreservesFirstChildAndMonotonicProgress() throws {
         let source = #"{"first":1,"second":{"name":"two"},"third":[true,false]}"#
         var processed: [Int64] = []

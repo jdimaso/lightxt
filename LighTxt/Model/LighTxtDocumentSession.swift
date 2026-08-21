@@ -58,7 +58,9 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
             sourceRevision: snapshot.revision,
             reader: { range in try snapshot.data(in: range) }
         )
-        startBackgroundLineScan(maximumWarmupChunks: 8)
+        if syntaxFileType != .parquet {
+            startBackgroundLineScan(maximumWarmupChunks: 8)
+        }
     }
 
     /// Untitled session that requires no scratch inode. It remains fully
@@ -89,6 +91,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     var canUndo: Bool { !isMutationSuspended && !isBulkEditing && engine.canUndo }
     var canRedo: Bool { !isMutationSuspended && !isBulkEditing && engine.canRedo }
     var totalLineCount: Int64? { lineIndex.totalLineCount }
+    var isReadOnly: Bool { syntaxFileType == .parquet }
 
     func editorSnapshot() throws -> DocumentSnapshot {
         try engine.snapshot()
@@ -99,6 +102,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     }
 
     func editorReplaceBytes(in range: Range<Int64>, with bytes: Data) throws {
+        guard !isReadOnly else { throw LighTxtSessionError.readOnlyDocument }
         guard !isMutationSuspended else {
             throw LighTxtSessionError.documentNavigationInProgress
         }
@@ -432,6 +436,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     }
 
     func replaceCurrent(with template: String) throws -> SearchMatch? {
+        guard !isReadOnly else { throw LighTxtSessionError.readOnlyDocument }
         guard !isMutationSuspended else {
             throw LighTxtSessionError.documentNavigationInProgress
         }
@@ -461,6 +466,10 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         with replacement: String,
         completion: @escaping (Result<Int, Error>) -> Void
     ) {
+        guard !isReadOnly else {
+            completion(.failure(LighTxtSessionError.readOnlyDocument))
+            return
+        }
         guard !isMutationSuspended else {
             completion(.failure(LighTxtSessionError.documentNavigationInProgress))
             return
@@ -629,7 +638,13 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         sourceURL = url
         isScratchDocument = false
         requiresDestinationSave = false
-        syntaxFileType = SyntaxFileTypeDetector.detect(url: url)
+        let detectedType = SyntaxFileTypeDetector.detect(url: url)
+        // Save As writes the current byte stream; it never encodes a Parquet
+        // container. A text document named with a .parquet suffix must not
+        // become a binary, read-only table after the save completes.
+        if detectedType != .parquet {
+            syntaxFileType = detectedType
+        }
         callbacks.documentChanged?(engine.byteCount, isEdited)
     }
 
@@ -786,6 +801,8 @@ enum LighTxtSessionError: Error, LocalizedError {
     case saveInProgress
     case documentNavigationInProgress
     case csvMutationUnavailable
+    case readOnlyDocument
+    case parquetExportUnsupported
 
     var errorDescription: String? {
         switch self {
@@ -797,6 +814,10 @@ enum LighTxtSessionError: Error, LocalizedError {
             "Finish switching documents before editing."
         case .csvMutationUnavailable:
             "CSV row and column operations are available only for CSV documents."
+        case .readOnlyDocument:
+            "Parquet documents are read-only."
+        case .parquetExportUnsupported:
+            "LighTxt can view Parquet files, but it does not export text as Parquet."
         }
     }
 }
@@ -811,6 +832,7 @@ extension SyntaxFileType {
         case .xml: "XML"
         case .csv: "CSV"
         case .yaml: "YAML"
+        case .parquet: "Parquet"
         }
     }
 
@@ -818,6 +840,7 @@ extension SyntaxFileType {
         switch self {
         case .plainText: "TXT"
         case .markdown: "MD"
+        case .parquet: "PARQUET"
         default: rawValue.uppercased()
         }
     }

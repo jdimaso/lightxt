@@ -49,19 +49,28 @@ change that choice in Sparkle's update UI.
    the release notes, signs the feed, verifies the feed, and prints a SHA-256.
    The signing tools read the private key directly from Keychain.
 
-4. Inspect the ZIP and signed appcast. Publish the ZIP first so the feed can
-   never point at a missing download:
+4. Inspect the ZIP and signed appcast. Create the GitHub Release as a draft and
+   upload the immutable ZIP (and optional DMG), but do not publish it or change
+   the production feed yet:
 
    ```sh
    gh release create "vVERSION" \
      "SparkleUpdates/vVERSION/LighTxt-VERSION-macOS-universal.zip" \
      --repo jdimaso/lightxt \
      --title "LighTxt VERSION" \
-     --notes-file /path/to/release-notes.md
+     --notes-file /path/to/release-notes.md \
+     --draft
    ```
 
-5. Only after the GitHub Release asset is publicly downloadable, promote the
-   generated feed and review the exact diff:
+5. Before publishing the release or changing the production feed, expose a
+   separately signed QA feed and archive at a temporary QA-only URL. Launch a
+   fresh copy of the previous public version with that process-only feed
+   override and complete one end-to-end install and relaunch. Verify that only
+   the disposable copy changed.
+6. Publish the GitHub Release as Latest. Verify that both public assets are
+   downloadable and exactly match the signed/notarized local artifacts.
+7. Only after the release assets are public and verified, promote the generated
+   production feed and review the exact diff:
 
    ```sh
    cp "SparkleUpdates/vVERSION/appcast.xml" appcast.xml
@@ -71,11 +80,7 @@ change that choice in Sparkle's update UI.
    git push
    ```
 
-6. Before changing the production feed, expose the generated feed at a temporary
-   QA-only URL and launch a fresh copy of the previous public version with that
-   feed override. Complete one end-to-end install and relaunch, verifying that
-   only the disposable copy changed.
-7. After promoting the signed feed, repeat the update from another fresh copy of
+8. After promoting the signed feed, repeat the update from another fresh copy of
    the previous public version with no override. Keep every GitHub asset
    immutable after the feed is live; replacing it invalidates its EdDSA
    signature.

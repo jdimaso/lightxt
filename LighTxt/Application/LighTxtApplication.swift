@@ -307,7 +307,7 @@ final class LighTxtMenu: NSObject {
         let menu = NSMenu(title: "View")
         root.submenu = menu
         let showFind = item(
-            "Show Find & Replace",
+            "Show Find",
             action: #selector(LighTxtDocumentController.showFindForCurrentLighTxtDocument(_:)),
             key: "f"
         )

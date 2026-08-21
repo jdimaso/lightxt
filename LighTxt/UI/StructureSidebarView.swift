@@ -18,6 +18,15 @@ enum StructureSidebarNodeRole {
     case loadMore
 }
 
+/// A bounded, source-faithful search row. `highlightUTF16Range` points into
+/// `text`, allowing AppKit to emphasize the exact bytes represented by a match
+/// without guessing how a decoded JSON escape maps back to its source spelling.
+struct StructureSearchResult: Sendable, Equatable {
+    let match: SearchMatch
+    let text: String
+    let highlightUTF16Range: Range<Int>
+}
+
 /// UI-facing tree node used by both the bounded viewport discovery path and a
 /// future streaming whole-document index. Stable identifiers let the outline
 /// preserve expansion while children arrive in batches.
@@ -29,6 +38,8 @@ final class StructureSidebarNode: NSObject {
     let range: Range<Int64>
     let kind: SyntaxFoldKind?
     let role: StructureSidebarNodeRole
+    let highlightUTF16Range: Range<Int>?
+    let isSearchMatch: Bool
     var children: [StructureSidebarNode]
     var childState: StructureSidebarChildState
 
@@ -39,6 +50,8 @@ final class StructureSidebarNode: NSObject {
         range: Range<Int64>,
         kind: SyntaxFoldKind?,
         role: StructureSidebarNodeRole = .content,
+        highlightUTF16Range: Range<Int>? = nil,
+        isSearchMatch: Bool = false,
         children: [StructureSidebarNode] = [],
         childState: StructureSidebarChildState? = nil
     ) {
@@ -48,6 +61,8 @@ final class StructureSidebarNode: NSObject {
         self.range = range
         self.kind = kind
         self.role = role
+        self.highlightUTF16Range = highlightUTF16Range
+        self.isSearchMatch = isSearchMatch
         self.children = children
         self.childState = childState ?? (children.isEmpty ? .leaf : .loaded)
     }
@@ -159,6 +174,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
     private var headingTrailingConstraint: NSLayoutConstraint!
     private var roots: [StructureSidebarNode] = []
     private var currentLoadingState: StructureSidebarLoadingState?
+    private var fullWorkspaceFontSize: CGFloat = 15
     /// Authoritative size for a whole-document snapshot. Bounded viewport and
     /// search trees leave this nil so their selected offsets are never shown
     /// against a misleading partial-range denominator.
@@ -265,6 +281,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         scopeLabel.stringValue = scope
         clearLoadingState()
         outline.reloadData()
+        outline.deselectAll(nil)
         clearLocation()
         showEmptyState(title: title, detail: detail)
     }
@@ -376,24 +393,85 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         )
     }
 
-    func updateSearchResults(_ matches: [SearchMatch], total: Int, truncated: Bool) {
+    func updateSearchResults(
+        _ results: [StructureSearchResult],
+        total: Int,
+        truncated: Bool,
+        title: String = "Find Results"
+    ) {
         locationDocumentByteCount = nil
-        titleLabel.stringValue = "Find Results"
-        let retained = matches.prefix(20_000)
+        titleLabel.stringValue = title
+        let retained = results.prefix(20_000)
         roots = retained.enumerated().map { index, match in
             StructureSidebarNode(
-                title: "Match \((index + 1).formatted())",
-                subtitle: "Byte \(match.byteRange.lowerBound.formatted())  ·  \(match.byteRange.count.formatted()) bytes",
-                range: match.byteRange,
-                kind: nil
+                identifier: "search:\(match.match.byteRange.lowerBound):\(match.match.byteRange.upperBound):\(index)",
+                title: match.text,
+                subtitle: "Match \((index + 1).formatted())  ·  byte \(match.match.byteRange.lowerBound.formatted())  ·  \(match.match.byteRange.count.formatted()) bytes",
+                range: match.match.byteRange,
+                kind: nil,
+                highlightUTF16Range: match.highlightUTF16Range,
+                isSearchMatch: true
             )
         }
         let suffix = truncated ? "  ·  first \(roots.count.formatted()) shown" : ""
         scopeLabel.stringValue = "\(total.formatted()) matches\(suffix)"
         clearLoadingState()
         outline.reloadData()
+        // Find All intentionally publishes an unselected list. A subsequent
+        // user click/keyboard selection must emit one activation and resolve
+        // the focused hierarchy; a stale selection could swallow that click.
+        outline.deselectAll(nil)
         clearLocation()
         showEmptyStateIfNeeded(title: "No matches", detail: "Try a different search term or pattern.")
+    }
+
+    func selectSearchResult(matching range: Range<Int64>) {
+        guard let row = (0..<outline.numberOfRows).first(where: {
+            (outline.item(atRow: $0) as? StructureSidebarNode)?.range == range
+        }) else { return }
+        outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        outline.scrollRowToVisible(row)
+    }
+
+    /// Expands the exact in-memory ancestor chain and scrolls/selects the
+    /// requested node. Focused search trees use this after constructing a
+    /// bounded source path, so the highlighted match cannot remain hidden
+    /// below a collapsed ancestor.
+    func revealNode(withIdentifier identifier: String) {
+        guard let path = nodePath(withIdentifier: identifier, in: roots),
+              let target = path.last else { return }
+        for ancestor in path.dropLast() where ancestor.isExpandable {
+            outline.expandItem(ancestor)
+        }
+        outline.reloadData()
+        guard let row = (0..<outline.numberOfRows).first(where: {
+            (outline.item(atRow: $0) as? StructureSidebarNode) === target
+        }) else { return }
+        outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        outline.scrollRowToVisible(row)
+    }
+
+    func changeFullWorkspaceFontSize(by delta: CGFloat) {
+        setFullWorkspaceFontSize(fullWorkspaceFontSize + delta)
+    }
+
+    func resetFullWorkspaceFontSize() {
+        setFullWorkspaceFontSize(15)
+    }
+
+    private func setFullWorkspaceFontSize(_ size: CGFloat) {
+        let bounded = min(28, max(11, size))
+        guard bounded != fullWorkspaceFontSize else { return }
+        fullWorkspaceFontSize = bounded
+        if presentation == .fullWorkspace {
+            outline.rowHeight = fullWorkspaceRowHeight
+            outline.reloadData()
+        }
+    }
+
+    private var fullWorkspaceRowHeight: CGFloat {
+        let subtitleSize = max(11.5, fullWorkspaceFontSize - 2.5)
+        return max(40, ceil(fullWorkspaceFontSize + subtitleSize + 13))
     }
 
     // MARK: - NSOutlineView
@@ -419,8 +497,15 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         let identifier = NSUserInterfaceItemIdentifier("StructureCell")
         let cell = (outlineView.makeView(withIdentifier: identifier, owner: self) as? StructureRowView)
             ?? StructureRowView(identifier: identifier)
-        cell.update(node: node, presentation: presentation, appearance: effectiveAppearance)
-        cell.toolTip = "Byte \(node.range.lowerBound.formatted())"
+        cell.update(
+            node: node,
+            presentation: presentation,
+            fullWorkspaceFontSize: fullWorkspaceFontSize,
+            appearance: effectiveAppearance
+        )
+        cell.toolTip = node.isSearchMatch
+            ? "\(node.title)\n\(node.subtitle)"
+            : "Byte \(node.range.lowerBound.formatted())"
         return cell
     }
 
@@ -444,7 +529,9 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
     }
 
     func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
-        StructureSelectionRowView()
+        StructureSelectionRowView(
+            showsSearchMatch: (item as? StructureSidebarNode)?.isSearchMatch == true
+        )
     }
 
     // MARK: - View construction
@@ -519,6 +606,9 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         outline.contextMenuProvider = { [weak self] node in
             guard let self else { return nil }
             return self.delegate?.structureSidebar(self, contextMenuFor: node)
+        }
+        outline.rowGestureHandler = { [weak self] node, clickCount in
+            self?.handleRowGesture(node, clickCount: clickCount)
         }
         outline.setAccessibilityLabel("Document structure outline")
 
@@ -621,7 +711,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         let full = presentation == .fullWorkspace
         titleLabel.font = NSFont.systemFont(ofSize: full ? 18 : 15, weight: .semibold)
         scopeLabel.font = NSFont.systemFont(ofSize: full ? 12.5 : 11.5, weight: .regular)
-        outline.rowHeight = full ? 36 : 34
+        outline.rowHeight = full ? fullWorkspaceRowHeight : 34
         outline.indentationPerLevel = full ? 17 : 15
         closeButton.isHidden = full
         headingLeadingConstraint?.constant = full ? 24 : 16
@@ -702,6 +792,71 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         }
         return nil
     }
+
+    private func nodePath(
+        withIdentifier identifier: String,
+        in nodes: [StructureSidebarNode]
+    ) -> [StructureSidebarNode]? {
+        for node in nodes {
+            if node.identifier == identifier { return [node] }
+            if let descendants = nodePath(withIdentifier: identifier, in: node.children) {
+                return [node] + descendants
+            }
+        }
+        return nil
+    }
+
+    private func handleRowGesture(_ node: StructureSidebarNode, clickCount: Int) {
+        guard node.role == .content, node.isExpandable else { return }
+        if clickCount >= 2 {
+            if outline.isItemExpanded(node) {
+                outline.collapseItem(node, collapseChildren: false)
+            }
+        } else if clickCount == 1, !outline.isItemExpanded(node) {
+            outline.expandItem(node)
+        }
+    }
+
+#if LIGHTXT_STANDALONE_STRUCTURE_QA
+    var qaFullWorkspaceFontSize: CGFloat { fullWorkspaceFontSize }
+    var qaRowHeight: CGFloat { outline.rowHeight }
+    var qaTitle: String { titleLabel.stringValue }
+    var qaScope: String { scopeLabel.stringValue }
+    var qaSelectedRange: Range<Int64>? {
+        guard outline.selectedRow >= 0 else { return nil }
+        return (outline.item(atRow: outline.selectedRow) as? StructureSidebarNode)?.range
+    }
+
+    func qaPerformRowGesture(identifier: String, clickCount: Int) {
+        guard let node = node(withIdentifier: identifier, in: roots) else { return }
+        handleRowGesture(node, clickCount: clickCount)
+    }
+
+    func qaIsExpanded(identifier: String) -> Bool {
+        guard let node = node(withIdentifier: identifier, in: roots) else { return false }
+        return outline.isItemExpanded(node)
+    }
+
+    func qaAttributedTitle(identifier: String) -> NSAttributedString? {
+        guard let node = node(withIdentifier: identifier, in: roots),
+              let row = (0..<outline.numberOfRows).first(where: {
+                  (outline.item(atRow: $0) as? StructureSidebarNode) === node
+              }),
+              let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                as? StructureRowView else { return nil }
+        return cell.qaAttributedTitle
+    }
+
+    func qaToolTip(identifier: String) -> String? {
+        guard let node = node(withIdentifier: identifier, in: roots),
+              let row = (0..<outline.numberOfRows).first(where: {
+                  (outline.item(atRow: $0) as? StructureSidebarNode) === node
+              }),
+              let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                as? StructureRowView else { return nil }
+        return cell.toolTip
+    }
+#endif
 
     private func showLocation(for node: StructureSidebarNode) {
         guard node.role == .content else { return }
@@ -935,6 +1090,18 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
 @MainActor
 private final class StructureOutlineView: NSOutlineView {
     var contextMenuProvider: ((StructureSidebarNode) -> NSMenu?)?
+    var rowGestureHandler: ((StructureSidebarNode, Int) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let clickedRow = row(at: point)
+        let clickedDisclosure = clickedRow >= 0
+            && frameOfOutlineCell(atRow: clickedRow).contains(point)
+        let node = clickedRow >= 0 ? item(atRow: clickedRow) as? StructureSidebarNode : nil
+        super.mouseDown(with: event)
+        guard !clickedDisclosure, let node else { return }
+        rowGestureHandler?(node, event.clickCount)
+    }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
@@ -956,7 +1123,33 @@ private final class StructureOutlineView: NSOutlineView {
 /// selection that keeps both title and metadata readable in light and dark UI.
 @MainActor
 private final class StructureSelectionRowView: NSTableRowView {
+    private let showsSearchMatch: Bool
+
+    init(showsSearchMatch: Bool) {
+        self.showsSearchMatch = showsSearchMatch
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
     override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        super.drawBackground(in: dirtyRect)
+        guard showsSearchMatch else { return }
+        let accent = LighTxtTheme.resolved(LighTxtTheme.accent, for: effectiveAppearance)
+        accent.withAlphaComponent(
+            effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? 0.13 : 0.09
+        ).setFill()
+        NSBezierPath(
+            roundedRect: bounds.insetBy(dx: 3, dy: 1),
+            xRadius: 5,
+            yRadius: 5
+        ).fill()
+    }
 
     override func drawSelection(in dirtyRect: NSRect) {
         guard selectionHighlightStyle != .none else { return }
@@ -1009,29 +1202,56 @@ private final class StructureRowView: NSTableCellView {
     func update(
         node: StructureSidebarNode,
         presentation: StructureSidebarPresentation,
+        fullWorkspaceFontSize: CGFloat,
         appearance: NSAppearance
     ) {
-        titleLabel.stringValue = node.title
         subtitleLabel.stringValue = node.childState == .loading ? "Loading children…" : node.subtitle
-        titleLabel.font = NSFont.systemFont(
-            ofSize: presentation == .fullWorkspace ? 14 : 13,
-            weight: .medium
-        )
+        let titleFontSize = presentation == .fullWorkspace ? fullWorkspaceFontSize : 13
+        let titleFont = NSFont.systemFont(ofSize: titleFontSize, weight: .medium)
+        titleLabel.font = titleFont
         subtitleLabel.font = NSFont.systemFont(
-            ofSize: presentation == .fullWorkspace ? 11.5 : 10.5,
+            ofSize: presentation == .fullWorkspace ? max(11.5, titleFontSize - 2.5) : 10.5,
             weight: .regular
         )
         let primary = LighTxtTheme.resolved(LighTxtTheme.primaryText, for: appearance)
         let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
         let accent = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
-        titleLabel.textColor = node.role == .loadMore ? accent : primary
+        let titleColor = node.role == .loadMore ? accent : primary
+        if let highlight = node.highlightUTF16Range {
+            let attributed = NSMutableAttributedString(
+                string: node.title,
+                attributes: [.font: titleFont, .foregroundColor: titleColor]
+            )
+            let safeLower = min(max(0, highlight.lowerBound), attributed.length)
+            let safeUpper = min(max(safeLower, highlight.upperBound), attributed.length)
+            if safeUpper > safeLower {
+                attributed.addAttributes(
+                    [
+                        .backgroundColor: accent.withAlphaComponent(
+                            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? 0.46 : 0.28
+                        ),
+                        .foregroundColor: primary,
+                        .font: NSFont.systemFont(ofSize: titleFontSize, weight: .bold),
+                    ],
+                    range: NSRange(location: safeLower, length: safeUpper - safeLower)
+                )
+            }
+            titleLabel.attributedStringValue = attributed
+        } else {
+            titleLabel.stringValue = node.title
+            titleLabel.textColor = titleColor
+        }
         subtitleLabel.textColor = secondary
         kindIcon.contentTintColor = accent.withAlphaComponent(node.role == .loadMore ? 1 : 0.78)
         kindIcon.image = NSImage(
             systemSymbolName: symbolName(for: node),
             accessibilityDescription: nil
         )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12.5, weight: .regular))
-        setAccessibilityLabel("\(node.title), \(node.subtitle)")
+        setAccessibilityLabel(
+            node.isSearchMatch
+                ? "Search match, \(node.title), \(node.subtitle)"
+                : "\(node.title), \(node.subtitle)"
+        )
     }
 
     private func symbolName(for node: StructureSidebarNode) -> String {
@@ -1047,6 +1267,10 @@ private final class StructureRowView: NSTableCellView {
         case nil: return "magnifyingglass"
         }
     }
+
+#if LIGHTXT_STANDALONE_STRUCTURE_QA
+    var qaAttributedTitle: NSAttributedString { titleLabel.attributedStringValue }
+#endif
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {

@@ -95,6 +95,17 @@ public nonisolated struct JSONStructureChildrenPage: Sendable, Equatable {
     public let nextCursor: JSONStructureChildrenCursor?
 }
 
+/// A bounded, exact container path for one source match. Every returned node
+/// contains the complete requested byte range. `isComplete` is false when the
+/// predecessor scan hit its hard record-read ceiling before reaching depth 0;
+/// callers can then show an explicit ellipsis instead of implying a false
+/// direct parent relationship.
+public nonisolated struct JSONStructureAncestry: Sendable, Equatable {
+    public let nodes: [JSONStructureNode]
+    public let isComplete: Bool
+    public let recordReadCount: Int
+}
+
 public nonisolated enum JSONStructureDiagnosticKind: UInt8, Sendable, Equatable {
     case unexpectedByte = 1
     case unexpectedToken = 2
@@ -1056,6 +1067,106 @@ public nonisolated final class JSONStructureIndex: @unchecked Sendable {
             cancellation: cancellation
         )
         return try scanner.page(limit: limit)
+    }
+
+    /// Finds the deepest indexed JSON container which encloses `byteRange`,
+    /// plus as many exact ancestors as can be proven within a strict read cap.
+    /// Container starts are monotonic in the immutable store, so locating the
+    /// predecessor is logarithmic. Walking through wide preceding siblings is
+    /// deliberately capped: a Find-result click must never scan a multi-GB
+    /// temporary index on the UI's behalf.
+    public func containerAncestry(
+        containing byteRange: Range<Int64>,
+        maximumRecordReads requestedMaximumRecordReads: Int = 4_096,
+        cancellation: CancellationToken? = nil
+    ) throws -> JSONStructureAncestry {
+        let state = try capturedOpenState()
+        let maximumRecordReads = min(65_536, max(1, requestedMaximumRecordReads))
+        var recordReadCount = 0
+
+        func read(_ ordinal: Int64) throws -> JSONContainerRecord? {
+            guard recordReadCount < maximumRecordReads else { return nil }
+            if cancellation?.isCancelled == true { throw CancellationError() }
+            recordReadCount += 1
+            return try state.containers.read(at: ordinal)
+        }
+
+        let lower = min(max(0, byteRange.lowerBound), sourceByteCount)
+        let upper = min(max(lower, byteRange.upperBound), sourceByteCount)
+        if cancellation?.isCancelled == true { throw CancellationError() }
+        guard indexedContainerCount > 0 else {
+            return JSONStructureAncestry(
+                nodes: [documentRoot],
+                isComplete: true,
+                recordReadCount: 0
+            )
+        }
+
+        // Upper-bound search for the last container starting at or before the
+        // match. An exhausted cap returns the document fallback with no false
+        // ancestry claim.
+        var low: Int64 = 0
+        var high = indexedContainerCount
+        while low < high {
+            guard recordReadCount < maximumRecordReads else {
+                return JSONStructureAncestry(
+                    nodes: [documentRoot],
+                    isComplete: false,
+                    recordReadCount: recordReadCount
+                )
+            }
+            let middle = low + (high - low) / 2
+            guard let candidate = try read(middle) else { break }
+            if candidate.start <= lower { low = middle + 1 }
+            else { high = middle }
+        }
+
+        var ordinal = low - 1
+        var deepestFirst: [JSONContainerRecord] = []
+        while ordinal >= 0, recordReadCount < maximumRecordReads {
+            guard let record = try read(ordinal) else { break }
+            let containsMatch = record.start <= lower && record.end >= upper
+            if containsMatch {
+                if let child = deepestFirst.last {
+                    if record.depth == child.depth - 1,
+                       record.start <= child.start,
+                       record.end >= child.end {
+                        deepestFirst.append(record)
+                    }
+                } else {
+                    deepestFirst.append(record)
+                }
+                if record.depth == 0 { break }
+            }
+            ordinal -= 1
+        }
+        if cancellation?.isCancelled == true { throw CancellationError() }
+
+        let reachedTopContainer = deepestFirst.last?.depth == 0
+        let exhaustedRecords = ordinal < 0
+        // Exhausting the store proves "no containing container" only when we
+        // never found one. Once a deep suffix exists, completeness requires a
+        // consecutive, enclosing chain all the way to depth zero; otherwise a
+        // malformed/gapped index must remain explicitly incomplete.
+        let complete = reachedTopContainer || (deepestFirst.isEmpty && exhaustedRecords)
+        let nodes = [documentRoot] + deepestFirst.reversed().map { record in
+            JSONStructureNode(
+                id: JSONStructureNodeID(byteOffset: record.start),
+                kind: record.kind,
+                byteRange: record.start..<record.end,
+                keyByteRange: nil,
+                depth: record.depth,
+                childCount: record.childCount,
+                isComplete: record.isComplete,
+                containsErrors: record.containsErrors,
+                indexIdentifier: identifier
+            )
+        }
+        return JSONStructureAncestry(
+            nodes: nodes,
+            isComplete: complete,
+            recordReadCount: recordReadCount
+        )
     }
 
     public func preview(

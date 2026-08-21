@@ -9,18 +9,20 @@ public enum SyntaxFileType: String, CaseIterable, Sendable {
     case xml
     case csv
     case yaml
+    case parquet
 
     public var preferredPathExtension: String { rawValue }
 
     public var pathExtensions: Set<String> {
         switch self {
-        case .plainText: ["txt"]
+        case .plainText: ["txt", "text", "log", "script"]
         case .json: ["json"]
-        case .markdown: ["md"]
+        case .markdown: ["md", "markdown"]
         case .sql: ["sql"]
         case .xml: ["xml"]
         case .csv: ["csv"]
         case .yaml: ["yaml", "yml"]
+        case .parquet: ["parquet"]
         }
     }
 }

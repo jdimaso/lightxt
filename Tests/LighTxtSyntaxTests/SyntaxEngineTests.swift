@@ -5,13 +5,18 @@ import XCTest
 final class SyntaxFileTypeDetectorTests: XCTestCase {
     func testEverySupportedExtensionIsCaseInsensitive() {
         XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "notes.TXT"), .plainText)
+        XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "server.LOG"), .plainText)
+        XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "deploy.SCRIPT"), .plainText)
         XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "data.JSON"), .json)
         XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "README.md"), .markdown)
+        XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "README.MARKDOWN"), .markdown)
         XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "query.SQL"), .sql)
         XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "feed.Xml"), .xml)
         XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "rows.CSV"), .csv)
         XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "config.yml"), .yaml)
         XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "config.YAML"), .yaml)
+        XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "records.PARQUET"), .parquet)
+        XCTAssertTrue(SyntaxFileType.plainText.pathExtensions.contains("script"))
     }
 
     func testConservativeContentSniffing() {
@@ -19,6 +24,7 @@ final class SyntaxFileTypeDetectorTests: XCTestCase {
         XCTAssertEqual(SyntaxFileTypeDetector.sniff(data("<?xml version=\"1.0\"?><r/>")), .xml)
         XCTAssertEqual(SyntaxFileTypeDetector.sniff(data("SELECT * FROM values_table;")), .sql)
         XCTAssertEqual(SyntaxFileTypeDetector.sniff(data("name,age\nAda,36\nLin,29\n")), .csv)
+        XCTAssertEqual(SyntaxFileTypeDetector.sniff(Data("PAR1fixture".utf8)), .parquet)
         XCTAssertNil(SyntaxFileTypeDetector.sniff(Data([0xFF, 0xFE, 0x7B, 0x00])))
     }
 }
