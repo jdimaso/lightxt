@@ -38,7 +38,7 @@ final class MarkdownPreviewView: NSView, NSTextViewDelegate {
     private var renderGeneration: UInt64 = 0
     private var renderCancellation: CancellationToken?
     private var sourceLineStartOffsets: [Int64] = []
-    private var renderedLineUTF16Starts: [Int] = []
+    private var renderedSourceLineUTF16Starts: [Int] = []
     private var currentSourceOffset: Int64 = 0
     private var isSynchronizingTextGeometry = false
     private var lastGeometryWidth: CGFloat = 0
@@ -259,7 +259,7 @@ final class MarkdownPreviewView: NSView, NSTextViewDelegate {
               !cancellation.isCancelled,
               let delegate = editorDelegate else { return }
         let applyStarted = ContinuousClock.now
-        let rendered = MarkdownNativeRenderer.render(
+        let rendered = MarkdownNativeRenderer.renderDocument(
             payload.prepared,
             appearance: effectiveAppearance,
             startsMidDocument: payload.range.lowerBound > 0
@@ -267,8 +267,8 @@ final class MarkdownPreviewView: NSView, NSTextViewDelegate {
         viewportRange = payload.range
         sourceLineStartOffsets = payload.sourceLineStartOffsets
         isApplyingViewport = true
-        textView.textStorage?.setAttributedString(rendered)
-        renderedLineUTF16Starts = Self.lineStartUTF16Offsets(in: rendered.string)
+        textView.textStorage?.setAttributedString(rendered.attributedString)
+        renderedSourceLineUTF16Starts = rendered.sourceLineUTF16Starts
         synchronizeTextGeometry()
         restore(placement)
         isApplyingViewport = false
@@ -407,7 +407,7 @@ final class MarkdownPreviewView: NSView, NSTextViewDelegate {
 
     private var visibleSourceByteRange: Range<Int64> {
         guard !sourceLineStartOffsets.isEmpty,
-              !renderedLineUTF16Starts.isEmpty,
+              !renderedSourceLineUTF16Starts.isEmpty,
               let layoutManager = textView.layoutManager,
               let textContainer = textView.textContainer else { return viewportRange }
         let bounds = scrollView.contentView.bounds.offsetBy(
@@ -419,14 +419,14 @@ final class MarkdownPreviewView: NSView, NSTextViewDelegate {
             forGlyphRange: glyphRange,
             actualGlyphRange: nil
         )
-        let firstLine = Self.floorIndex(
+        let firstSourceLine = Self.floorIndex(
             of: characterRange.location,
-            in: renderedLineUTF16Starts
+            in: renderedSourceLineUTF16Starts
         )
         let lastCharacter = max(characterRange.location, NSMaxRange(characterRange) - 1)
-        let lastLine = Self.floorIndex(of: lastCharacter, in: renderedLineUTF16Starts)
-        let lower = sourceLineStartOffsets[min(firstLine, sourceLineStartOffsets.count - 1)]
-        let nextLine = min(lastLine + 1, sourceLineStartOffsets.count)
+        let lastSourceLine = Self.floorIndex(of: lastCharacter, in: renderedSourceLineUTF16Starts)
+        let lower = sourceLineStartOffsets[min(firstSourceLine, sourceLineStartOffsets.count - 1)]
+        let nextLine = min(lastSourceLine + 1, sourceLineStartOffsets.count)
         let upper = nextLine < sourceLineStartOffsets.count
             ? sourceLineStartOffsets[nextLine]
             : viewportRange.upperBound
@@ -454,13 +454,13 @@ final class MarkdownPreviewView: NSView, NSTextViewDelegate {
 
     private func verticalPosition(forSourceByteOffset offset: Int64) -> CGFloat {
         guard !sourceLineStartOffsets.isEmpty,
-              !renderedLineUTF16Starts.isEmpty,
+              !renderedSourceLineUTF16Starts.isEmpty,
               let layoutManager = textView.layoutManager,
               layoutManager.numberOfGlyphs > 0 else { return 0 }
         let sourceLine = Self.floorIndex(of: offset, in: sourceLineStartOffsets)
-        let renderedLine = min(sourceLine, renderedLineUTF16Starts.count - 1)
+        let renderedSourceLine = min(sourceLine, renderedSourceLineUTF16Starts.count - 1)
         let character = min(
-            renderedLineUTF16Starts[renderedLine],
+            renderedSourceLineUTF16Starts[renderedSourceLine],
             max(0, textView.string.utf16.count - 1)
         )
         let glyph = min(
@@ -469,20 +469,6 @@ final class MarkdownPreviewView: NSView, NSTextViewDelegate {
         )
         let line = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
         return line.minY + textView.textContainerOrigin.y
-    }
-
-    private static func lineStartUTF16Offsets(in string: String) -> [Int] {
-        let source = string as NSString
-        var offsets = [0]
-        var cursor = 0
-        while cursor < source.length {
-            let range = source.lineRange(for: NSRange(location: cursor, length: 0))
-            let next = NSMaxRange(range)
-            guard next > cursor, next < source.length else { break }
-            offsets.append(next)
-            cursor = next
-        }
-        return offsets
     }
 
     private static func floorIndex<T: Comparable>(of value: T, in values: [T]) -> Int {
@@ -632,6 +618,7 @@ enum MarkdownPreparedBlock: @unchecked Sendable {
     case list(prefix: String, content: AttributedString)
     case quote(AttributedString)
     case table([AttributedString])
+    case tableSeparator
     case rule
     case paragraph(content: AttributedString, isBlank: Bool)
 }
@@ -673,7 +660,7 @@ nonisolated enum MarkdownSemanticPreparer {
             } else if let quote = quoteContent(line) {
                 blocks.append(.quote(inline(quote)))
             } else if let cells = tableCells(line) {
-                blocks.append(isTableSeparator(cells) ? .hidden : .table(cells.map(inline)))
+                blocks.append(isTableSeparator(cells) ? .tableSeparator : .table(cells.map(inline)))
             } else if isHorizontalRule(trimmed) {
                 blocks.append(.rule)
             } else {
@@ -723,12 +710,81 @@ nonisolated enum MarkdownSemanticPreparer {
 
     private static func tableCells(_ line: String) -> [String]? {
         guard line.contains("|") else { return nil }
-        var cells = line.split(separator: "|", omittingEmptySubsequences: false).map {
-            String($0).trimmingCharacters(in: .whitespaces)
+        var cells: [String] = []
+        var cell = ""
+        var sawDelimiter = false
+        var activeCodeFenceLength: Int?
+        var remainingCodeFenceCounts = codeFenceCounts(in: line)
+        var index = line.startIndex
+        while index < line.endIndex {
+            let character = line[index]
+            if character == "\\" {
+                cell.append(character)
+                let next = line.index(after: index)
+                if next < line.endIndex {
+                    cell.append(line[next])
+                    index = line.index(after: next)
+                } else {
+                    index = next
+                }
+                continue
+            }
+            if character == "`" {
+                var end = index
+                var fenceLength = 0
+                while end < line.endIndex, line[end] == "`" {
+                    cell.append("`")
+                    fenceLength += 1
+                    end = line.index(after: end)
+                }
+                remainingCodeFenceCounts[fenceLength, default: 0] -= 1
+                if activeCodeFenceLength == fenceLength {
+                    activeCodeFenceLength = nil
+                } else if activeCodeFenceLength == nil,
+                          remainingCodeFenceCounts[fenceLength, default: 0] > 0 {
+                    activeCodeFenceLength = fenceLength
+                }
+                index = end
+                continue
+            }
+            if character == "|", activeCodeFenceLength == nil {
+                cells.append(cell.trimmingCharacters(in: .whitespaces))
+                cell.removeAll(keepingCapacity: true)
+                sawDelimiter = true
+            } else {
+                cell.append(character)
+            }
+            index = line.index(after: index)
         }
+        cells.append(cell.trimmingCharacters(in: .whitespaces))
         if cells.first?.isEmpty == true { cells.removeFirst() }
         if cells.last?.isEmpty == true { cells.removeLast() }
-        return cells.count >= 2 ? cells : nil
+        return sawDelimiter && cells.count >= 2 ? cells : nil
+    }
+
+    private static func codeFenceCounts(in line: String) -> [Int: Int] {
+        var counts: [Int: Int] = [:]
+        var index = line.startIndex
+        while index < line.endIndex {
+            if line[index] == "\\" {
+                let next = line.index(after: index)
+                index = next < line.endIndex ? line.index(after: next) : next
+                continue
+            }
+            guard line[index] == "`" else {
+                index = line.index(after: index)
+                continue
+            }
+            var end = index
+            var length = 0
+            while end < line.endIndex, line[end] == "`" {
+                length += 1
+                end = line.index(after: end)
+            }
+            counts[length, default: 0] += 1
+            index = end
+        }
+        return counts
     }
 
     private static func isTableSeparator(_ cells: [String]) -> Bool {
@@ -753,6 +809,11 @@ nonisolated enum MarkdownSemanticPreparer {
 
 @MainActor
 enum MarkdownNativeRenderer {
+    struct RenderedDocument {
+        let attributedString: NSAttributedString
+        let sourceLineUTF16Starts: [Int]
+    }
+
     static func render(
         _ source: String,
         appearance: NSAppearance,
@@ -768,14 +829,50 @@ enum MarkdownNativeRenderer {
         appearance: NSAppearance,
         startsMidDocument: Bool
     ) -> NSAttributedString {
+        renderDocument(
+            prepared,
+            appearance: appearance,
+            startsMidDocument: startsMidDocument
+        ).attributedString
+    }
+
+    static func renderDocument(
+        _ prepared: MarkdownPreparedDocument,
+        appearance: NSAppearance,
+        startsMidDocument: Bool
+    ) -> RenderedDocument {
         let primary = LighTxtTheme.resolved(LighTxtTheme.primaryText, for: appearance)
         let accent = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
         let soft = LighTxtTheme.resolved(LighTxtTheme.gutterBackground, for: appearance)
         let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
         let output = NSMutableAttributedString()
-        for (lineIndex, block) in prepared.blocks.enumerated() {
+        var sourceLineUTF16Starts: [Int] = []
+        sourceLineUTF16Starts.reserveCapacity(prepared.blocks.count)
+        var lineIndex = 0
+        while lineIndex < prepared.blocks.count {
+            if case .table = prepared.blocks[lineIndex] {
+                var tableEnd = lineIndex + 1
+                while tableEnd < prepared.blocks.count,
+                      isTableRunBlock(prepared.blocks[tableEnd]) {
+                    tableEnd += 1
+                }
+                appendTable(
+                    blocks: prepared.blocks[lineIndex..<tableEnd],
+                    isLastBlock: tableEnd == prepared.blocks.count,
+                    to: output,
+                    sourceLineUTF16Starts: &sourceLineUTF16Starts,
+                    primary: primary,
+                    accent: accent,
+                    soft: soft
+                )
+                lineIndex = tableEnd
+                continue
+            }
+
+            sourceLineUTF16Starts.append(output.length)
+            let block = prepared.blocks[lineIndex]
             switch block {
-            case .hidden:
+            case .hidden, .tableSeparator:
                 break
             case let .code(line):
                 let paragraph = paragraphStyle(spacingAfter: 0)
@@ -839,27 +936,8 @@ enum MarkdownNativeRenderer {
                     codeBackground: soft,
                     paragraph: paragraph
                 ))
-            case let .table(cells):
-                let paragraph = tableParagraphStyle()
-                for (cellIndex, cell) in cells.enumerated() {
-                    if cellIndex > 0 {
-                        appendPlain(
-                            "\t",
-                            to: output,
-                            font: .monospacedSystemFont(ofSize: 13, weight: .regular),
-                            color: secondary,
-                            paragraph: paragraph
-                        )
-                    }
-                    output.append(inlineFragment(
-                        cell,
-                        font: .systemFont(ofSize: 13),
-                        color: primary,
-                        accent: accent,
-                        codeBackground: soft,
-                        paragraph: paragraph
-                    ))
-                }
+            case .table:
+                break
             case .rule:
                 appendPlain(
                     "────────────────────────",
@@ -880,9 +958,96 @@ enum MarkdownNativeRenderer {
             }
 
             if lineIndex < prepared.blocks.count - 1 { output.append(NSAttributedString(string: "\n")) }
+            lineIndex += 1
         }
         _ = startsMidDocument // The viewport itself communicates position via its scroller/status.
-        return output
+        return RenderedDocument(
+            attributedString: output,
+            sourceLineUTF16Starts: sourceLineUTF16Starts
+        )
+    }
+
+    private static func isTableRunBlock(_ block: MarkdownPreparedBlock) -> Bool {
+        switch block {
+        case .table, .tableSeparator:
+            true
+        default:
+            false
+        }
+    }
+
+    private static func appendTable(
+        blocks: ArraySlice<MarkdownPreparedBlock>,
+        isLastBlock: Bool,
+        to output: NSMutableAttributedString,
+        sourceLineUTF16Starts: inout [Int],
+        primary: NSColor,
+        accent: NSColor,
+        soft: NSColor
+    ) {
+        let rows = blocks.compactMap { block -> [AttributedString]? in
+            guard case let .table(cells) = block else { return nil }
+            return cells
+        }
+        let columnCount = rows.map(\.count).max() ?? 0
+        guard columnCount > 0 else {
+            for _ in blocks { sourceLineUTF16Starts.append(output.length) }
+            return
+        }
+
+        let table = NSTextTable()
+        table.numberOfColumns = columnCount
+        table.layoutAlgorithm = .fixedLayoutAlgorithm
+        table.collapsesBorders = true
+        table.hidesEmptyCells = false
+        table.setContentWidth(100, type: .percentageValueType)
+
+        var tableRow = 0
+        var sourceBlockOffset = 0
+        let lastTableSourceOffset = blocks.indices.last { index in
+            if case .table = blocks[index] { return true }
+            return false
+        }.map { blocks.distance(from: blocks.startIndex, to: $0) } ?? 0
+
+        for block in blocks {
+            sourceLineUTF16Starts.append(output.length)
+            defer { sourceBlockOffset += 1 }
+            guard case let .table(cells) = block else { continue }
+            for column in 0..<columnCount {
+                let tableBlock = NSTextTableBlock(
+                    table: table,
+                    startingRow: tableRow,
+                    rowSpan: 1,
+                    startingColumn: column,
+                    columnSpan: 1
+                )
+                tableBlock.verticalAlignment = .topAlignment
+                tableBlock.setWidth(5, type: .absoluteValueType, for: .padding)
+                let paragraph = tableParagraphStyle(block: tableBlock)
+                let content = column < cells.count ? cells[column] : AttributedString()
+                output.append(inlineFragment(
+                    content,
+                    font: .systemFont(ofSize: 13),
+                    color: primary,
+                    accent: accent,
+                    codeBackground: soft,
+                    paragraph: paragraph
+                ))
+                let isFinalCell = isLastBlock
+                    && sourceBlockOffset == lastTableSourceOffset
+                    && column == columnCount - 1
+                if !isFinalCell {
+                    appendPlain(
+                        "\n",
+                        to: output,
+                        font: .systemFont(ofSize: 13),
+                        color: primary,
+                        paragraph: paragraph
+                    )
+                }
+            }
+            tableRow += 1
+        }
     }
 
     private static func inlineFragment(
@@ -964,12 +1129,10 @@ enum MarkdownNativeRenderer {
         return paragraph
     }
 
-    private static func tableParagraphStyle() -> NSParagraphStyle {
-        let paragraph = paragraphStyle(spacingAfter: 3) as! NSMutableParagraphStyle
-        paragraph.tabStops = stride(from: CGFloat(180), through: 1_080, by: 180).map {
-            NSTextTab(textAlignment: .left, location: $0)
-        }
-        paragraph.defaultTabInterval = 180
+    private static func tableParagraphStyle(block: NSTextTableBlock) -> NSParagraphStyle {
+        let paragraph = paragraphStyle(spacingAfter: 0) as! NSMutableParagraphStyle
+        paragraph.lineBreakMode = .byCharWrapping
+        paragraph.textBlocks = [block]
         return paragraph
     }
 

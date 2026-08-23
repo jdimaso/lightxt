@@ -85,6 +85,7 @@ struct MarkdownRendererRuntimeQA {
         try assertSemanticRendering(lightResult)
         try assertSemanticRendering(darkResult)
         try assertVisualAttributes(lightResult)
+        try assertWideTableLayout(lightResult)
         try render(lightResult, appearance: light, to: outputDirectory.appendingPathComponent("markdown-light.png"))
         try render(darkResult, appearance: dark, to: outputDirectory.appendingPathComponent("markdown-dark.png"))
         let mainApplyMilliseconds = try measureBoundedMainApply(appearance: light)
@@ -94,6 +95,7 @@ struct MarkdownRendererRuntimeQA {
             )
         }
         let asyncSample = try assertAsyncViewportAndStalePublicationGate()
+        let partialTableSummary = try assertPartialTableWindow()
         var scrollingSummary = ""
         if CommandLine.arguments.count >= 4 {
             let scrollingFixtureURL = URL(fileURLWithPath: CommandLine.arguments[3])
@@ -108,7 +110,7 @@ struct MarkdownRendererRuntimeQA {
                 + "bounded main apply \(String(format: "%.3f", mainApplyMilliseconds)) ms, "
                 + "production switch enqueue \(String(format: "%.3f", asyncSample.enqueue)) ms / "
                 + "apply \(String(format: "%.3f", asyncSample.apply)) ms, stale publication rejected; "
-                + "light/dark captures rendered\(scrollingSummary)"
+                + "light/dark captures rendered, \(partialTableSummary)\(scrollingSummary)"
         )
     }
 
@@ -121,7 +123,12 @@ struct MarkdownRendererRuntimeQA {
             "Clickable links",
             "inline code",
             "let message = \"Rendered without WebKit\"",
-            "Mode\tMemory behavior",
+            "Mode",
+            "Memory behavior",
+            "tpi.query_artifact_analysis_with_an_extremely_long_unbreakable_identifier_that_must_wrap_inside_column_one",
+            "scope|tool",
+            "Escaped | prose",
+            "Unmatched backtick remains a row",
         ]
         let forbidden = [
             "# LighTxt",
@@ -132,6 +139,9 @@ struct MarkdownRendererRuntimeQA {
             "`inline code`",
             "```swift",
             "| --- |",
+            ":---",
+            "---:",
+            "Escaped \\| prose",
         ]
         guard required.allSatisfy(visible.contains) else {
             throw QAError.failed("Rendered text omitted expected fixture content: \(visible)")
@@ -181,6 +191,257 @@ struct MarkdownRendererRuntimeQA {
         }
         guard rendered.attribute(.backgroundColor, at: fencedCodeRange.location, effectiveRange: nil) != nil else {
             throw QAError.failed("Fenced code did not receive its code background")
+        }
+    }
+
+    /// Logical column boundaries belong to the entire table. A long value may
+    /// wrap inside its own cell, but must never move later cells for only that
+    /// row (the fixed-tab implementation regressed exactly this invariant).
+    private static func assertWideTableLayout(_ rendered: NSAttributedString) throws {
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 620, height: 6_000))
+        textView.isEditable = false
+        textView.isRichText = true
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.containerSize = NSSize(
+            width: 620,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = true
+        textView.textStorage?.setAttributedString(rendered)
+        guard let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer else {
+            throw QAError.failed("Could not lay out the Markdown table regression fixture")
+        }
+        layoutManager.ensureLayout(for: textContainer)
+
+        let longTool = try inspectCell(
+            "tpi.query_artifact_analysis_with_an_extremely_long_unbreakable_identifier_that_must_wrap_inside_column_one",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let longCalls = try inspectCell(
+            "043",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let longDescription = try inspectCell(
+            "Third-A",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let shortTool = try inspectCell(
+            "Short",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let shortCalls = try inspectCell(
+            "007",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let shortDescription = try inspectCell(
+            "Third-B",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+
+        let primaryTable = longTool.block.table
+        let primaryCells = [
+            longTool,
+            longCalls,
+            longDescription,
+            shortTool,
+            shortCalls,
+            shortDescription,
+        ]
+        guard primaryCells.allSatisfy({ $0.block.table === primaryTable }) else {
+            throw QAError.failed("Rows in one Markdown table did not share a native table layout")
+        }
+        guard longTool.block.startingColumn == 0,
+              longCalls.block.startingColumn == 1,
+              longDescription.block.startingColumn == 2,
+              shortTool.block.startingColumn == 0,
+              shortCalls.block.startingColumn == 1,
+              shortDescription.block.startingColumn == 2 else {
+            throw QAError.failed("Markdown table cells lost their logical column identities")
+        }
+        try assertAligned(
+            longCalls,
+            shortCalls,
+            label: "second column after a long first cell"
+        )
+        try assertAligned(
+            longDescription,
+            shortDescription,
+            label: "third column after a long first cell"
+        )
+
+        let longGlyphRange = layoutManager.glyphRange(
+            forCharacterRange: longTool.characterRange,
+            actualCharacterRange: nil
+        )
+        var wrappedLineCount = 0
+        layoutManager.enumerateLineFragments(forGlyphRange: longGlyphRange) { _, _, _, _, _ in
+            wrappedLineCount += 1
+        }
+        guard wrappedLineCount >= 2 else {
+            throw QAError.failed("Long unbreakable Markdown table content did not wrap inside its cell")
+        }
+
+        let inlinePipe = try inspectCell(
+            "scope|tool",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let inlineCalls = try inspectCell(
+            "011",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let escapedPipe = try inspectCell(
+            "Escaped | prose",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let escapedCalls = try inspectCell(
+            "012",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        guard inlinePipe.block.startingColumn == 0,
+              inlineCalls.block.startingColumn == 1,
+              escapedPipe.block.startingColumn == 0,
+              escapedCalls.block.startingColumn == 1 else {
+            throw QAError.failed("An escaped or inline-code pipe split a Markdown table cell")
+        }
+        let unmatchedBacktick = try inspectCell(
+            "unclosed marker",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let unmatchedCalls = try inspectCell(
+            "013",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let unmatchedDescription = try inspectCell(
+            "Unmatched backtick remains a row",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        guard unmatchedBacktick.block.startingColumn == 0,
+              unmatchedCalls.block.startingColumn == 1,
+              unmatchedDescription.block.startingColumn == 2 else {
+            throw QAError.failed("An unmatched backtick suppressed later Markdown table delimiters")
+        }
+
+        let wideSecondA = try inspectCell(
+            "W2-A",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let wideSecondB = try inspectCell(
+            "W2-B",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let wideSixthA = try inspectCell(
+            "W6-A",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        let wideSixthB = try inspectCell(
+            "W6-B",
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        guard wideSecondA.block.startingColumn == 1,
+              wideSecondB.block.startingColumn == 1,
+              wideSixthA.block.startingColumn == 5,
+              wideSixthB.block.startingColumn == 5,
+              wideSecondA.block.table === wideSixthA.block.table else {
+            throw QAError.failed("A wide Markdown table did not retain all six logical columns")
+        }
+        try assertAligned(wideSecondA, wideSecondB, label: "wide-table second column")
+        try assertAligned(wideSixthA, wideSixthB, label: "wide-table sixth column")
+    }
+
+    private struct InspectedTableCell {
+        let block: NSTextTableBlock
+        let characterRange: NSRange
+        let glyphRect: NSRect
+        let lineFragmentRect: NSRect
+    }
+
+    private static func inspectCell(
+        _ marker: String,
+        in rendered: NSAttributedString,
+        layoutManager: NSLayoutManager,
+        textContainer: NSTextContainer
+    ) throws -> InspectedTableCell {
+        let range = (rendered.string as NSString).range(of: marker)
+        guard range.location != NSNotFound,
+              range.length > 0,
+              let paragraph = rendered.attribute(
+                .paragraphStyle,
+                at: range.location,
+                effectiveRange: nil
+              ) as? NSParagraphStyle,
+              let block = paragraph.textBlocks.compactMap({ $0 as? NSTextTableBlock }).last else {
+            throw QAError.failed("Could not resolve native Markdown table cell ‘\(marker)’")
+        }
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: range,
+            actualCharacterRange: nil
+        )
+        guard glyphRange.length > 0 else {
+            throw QAError.failed("Markdown table marker ‘\(marker)’ had no laid-out glyph")
+        }
+        let firstGlyph = NSRange(location: glyphRange.location, length: 1)
+        return InspectedTableCell(
+            block: block,
+            characterRange: range,
+            glyphRect: layoutManager.boundingRect(forGlyphRange: firstGlyph, in: textContainer),
+            lineFragmentRect: layoutManager.lineFragmentRect(
+                forGlyphAt: glyphRange.location,
+                effectiveRange: nil
+            )
+        )
+    }
+
+    private static func assertAligned(
+        _ first: InspectedTableCell,
+        _ second: InspectedTableCell,
+        label: String
+    ) throws {
+        let glyphDelta = abs(first.glyphRect.minX - second.glyphRect.minX)
+        let fragmentStartDelta = abs(first.lineFragmentRect.minX - second.lineFragmentRect.minX)
+        let fragmentWidthDelta = abs(first.lineFragmentRect.width - second.lineFragmentRect.width)
+        guard glyphDelta <= 1.5,
+              fragmentStartDelta <= 1.5,
+              fragmentWidthDelta <= 1.5 else {
+            throw QAError.failed(
+                "Markdown \(label) drifted across rows: glyph Δ \(glyphDelta), "
+                    + "cell origin Δ \(fragmentStartDelta), width Δ \(fragmentWidthDelta)"
+            )
         }
     }
 
@@ -270,6 +531,149 @@ struct MarkdownRendererRuntimeQA {
         }
         preview.deactivate()
         return (enqueueMilliseconds, applyMilliseconds)
+    }
+
+    /// Exercises a table whose header and separator are outside the bounded
+    /// render window. A mid-document viewport must still build one coherent
+    /// table with stable cell geometry; it cannot rely on seeing the table's
+    /// first source row.
+    private static func assertPartialTableWindow() throws -> String {
+        let prelude = String(
+            repeating: "Prelude filler keeps the requested viewport away from byte zero.\n",
+            count: 900
+        )
+        let header = "| Name | Count | Detail |\n| :--- | ---: | :---: |\n"
+        let rows = (0..<720).map { row in
+            let ordinal = String(format: "%04d", row)
+            return "| partial_row_\(ordinal)_with_a_long_unbreakable_identifier_that_wraps_inside_its_cell | C\(ordinal) | Tail\(ordinal) |"
+        }
+        let midpoint = rows.count / 2
+        let tablePrefix = header + rows[..<midpoint].joined(separator: "\n") + "\n"
+        let tableSource = header + rows.joined(separator: "\n") + "\n"
+        let postlude = String(
+            repeating: "Postlude filler keeps the requested viewport away from true EOF.\n",
+            count: 900
+        )
+        let source = prelude + tableSource + postlude
+        let tableStart = Int64(prelude.utf8.count)
+        let tableEnd = tableStart + Int64(tableSource.utf8.count)
+        let target = tableStart + Int64(tablePrefix.utf8.count)
+
+        let preview = MarkdownPreviewView(frame: NSRect(x: 0, y: 0, width: 700, height: 520))
+        preview.appearance = NSAppearance(named: .aqua)
+        var applyCount = 0
+        preview.onPerformanceSample = { _, _ in applyCount += 1 }
+        let delegate = QAMarkdownDelegate(source: source)
+        preview.editorDelegate = delegate
+        preview.layoutSubtreeIfNeeded()
+        try wait(
+            until: { applyCount >= 1 },
+            timeout: 5,
+            failure: "Initial render for the partial Markdown table fixture did not publish"
+        )
+        let appliesBeforePartialWindow = applyCount
+        preview.scrollTo(byteOffset: target)
+        try wait(
+            until: { applyCount > appliesBeforePartialWindow },
+            timeout: 5,
+            failure: "Bounded mid-table Markdown viewport did not publish"
+        )
+        preview.layoutSubtreeIfNeeded()
+        defer { preview.deactivate() }
+
+        guard let exposed = delegate.lastExposedRange,
+              exposed.lowerBound > tableStart,
+              exposed.upperBound < tableEnd else {
+            throw QAError.failed(
+                "Partial-table QA did not actually render a bounded window inside the table: "
+                    + "\(String(describing: delegate.lastExposedRange)) / \(tableStart)..<\(tableEnd)"
+            )
+        }
+        guard let textView = descendant(of: preview, as: NSTextView.self),
+              let rendered = textView.textStorage,
+              let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer,
+              rendered.string.contains("partial_row_") else {
+            throw QAError.failed("Could not inspect the rendered partial Markdown table window")
+        }
+        layoutManager.ensureLayout(for: textContainer)
+        let cells = tableCells(
+            in: rendered,
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+        guard cells.count >= 90,
+              let first = cells.first,
+              cells.allSatisfy({ $0.block.table === first.block.table }) else {
+            throw QAError.failed(
+                "A bounded Markdown table window did not retain one shared native table (\(cells.count) cells)"
+            )
+        }
+        let columns = Set(cells.map { $0.block.startingColumn })
+        guard columns == Set(0..<3) else {
+            throw QAError.failed("A bounded Markdown table window exposed columns \(columns), expected 0, 1, 2")
+        }
+        for column in 0..<3 {
+            let columnCells = cells.filter { $0.block.startingColumn == column }
+            guard columnCells.count >= 30 else {
+                throw QAError.failed("Bounded Markdown column \(column) contained only \(columnCells.count) cells")
+            }
+            let glyphXs = columnCells.map(\.glyphRect.minX)
+            let fragmentXs = columnCells.map(\.lineFragmentRect.minX)
+            let fragmentWidths = columnCells.map(\.lineFragmentRect.width)
+            guard spread(glyphXs) <= 1.5,
+                  spread(fragmentXs) <= 1.5,
+                  spread(fragmentWidths) <= 1.5 else {
+                throw QAError.failed(
+                    "Bounded Markdown column \(column) drifted across rows: glyph spread "
+                        + "\(spread(glyphXs)), origin spread \(spread(fragmentXs)), "
+                        + "width spread \(spread(fragmentWidths))"
+                )
+            }
+        }
+        return "partial-table window retained \(cells.count) aligned native cells"
+    }
+
+    private static func tableCells(
+        in rendered: NSAttributedString,
+        layoutManager: NSLayoutManager,
+        textContainer: NSTextContainer
+    ) -> [InspectedTableCell] {
+        var cells: [InspectedTableCell] = []
+        var seenBlocks: Set<ObjectIdentifier> = []
+        let full = NSRange(location: 0, length: rendered.length)
+        rendered.enumerateAttribute(.paragraphStyle, in: full) { value, range, _ in
+            guard range.length > 0,
+                  let paragraph = value as? NSParagraphStyle,
+                  let block = paragraph.textBlocks.compactMap({ $0 as? NSTextTableBlock }).last,
+                  seenBlocks.insert(ObjectIdentifier(block)).inserted else { return }
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: range,
+                actualCharacterRange: nil
+            )
+            guard glyphRange.length > 0 else { return }
+            let firstGlyph = NSRange(location: glyphRange.location, length: 1)
+            cells.append(InspectedTableCell(
+                block: block,
+                characterRange: range,
+                glyphRect: layoutManager.boundingRect(
+                    forGlyphRange: firstGlyph,
+                    in: textContainer
+                ),
+                lineFragmentRect: layoutManager.lineFragmentRect(
+                    forGlyphAt: glyphRange.location,
+                    effectiveRange: nil
+                )
+            ))
+        }
+        return cells
+    }
+
+    private static func spread(_ values: [CGFloat]) -> CGFloat {
+        guard let minimum = values.min(), let maximum = values.max() else {
+            return .greatestFiniteMagnitude
+        }
+        return maximum - minimum
     }
 
     private static func assertProductionScrolling(
@@ -491,6 +895,7 @@ struct MarkdownRendererRuntimeQA {
 private final class QAMarkdownDelegate: VirtualTextEditorDelegate {
     private let bytes: Data
     private let snapshot: DocumentSnapshot
+    private(set) var lastExposedRange: Range<Int64>?
     init(source: String) {
         bytes = Data(source.utf8)
         snapshot = DocumentSnapshot(bytes)
@@ -506,7 +911,7 @@ private final class QAMarkdownDelegate: VirtualTextEditorDelegate {
     func editorDidCommitEdit(replaced range: Range<Int64>, insertedByteCount: Int64) {}
     func editorSelectionDidChange(byteRange: Range<Int64>, line: Int64, column: Int) {}
     func editorDidLoadViewport(byteRange: Range<Int64>) {}
-    func editorDidExpose(byteRange: Range<Int64>) {}
+    func editorDidExpose(byteRange: Range<Int64>) { lastExposedRange = byteRange }
     func editorDidDiscoverStructure(
         folds: [SyntaxFoldRange],
         viewportData: Data,
