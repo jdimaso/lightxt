@@ -430,6 +430,13 @@ public nonisolated final class FileBackedPieceTable: @unchecked Sendable {
         withLock { state?.documentURL }
     }
 
+    /// The identity of the exact base inode captured when this engine opened
+    /// (or most recently adopted a successful save). Recovery creation can use
+    /// it to reject a pathname that changed before its journal was published.
+    var recoveryBaseFingerprint: RecoveryBaseFingerprint? {
+        withLock { state?.diskFingerprint.map(RecoveryBaseFingerprint.init) }
+    }
+
     public var byteCount: Int64 {
         withLock { treeByteCount(state?.root) }
     }

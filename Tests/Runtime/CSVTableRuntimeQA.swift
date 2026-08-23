@@ -9,6 +9,32 @@ struct EditorLineLocation: Sendable {
 }
 struct SyntaxFoldRange: Sendable {}
 
+// Keep this standalone harness independent of the app's syntax/session layer.
+// CSVTableView only needs delimiter presentation plus conservative document
+// access checks; the real mutation delegate below remains authoritative.
+enum DelimitedTextDelimiter: UInt8, CaseIterable {
+    case comma = 0x2C
+    case tab = 0x09
+    case semicolon = 0x3B
+    case pipe = 0x7C
+
+    var displayName: String {
+        switch self {
+        case .comma: "Comma"
+        case .tab: "Tab"
+        case .semicolon: "Semicolon"
+        case .pipe: "Pipe"
+        }
+    }
+}
+
+@MainActor
+protocol LighTxtDocumentSession: AnyObject {
+    var isReadOnly: Bool { get }
+    var isSourceTextValidated: Bool { get }
+    func setDelimitedTextDelimiter(_ delimiter: DelimitedTextDelimiter)
+}
+
 @MainActor
 protocol VirtualTextEditorDelegate: AnyObject {
     var editorDocumentByteCount: Int64 { get }
@@ -72,8 +98,12 @@ struct CSVTableRuntimeQA {
               fixtureTable.numberOfColumns == 5 else {
             throw QAError.failed("CSV table did not detect a four-row/four-column fixture with fixed header")
         }
+        guard let fixtureScrollView = fixtureTable.enclosingScrollView else {
+            throw QAError.failed("CSV table was not hosted by its production scroll view")
+        }
         fixtureView.layoutSubtreeIfNeeded()
         fixtureTable.headerView?.layoutSubtreeIfNeeded()
+        try assertComfortScrollers(fixtureScrollView, label: "CSV table")
 
         try assertHeaderLayout(fixtureView, column: 0, label: "initial 1000pt fixture")
 
@@ -1014,9 +1044,30 @@ struct CSVTableRuntimeQA {
         // may install a row map; the abandoned temporary map must be closed.
         stressComplete = false
         stressView.qaApplyContainsFilter(column: 1, value: "person-9")
+        guard stressView.qaIsQueryLoadingOverlayVisible,
+              stressView.qaQueryOverlayConsumesHitTest,
+              stressView.qaPresentedTableAlpha < 0.5,
+              !stressView.qaPresentedTableIsEnabled else {
+            throw QAError.failed(
+                "An in-flight filter left stale table rows looking current or interactive"
+            )
+        }
         stressView.qaApplyContainsFilter(column: 1, value: "person-1")
-        try wait(until: { stressComplete }, timeout: 15, failure: "Replacement filter query did not finish")
-        guard stressTable.numberOfRows == 11 else {
+        try wait(
+            until: {
+                stressComplete
+                    && !stressView.qaIsQueryLoadingOverlayVisible
+                    && !stressView.qaQueryOverlayConsumesHitTest
+                    && abs(stressView.qaPresentedTableAlpha - 1) < 0.01
+            },
+            timeout: 15,
+            failure: "Replacement filter query did not finish"
+        )
+        guard stressTable.numberOfRows == 11,
+              !stressView.qaIsQueryLoadingOverlayVisible,
+              !stressView.qaQueryOverlayConsumesHitTest,
+              abs(stressView.qaPresentedTableAlpha - 1) < 0.01,
+              stressView.qaPresentedTableIsEnabled else {
             throw QAError.failed("A stale filter result replaced the newest 11-row query")
         }
         let replacementValues = try cellValues(
@@ -1075,6 +1126,42 @@ struct CSVTableRuntimeQA {
             throw QAError.failed("Settled projected rows re-enqueued and thrashed the cache")
         }
 
+        // Inactive-window purging must release only decoded presentation rows.
+        // The disk-backed sorted projection and AppKit selection remain live,
+        // and no page may silently repopulate until explicit reactivation.
+        let purgeSelection = IndexSet([1, 3, 5])
+        let projectionRowCountBeforePurge = stressTable.numberOfRows
+        stressTable.selectRowIndexes(purgeSelection, byExtendingSelection: false)
+        guard stressView.purgeRebuildableResidentMemory(),
+              !stressView.purgeRebuildableResidentMemory(),
+              stressView.qaCachedSourceRecords.isEmpty,
+              stressView.qaPendingRecordLoadCount == 0,
+              stressTable.selectedRowIndexes == purgeSelection,
+              stressTable.numberOfRows == projectionRowCountBeforePurge else {
+            throw QAError.failed("Inactive CSV purge lost projection/selection or was not idempotent")
+        }
+        stressView.qaRequestDisplayedRows(projectedRows)
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        guard stressView.qaCachedSourceRecords.isEmpty,
+              stressView.qaPendingRecordLoadCount == 0 else {
+            throw QAError.failed("Inactive CSV presentation repopulated decoded rows")
+        }
+        stressView.reactivateAfterResidentPurge()
+        stressView.reactivateAfterResidentPurge()
+        stressView.qaRequestDisplayedRows(projectedRows)
+        try wait(
+            until: { stressView.qaPendingRecordLoadCount == 0 },
+            timeout: 10,
+            failure: "Reactivated CSV presentation did not lazily restore rows"
+        )
+        let reactivatedSources = try projectedRows.map {
+            try stressView.qaSourceRecord(forDisplayedRow: Int64($0))
+        }
+        guard stressTable.selectedRowIndexes == purgeSelection,
+              reactivatedSources == projectedSources else {
+            throw QAError.failed("CSV reactivation lost the selected rows or sorted projection")
+        }
+
 
         // Record zero is intentionally absent from the bounded row cache after
         // the scattered requests above. Toggling header mode must still use
@@ -1096,6 +1183,7 @@ struct CSVTableRuntimeQA {
                 + "\(String(format: "%.3f", editMilliseconds)) ms; stale-query cancellation and "
                 + "exact-record projected cache stable; projected-key edits, retained header, "
                 + "empty bootstrap, and 512-column cap verified; accessibility + light/dark captures rendered"
+                + "; native auto-hiding table scrollers are +2 pt"
         )
     }
 
@@ -1118,6 +1206,63 @@ struct CSVTableRuntimeQA {
         view.frame = NSRect(origin: .zero, size: requestedSize)
         window.layoutIfNeeded()
         return window
+    }
+
+    private static func assertComfortScrollers(
+        _ scrollView: NSScrollView,
+        label: String
+    ) throws {
+        guard let verticalScroller = scrollView.verticalScroller as? LighTxtComfortScroller,
+              let horizontalScroller = scrollView.horizontalScroller as? LighTxtComfortScroller else {
+            throw QAError.failed("\(label) did not install both production comfort scrollers")
+        }
+        guard scrollView.autohidesScrollers else {
+            throw QAError.failed("\(label) comfort scrollers were forced to remain visible")
+        }
+        guard LighTxtComfortScroller.isCompatibleWithOverlayScrollers else {
+            throw QAError.failed("\(label) comfort scrollers disabled overlay compatibility")
+        }
+        for style in [NSScroller.Style.overlay, .legacy] {
+            let native = NSScroller.scrollerWidth(for: .regular, scrollerStyle: style)
+            let comfortable = LighTxtComfortScroller.scrollerWidth(
+                for: .regular,
+                scrollerStyle: style
+            )
+            guard abs((comfortable - native) - 2) < 0.01 else {
+                throw QAError.failed(
+                    "\(label) comfort delta changed for \(style): "
+                        + "native \(native), comfortable \(comfortable)"
+                )
+            }
+        }
+        let nativeVerticalWidth = NSScroller.scrollerWidth(
+            for: verticalScroller.controlSize,
+            scrollerStyle: verticalScroller.scrollerStyle
+        )
+        let expectedVerticalWidth = LighTxtComfortScroller.scrollerWidth(
+            for: verticalScroller.controlSize,
+            scrollerStyle: verticalScroller.scrollerStyle
+        )
+        let nativeHorizontalHeight = NSScroller.scrollerWidth(
+            for: horizontalScroller.controlSize,
+            scrollerStyle: horizontalScroller.scrollerStyle
+        )
+        let expectedHorizontalHeight = LighTxtComfortScroller.scrollerWidth(
+            for: horizontalScroller.controlSize,
+            scrollerStyle: horizontalScroller.scrollerStyle
+        )
+        guard abs(verticalScroller.bounds.width - expectedVerticalWidth) < 0.5,
+              verticalScroller.bounds.width >= nativeVerticalWidth + 1.5,
+              abs(horizontalScroller.bounds.height - expectedHorizontalHeight) < 0.5,
+              horizontalScroller.bounds.height >= nativeHorizontalHeight + 1.5 else {
+            throw QAError.failed(
+                "\(label) managed scrollers were not physically widened: "
+                    + "vertical actual/native/expected \(verticalScroller.bounds.width)/"
+                    + "\(nativeVerticalWidth)/\(expectedVerticalWidth), horizontal "
+                    + "\(horizontalScroller.bounds.height)/\(nativeHorizontalHeight)/"
+                    + "\(expectedHorizontalHeight)"
+            )
+        }
     }
 
     private static func settleLayout(window: NSWindow, view: CSVTableView) throws {
@@ -1502,7 +1647,7 @@ struct CSVTableRuntimeQA {
 }
 
 @MainActor
-private final class QACSVDelegate: CSVMutationEditorDelegate {
+private final class QACSVDelegate: CSVMutationEditorDelegate, LighTxtDocumentSession {
     let engine: FileBackedPieceTable
     private(set) var lastError: Error?
     private(set) var commitCount = 0
@@ -1515,6 +1660,9 @@ private final class QACSVDelegate: CSVMutationEditorDelegate {
 
     var editorDocumentByteCount: Int64 { engine.byteCount }
     var editorSyntaxFileType: SyntaxFileType { .csv }
+    var isReadOnly: Bool { false }
+    var isSourceTextValidated: Bool { true }
+    func setDelimitedTextDelimiter(_ delimiter: DelimitedTextDelimiter) {}
     func editorSnapshot() throws -> DocumentSnapshot { try engine.snapshot() }
     func editorReadBytes(in range: Range<Int64>) throws -> Data {
         try engine.snapshot().data(in: range)

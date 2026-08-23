@@ -8,6 +8,9 @@ enum LighTxtApplication {
         let application = NSApplication.shared
         let delegate = LighTxtAppDelegate()
         application.delegate = delegate
+        // The hosted workflow regression also needs genuine key-window
+        // transitions, so its isolated QA bundle uses the same foreground
+        // activation policy as the production application.
         application.setActivationPolicy(.regular)
         application.run()
         withExtendedLifetime(delegate) {}
@@ -22,6 +25,15 @@ final class LighTxtAppDelegate: NSObject, NSApplicationDelegate {
     private var updaterController: SPUStandardUpdaterController!
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+#if LIGHTXT_RUNTIME_QA
+        if LighTxtWorkflowRuntimeQAInvocation(arguments: ProcessInfo.processInfo.arguments) != nil {
+            // This is still the process's real, first NSDocumentController.
+            // Skip menus and Sparkle so the hosted check has no network or
+            // update side effects.
+            documentController = LighTxtDocumentController()
+            return
+        }
+#endif
         // Apply the persisted preference before creating menus or windows so
         // every AppKit control resolves its initial colors consistently.
         appearanceController = LighTxtAppearanceController()
@@ -47,6 +59,18 @@ final class LighTxtAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+#if LIGHTXT_RUNTIME_QA
+        if let invocation = LighTxtWorkflowRuntimeQAInvocation(
+            arguments: ProcessInfo.processInfo.arguments
+        ) {
+            NSApp.activate(ignoringOtherApps: true)
+            LighTxtWorkflowRuntimeQA.start(
+                invocation: invocation,
+                documentController: documentController
+            )
+            return
+        }
+#endif
         NSApp.activate(ignoringOtherApps: true)
         let arguments = ProcessInfo.processInfo.arguments
         // AppKit completes persistent-window restoration just after the launch
@@ -66,10 +90,17 @@ final class LighTxtAppDelegate: NSObject, NSApplicationDelegate {
                 }
                 return
             }
-            if self.documentController.documents.isEmpty {
-                self.documentController.showHomeWindow()
-            } else {
-                self.documentController.reopenApplication()
+            // AppKit may already have recreated clean document windows by this
+            // point. Crash journals still take precedence: skipping the chooser
+            // whenever restoration opened a base file would strand its unsaved
+            // edits indefinitely.
+            self.documentController.offerCrashRecovery { [weak self] recovered in
+                guard let self, !recovered else { return }
+                if self.documentController.documents.isEmpty {
+                    self.documentController.showHomeWindow()
+                } else {
+                    self.documentController.reopenApplication()
+                }
             }
         }
     }
@@ -79,11 +110,25 @@ final class LighTxtAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldSaveApplicationState(_ sender: NSApplication) -> Bool {
-        false
+#if LIGHTXT_RUNTIME_QA
+        if LighTxtWorkflowRuntimeQAInvocation(arguments: ProcessInfo.processInfo.arguments) != nil {
+            return false
+        }
+#endif
+        return true
     }
 
     func applicationShouldRestoreApplicationState(_ sender: NSApplication) -> Bool {
-        false
+#if LIGHTXT_RUNTIME_QA
+        if LighTxtWorkflowRuntimeQAInvocation(arguments: ProcessInfo.processInfo.arguments) != nil {
+            return false
+        }
+#endif
+        return true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        documentController.captureCurrentTask()
     }
 
     func applicationShouldHandleReopen(
@@ -95,15 +140,10 @@ final class LighTxtAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        // The shell intentionally has one active document. Finder may deliver
-        // several URLs in one event; open the first rather than racing multiple
-        // save-review sheets and leaving the final selection nondeterministic.
-        guard let url = urls.first else { return }
-        documentController.openDocument(withContentsOf: url, display: true) { _, _, error in
-            if let error, (error as? CocoaError)?.code != .userCancelled {
-                NSApp.presentError(error)
-            }
-        }
+        // Finder can deliver an entire selection in one event. Keep the order
+        // stable and let the controller serialize presentation/error handling
+        // so every requested file gets its own document window.
+        documentController.openDocumentsInNewWindows(at: urls)
     }
 }
 
@@ -124,7 +164,7 @@ final class LighTxtMenu: NSObject {
             appearanceController: appearanceController,
             fontController: fontController
         ))
-        main.addItem(windowMenuItem())
+        main.addItem(windowMenuItem(documentController: documentController))
         main.addItem(helpMenuItem(documentController: documentController))
         return main
     }
@@ -179,7 +219,51 @@ final class LighTxtMenu: NSObject {
         )
         openDocument.target = documentController
         menu.addItem(openDocument)
+        let openInNewWindow = item(
+            "Open in New Window…",
+            action: #selector(LighTxtDocumentController.openLighTxtDocumentInNewWindow(_:)),
+            key: "o",
+            modifiers: [.command, .option]
+        )
+        openInNewWindow.target = documentController
+        menu.addItem(openInNewWindow)
+        let openAs = item(
+            "Open As…",
+            action: #selector(LighTxtDocumentController.openAsLighTxtDocument(_:)),
+            key: "o",
+            modifiers: [.command, .shift]
+        )
+        openAs.target = documentController
+        menu.addItem(openAs)
         menu.addItem(recentDocumentsItem(documentController: documentController))
+        let reopenLastTask = item(
+            "Reopen Last Task",
+            action: #selector(LighTxtDocumentController.reopenLastTask(_:))
+        )
+        reopenLastTask.target = documentController
+        menu.addItem(reopenLastTask)
+        menu.addItem(.separator())
+        let reload = item(
+            "Reload from Disk",
+            action: #selector(LighTxtDocumentController.reloadCurrentLighTxtDocument(_:)),
+            key: "r"
+        )
+        reload.target = documentController
+        menu.addItem(reload)
+        let follow = item(
+            "Follow End of File",
+            action: #selector(LighTxtDocumentController.toggleFollowEndOfFile(_:)),
+            key: "f",
+            modifiers: [.command, .option]
+        )
+        follow.target = documentController
+        menu.addItem(follow)
+        let automaticReload = item(
+            "Automatically Reload Clean Files",
+            action: #selector(LighTxtDocumentController.toggleAutomaticReloadCleanFiles(_:))
+        )
+        automaticReload.target = documentController
+        menu.addItem(automaticReload)
         menu.addItem(.separator())
         menu.addItem(item("Close", action: #selector(NSWindow.performClose(_:)), key: "w"))
         let save = item(
@@ -212,6 +296,19 @@ final class LighTxtMenu: NSObject {
         )
         duplicate.target = documentController
         menu.addItem(duplicate)
+        menu.addItem(.separator())
+        let exportTable = item(
+            "Export Table…",
+            action: #selector(LighTxtDocumentController.exportCurrentTableView(_:))
+        )
+        exportTable.target = documentController
+        menu.addItem(exportTable)
+        let cancelExport = item(
+            "Cancel Table Export",
+            action: #selector(LighTxtDocumentController.cancelCurrentTableExport(_:))
+        )
+        cancelExport.target = documentController
+        menu.addItem(cancelExport)
         return root
     }
 
@@ -219,23 +316,8 @@ final class LighTxtMenu: NSObject {
         let root = NSMenuItem(title: "Open Recent", action: nil, keyEquivalent: "")
         let menu = NSMenu(title: "Open Recent")
         root.submenu = menu
-        for url in documentController.recentDocumentURLs.prefix(12) {
-            let recent = NSMenuItem(
-                title: url.lastPathComponent,
-                action: #selector(LighTxtDocumentController.openRecentLighTxtDocument(_:)),
-                keyEquivalent: ""
-            )
-            recent.target = documentController
-            recent.representedObject = url
-            recent.toolTip = url.path
-            menu.addItem(recent)
-        }
-        if !menu.items.isEmpty {
-            menu.addItem(.separator())
-        }
-        let clear = item("Clear Menu", action: #selector(NSDocumentController.clearRecentDocuments(_:)))
-        clear.target = documentController
-        menu.addItem(clear)
+        menu.delegate = documentController
+        documentController.populateRecentDocumentsMenu(menu)
         return root
     }
 
@@ -400,12 +482,52 @@ final class LighTxtMenu: NSObject {
         return root
     }
 
-    private static func windowMenuItem() -> NSMenuItem {
+    private static func windowMenuItem(
+        documentController: LighTxtDocumentController
+    ) -> NSMenuItem {
         let root = NSMenuItem()
         let menu = NSMenu(title: "Window")
         root.submenu = menu
         menu.addItem(item("Minimize", action: #selector(NSWindow.performMiniaturize(_:)), key: "m"))
         menu.addItem(item("Zoom", action: #selector(NSWindow.performZoom(_:))))
+        menu.addItem(.separator())
+        let previousDocument = item(
+            "Previous Document",
+            action: #selector(LighTxtDocumentController.activatePreviousLighTxtDocument(_:)),
+            key: "[",
+            modifiers: [.command, .option]
+        )
+        previousDocument.target = documentController
+        menu.addItem(previousDocument)
+        let nextDocument = item(
+            "Next Document",
+            action: #selector(LighTxtDocumentController.activateNextLighTxtDocument(_:)),
+            key: "]",
+            modifiers: [.command, .option]
+        )
+        nextDocument.target = documentController
+        menu.addItem(nextDocument)
+        menu.addItem(.separator())
+        menu.addItem(item(
+            "Show Tab Bar",
+            action: #selector(NSWindow.toggleTabBar(_:)),
+            key: "t",
+            modifiers: [.command, .shift]
+        ))
+        menu.addItem(item(
+            "Previous Tab",
+            action: #selector(NSWindow.selectPreviousTab(_:)),
+            key: "\t",
+            modifiers: [.control, .shift]
+        ))
+        menu.addItem(item(
+            "Next Tab",
+            action: #selector(NSWindow.selectNextTab(_:)),
+            key: "\t",
+            modifiers: [.control]
+        ))
+        menu.addItem(item("Move Tab to New Window", action: #selector(NSWindow.moveTabToNewWindow(_:))))
+        menu.addItem(item("Merge All Windows", action: #selector(NSWindow.mergeAllWindows(_:))))
         menu.addItem(.separator())
         menu.addItem(item("Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:))))
         NSApp.windowsMenu = menu
@@ -425,6 +547,20 @@ final class LighTxtMenu: NSObject {
         NSApp.helpMenu = menu
         return root
     }
+
+#if LIGHTXT_RUNTIME_QA
+    static func qaFileMenu(
+        documentController: LighTxtDocumentController
+    ) -> NSMenu? {
+        fileMenuItem(documentController: documentController).submenu
+    }
+
+    static func qaWindowMenu(
+        documentController: LighTxtDocumentController
+    ) -> NSMenu? {
+        windowMenuItem(documentController: documentController).submenu
+    }
+#endif
 
     private static func item(
         _ title: String,

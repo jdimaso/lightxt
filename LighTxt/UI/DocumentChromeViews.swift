@@ -16,6 +16,7 @@ enum DocumentPresentationMode: Int, CaseIterable {
 final class DocumentHeaderView: NSView {
     var onFind: (() -> Void)?
     var onStructure: (() -> Void)?
+    var onExport: (() -> Void)?
     var onPrettifyChanged: ((Bool) -> Void)?
     var onOpenFolder: ((URL) -> Void)?
     var onPresentationModeChanged: ((DocumentPresentationMode) -> Void)?
@@ -38,12 +39,18 @@ final class DocumentHeaderView: NSView {
         symbolName: "sidebar.right",
         accessibilityLabel: "Toggle structure sidebar"
     )
+    private let exportButton = HeaderIconButton(
+        symbolName: "square.and.arrow.up",
+        accessibilityLabel: "Export table"
+    )
     private let findButton = HeaderIconButton(
         symbolName: "magnifyingglass",
         accessibilityLabel: "Find"
     )
     private var currentFileURL: URL?
     private var trailingWidthConstraint: NSLayoutConstraint?
+    private var isPrettifyAvailable = false
+    private var isExportVisible = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -114,30 +121,49 @@ final class DocumentHeaderView: NSView {
     /// Binary table formats have a rendered, read-only presentation only.
     /// Keep View visible and selected while making the unavailable Edit path
     /// explicit to mouse, keyboard, and accessibility users.
-    func setEditingAvailable(_ available: Bool) {
+    func setEditingAvailable(_ available: Bool, unavailableReason: String? = nil) {
         modeControl.setEnabled(available, forSegment: DocumentPresentationMode.edit.rawValue)
         if !available {
             modeControl.selectedSegment = DocumentPresentationMode.view.rawValue
         }
         modeControl.toolTip = available
             ? "Switch between a rendered view and byte-window editing"
-            : "This document is available in read-only View mode"
+            : (unavailableReason ?? "This document is available in read-only View mode")
         modeControl.setAccessibilityHelp(modeControl.toolTip)
     }
 
-    func setFindAvailable(_ available: Bool) {
+    func setFindAvailable(_ available: Bool, unavailableReason: String? = nil) {
         findButton.isEnabled = available
         findButton.toolTip = available
             ? "Find in document (Command-F)"
-            : "Use the column filters to find Parquet rows"
+            : (unavailableReason ?? "Use the column filters to find Parquet rows")
         findButton.setAccessibilityHelp(findButton.toolTip)
     }
 
+    /// Table export is a contextual action: it is absent for ordinary text
+    /// presentations, but remains visible and explains itself while a CSV or
+    /// Parquet table is temporarily busy or otherwise unavailable.
+    func setExportAvailable(
+        _ available: Bool,
+        visible: Bool,
+        unavailableReason: String? = nil
+    ) {
+        isExportVisible = visible
+        exportButton.isHidden = !visible
+        exportButton.isEnabled = visible && available
+        exportButton.toolTip = available
+            ? "Export the current table view"
+            : (unavailableReason ?? "Export is temporarily unavailable")
+        exportButton.setAccessibilityHelp(exportButton.toolTip)
+        updateTrailingWidth()
+    }
+
     func setPrettifyAvailable(_ available: Bool) {
+        isPrettifyAvailable = available
         prettifyButton.isHidden = !available
         prettifyButton.isEnabled = available
         if !available { prettifyButton.state = .off }
-        trailingWidthConstraint?.constant = available ? 281 : 197
+        updateTrailingWidth()
     }
 
     func setPrettifyOn(_ enabled: Bool) {
@@ -239,12 +265,17 @@ final class DocumentHeaderView: NSView {
 
         structureButton.toolTip = "Show or hide the structure sidebar"
         structureButton.onActivate = { [weak self] in self?.onStructure?() }
+        exportButton.toolTip = "Export the current table view"
+        exportButton.isHidden = true
+        exportButton.onActivate = { [weak self] in self?.onExport?() }
         findButton.toolTip = "Find in document (Command-F)"
         findButton.keyEquivalent = "f"
         findButton.keyEquivalentModifierMask = [.command]
         findButton.onActivate = { [weak self] in self?.onFind?() }
 
-        let trailing = NSStackView(views: [modeControl, prettifyButton, structureButton, findButton])
+        let trailing = NSStackView(
+            views: [modeControl, prettifyButton, exportButton, structureButton, findButton]
+        )
         trailing.orientation = .horizontal
         trailing.alignment = .centerY
         trailing.spacing = 8
@@ -282,6 +313,15 @@ final class DocumentHeaderView: NSView {
         ])
     }
 
+    private func updateTrailingWidth() {
+        // The fixed width prevents the path and type badge from nudging the
+        // trailing controls as contextual actions appear. Each icon adds its
+        // 32pt hit target plus the stack's 8pt spacing; Prettify adds 84pt.
+        trailingWidthConstraint?.constant = CGFloat(197)
+            + (isExportVisible ? CGFloat(40) : 0)
+            + (isPrettifyAvailable ? CGFloat(84) : 0)
+    }
+
     private func applyResolvedAppearance() {
         let appearance = effectiveAppearance
         let accent = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
@@ -317,6 +357,12 @@ final class DocumentHeaderView: NSView {
     var qaPrettifyAccessibilityLabel: String? { prettifyButton.accessibilityLabel() }
     var qaPrettifyFrame: NSRect { prettifyButton.frame }
     func qaActivatePrettify() { prettifyButton.performClick(nil) }
+    var qaExportIsVisible: Bool { !exportButton.isHidden }
+    var qaExportIsEnabled: Bool { exportButton.isEnabled }
+    var qaExportAccessibilityLabel: String? { exportButton.accessibilityLabel() }
+    var qaExportAccessibilityHelp: String? { exportButton.accessibilityHelp() }
+    var qaExportFrame: NSRect { exportButton.frame }
+    func qaActivateExport() { _ = exportButton.accessibilityPerformPress() }
 #endif
 
     private func activatePathItem(_ url: URL) {

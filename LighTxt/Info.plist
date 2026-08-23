@@ -37,6 +37,8 @@
 				<string>sql</string>
 				<string>xml</string>
 				<string>csv</string>
+				<string>tsv</string>
+				<string>psv</string>
 				<string>yml</string>
 				<string>yaml</string>
 			</array>

@@ -20,7 +20,7 @@ public enum SyntaxFileType: String, CaseIterable, Sendable {
         case .markdown: ["md", "markdown"]
         case .sql: ["sql"]
         case .xml: ["xml"]
-        case .csv: ["csv"]
+        case .csv: ["csv", "tsv", "psv"]
         case .yaml: ["yaml", "yml"]
         case .parquet: ["parquet"]
         }

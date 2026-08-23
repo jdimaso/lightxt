@@ -30,10 +30,7 @@ final class JSONStructureController {
         memoryPressureSource = source
         source.setEventHandler { [weak self] in
             DispatchQueue.main.async { [weak self] in
-                guard let current = self?.index else { return }
-                DispatchQueue.global(qos: .utility).async {
-                    _ = try? current.purgeResidentMemory()
-                }
+                self?.purgeRebuildableResidentMemory()
             }
         }
         source.resume()
@@ -130,6 +127,23 @@ final class JSONStructureController {
         isBuilding = false
         latestProgress = nil
     }
+
+    /// Releases only the completed index's mapped source/index pages. The
+    /// index transparently falls back to its unlinked disk backing, so node
+    /// identities, child cursors, expansion state, and selection remain valid.
+    /// Repeated calls are harmless. In-flight child requests are deliberately
+    /// allowed to finish: their owner uses completion to clear per-node loading
+    /// state, and the disk-backed index remains safe to read during a purge.
+    func purgeRebuildableResidentMemory() {
+        guard let current = index else { return }
+        DispatchQueue.global(qos: .utility).async {
+            _ = try? current.purgeResidentMemory()
+        }
+    }
+
+    /// Disk-backed JSON indexes reactivate lazily on their next child read.
+    /// This explicit no-op keeps window lifecycle fan-out idempotent.
+    func reactivateAfterResidentPurge() {}
 
     /// Cancels every operation and releases the captured source snapshot plus
     /// all unlinked index storage, even when the logical edit revision did not

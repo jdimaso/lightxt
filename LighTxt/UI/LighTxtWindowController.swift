@@ -33,13 +33,43 @@ private nonisolated struct JSONSidebarPasteboardPayload: Sendable {
 
 @MainActor
 final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
+    private static let automaticReloadDefaultsKey = "LighTxt.AutomaticallyReloadCleanFiles"
     private var editorViewController: LighTxtEditorViewController
     private let preferredInitialContentSize: NSSize
     private var needsInitialExpandedFrame: Bool
     private var pendingNavigation: (
         url: URL,
+        openOptions: DocumentOpenOptions,
         completion: ((LighTxtDocument?, Error?) -> Void)?
     )?
+    private var externalFileMonitor: ExternalFileMonitor?
+    private var externalChangeDecisions = ExternalFileChangeDecisionTracker()
+    private var latestExternalFileChange: ExternalFileChange?
+    private var externalSaveObserver: NSObjectProtocol?
+    private var followsEndOfFile = false
+    private var pendingRestoredMetadata: RecoveryMetadata?
+    private var inactiveResidentPurgeWorkItem: DispatchWorkItem?
+#if LIGHTXT_RUNTIME_QA
+    private var runtimeQAInactivePurgeMinimumByteCount: Int64?
+    private var runtimeQAInactivePurgeDelay: TimeInterval?
+    private(set) var runtimeQAInactivePurgeAttemptCount = 0
+    private(set) var runtimeQAInactivePurgeAcceptedCount = 0
+    private(set) var runtimeQAResidentReactivationCount = 0
+    private(set) var runtimeQAExternalChangePresentationCount = 0
+#endif
+
+    var automaticallyReloadsCleanFiles: Bool {
+        get {
+            let defaults = UserDefaults.standard
+            if defaults.object(forKey: Self.automaticReloadDefaultsKey) == nil { return true }
+            return defaults.bool(forKey: Self.automaticReloadDefaultsKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: Self.automaticReloadDefaultsKey) }
+    }
+
+    var isFollowingEndOfFile: Bool { followsEndOfFile }
+    var canExportCurrentView: Bool { editorViewController.canExportCurrentView }
+    var isExportingCurrentView: Bool { editorViewController.isExportingCurrentView }
 
     init(document: LighTxtDocument) {
         let initialSize = Self.initialContentSize()
@@ -60,10 +90,10 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         window.sharingType = .readOnly
         window.minSize = NSSize(width: 1_000, height: 560)
         window.collectionBehavior = [.fullScreenPrimary, .managed]
-        // Each document owns an independently virtualized viewport. Automatic
-        // tabbing can leave a launch-time requested file hidden behind a
-        // restored untitled tab, so keep document windows explicit.
-        window.tabbingMode = .disallowed
+        // Keep each document independently virtualized while honoring the
+        // user's macOS preference for opening document windows as tabs.
+        window.tabbingIdentifier = "app.lightext.LighTxt.document"
+        window.tabbingMode = .automatic
         window.contentViewController = editorViewController
         // Do not attach AppKit frame autosave here. Older releases persisted a
         // 700 × 460 fitting frame and AppKit reapplied it every time the
@@ -72,6 +102,16 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
         window.delegate = self
         shouldCascadeWindows = true
+        pendingRestoredMetadata = document.session.takeRestoredRecoveryMetadata()
+        wireEditorLifecycleCallbacks()
+        externalSaveObserver = NotificationCenter.default.addObserver(
+            forName: .lighTxtSaveProgress,
+            object: document,
+            queue: .main
+        ) { [weak self] note in
+            guard note.userInfo?["sourceRebased"] as? Bool == true else { return }
+            MainActor.assumeIsolated { self?.documentDidFinishSaving() }
+        }
     }
 
     private static func initialContentSize() -> NSSize {
@@ -91,9 +131,18 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        inactiveResidentPurgeWorkItem?.cancel()
+        if let externalSaveObserver { NotificationCenter.default.removeObserver(externalSaveObserver) }
+    }
+
     override func showWindow(_ sender: Any?) {
         super.showWindow(sender)
-        if needsInitialExpandedFrame, let window {
+        configureExternalFileMonitoring()
+        if let metadata = pendingRestoredMetadata {
+            pendingRestoredMetadata = nil
+            applyRestoredMetadata(metadata)
+        } else if needsInitialExpandedFrame, let window {
             // NSDocument performs one final fitting-size pass when it first
             // shows a controller. Apply the expanded default after that pass,
             // exactly once, so subsequent deliberate resizing is preserved.
@@ -106,12 +155,109 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        inactiveResidentPurgeWorkItem?.cancel()
+        inactiveResidentPurgeWorkItem = nil
+#if LIGHTXT_RUNTIME_QA
+        let wasResidentPresentationPurged = editorViewController.qaIsResidentPresentationPurged
+#endif
+        editorViewController.reactivateAfterResidentPurge()
+#if LIGHTXT_RUNTIME_QA
+        if wasResidentPresentationPurged,
+           !editorViewController.qaIsResidentPresentationPurged {
+            runtimeQAResidentReactivationCount += 1
+        }
+#endif
+        if let document = document as? LighTxtDocument {
+            LighTxtDocumentController.active?.noteDocumentActivated(document)
+        }
         editorViewController.refreshChrome()
     }
 
+    func windowDidResignKey(_ notification: Notification) {
+        scheduleInactiveResidentPurge()
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        scheduleInactiveResidentPurge()
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        editorViewController.persistRecoveryMetadata()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        editorViewController.persistRecoveryMetadata()
+    }
+
     func windowWillClose(_ notification: Notification) {
+        inactiveResidentPurgeWorkItem?.cancel()
+        inactiveResidentPurgeWorkItem = nil
+        externalFileMonitor?.stop()
+        externalFileMonitor = nil
         editorViewController.prepareForWindowClose()
         LighTxtDocumentController.active?.documentWindowDidClose()
+    }
+
+    private func scheduleInactiveResidentPurge() {
+        inactiveResidentPurgeWorkItem?.cancel()
+        inactiveResidentPurgeWorkItem = nil
+        guard let document = document as? LighTxtDocument else { return }
+        let documentByteCount = document.session.byteCount
+#if LIGHTXT_RUNTIME_QA
+        let shouldSchedule = runtimeQAInactivePurgeMinimumByteCount.map {
+            documentByteCount >= $0
+        } ?? InactiveDocumentPurgePolicy.shouldSchedule(
+            documentByteCount: documentByteCount
+        )
+#else
+        let shouldSchedule = InactiveDocumentPurgePolicy.shouldSchedule(
+            documentByteCount: documentByteCount
+        )
+#endif
+        guard shouldSchedule else { return }
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.performInactiveResidentPurge()
+        }
+        inactiveResidentPurgeWorkItem = work
+#if LIGHTXT_RUNTIME_QA
+        let delay = runtimeQAInactivePurgeDelay ?? InactiveDocumentPurgePolicy.delay
+#else
+        let delay = InactiveDocumentPurgePolicy.delay
+#endif
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + delay,
+            execute: work
+        )
+    }
+
+    private func performInactiveResidentPurge() {
+        inactiveResidentPurgeWorkItem = nil
+        guard let window,
+              let document = document as? LighTxtDocument else { return }
+        let conditions = InactiveDocumentPurgeConditions(
+            isKeyWindow: window.isKeyWindow,
+            hasAttachedSheet: window.attachedSheet != nil,
+            hasPendingNavigation: pendingNavigation != nil,
+            isSaving: document.isSaving,
+            isBulkEditing: document.session.isBulkEditing,
+            isExporting: editorViewController.isExportingCurrentView
+        )
+        guard InactiveDocumentPurgePolicy.canPurge(conditions) else {
+            if conditions.isKeyWindow { return }
+            scheduleInactiveResidentPurge()
+            return
+        }
+        let accepted = editorViewController.purgeRebuildableResidentMemory()
+#if LIGHTXT_RUNTIME_QA
+        runtimeQAInactivePurgeAttemptCount += 1
+        if accepted, editorViewController.qaIsResidentPresentationPurged {
+            runtimeQAInactivePurgeAcceptedCount += 1
+        }
+#endif
+        if !accepted {
+            scheduleInactiveResidentPurge()
+        }
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -122,11 +268,61 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         return editorViewController.commitPendingPresentationEdit()
     }
 
+    private func applyRestoredMetadata(_ metadata: RecoveryMetadata) {
+        if let saved = metadata.window?.frame,
+           let window,
+           let frame = Self.safeRestoredFrame(saved, for: window) {
+            window.setFrame(frame, display: true)
+            needsInitialExpandedFrame = false
+        }
+        editorViewController.applyRestoredMetadata(metadata)
+    }
+
+    private static func safeRestoredFrame(
+        _ saved: RecoveryWindowMetadata.Frame,
+        for window: NSWindow
+    ) -> NSRect? {
+        let requested = NSRect(
+            x: CGFloat(saved.x),
+            y: CGFloat(saved.y),
+            width: CGFloat(saved.width),
+            height: CGFloat(saved.height)
+        )
+        guard requested.width.isFinite,
+              requested.height.isFinite,
+              requested.width > 0,
+              requested.height > 0 else { return nil }
+
+        let screens = NSScreen.screens
+        let intersecting = screens.max { lhs, rhs in
+            lhs.visibleFrame.intersection(requested).width
+                * lhs.visibleFrame.intersection(requested).height
+                < rhs.visibleFrame.intersection(requested).width
+                * rhs.visibleFrame.intersection(requested).height
+        }
+        let screen = intersecting.flatMap { candidate in
+            candidate.visibleFrame.intersects(requested) ? candidate : nil
+        } ?? NSScreen.main ?? screens.first
+        guard let visible = screen?.visibleFrame else { return requested }
+
+        let size = NSSize(
+            width: min(visible.width, max(window.minSize.width, requested.width)),
+            height: min(visible.height, max(window.minSize.height, requested.height))
+        )
+        return NSRect(
+            x: min(max(requested.minX, visible.minX), visible.maxX - size.width),
+            y: min(max(requested.minY, visible.minY), visible.maxY - size.height),
+            width: size.width,
+            height: size.height
+        )
+    }
+
     /// Reuses this NSDocument and NSWindow for an external Open request. The
     /// AppKit review is asynchronous so a large save completes before the old
     /// session is released, and Cancel leaves every bit of current UI intact.
     func navigateToDocument(
         at url: URL,
+        openOptions: DocumentOpenOptions = DocumentOpenOptions(),
         completion: ((LighTxtDocument?, Error?) -> Void)? = nil
     ) {
         guard pendingNavigation == nil,
@@ -138,7 +334,8 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         let target = url.standardizedFileURL
-        if document.fileURL?.standardizedFileURL == target {
+        if document.fileURL?.standardizedFileURL == target,
+           openOptions == DocumentOpenOptions() {
             window?.makeKeyAndOrderFront(nil)
             completion?(document, nil)
             return
@@ -159,7 +356,7 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
             return
         }
 
-        pendingNavigation = (target, completion)
+        pendingNavigation = (target, openOptions, completion)
         document.canClose(
             withDelegate: self,
             shouldClose: #selector(navigationReviewDidFinish(_:shouldClose:contextInfo:)),
@@ -186,8 +383,13 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         do {
             let type = try LighTxtDocumentController.active?.typeForContents(of: pending.url)
                 ?? "public.plain-text"
-            try document.replaceContentsForNavigation(with: pending.url, ofType: type)
+            try document.replaceContentsForNavigation(
+                with: pending.url,
+                ofType: type,
+                openOptions: pending.openOptions
+            )
             installFreshEditor(for: document)
+            restartExternalFileMonitoring()
             LighTxtDocumentController.active?.noteNewRecentDocumentURL(pending.url)
             pending.completion?(document, nil)
         } catch {
@@ -208,8 +410,320 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         window?.title = document.displayName
         window?.representedURL = document.fileURL
         window?.isDocumentEdited = false
+        wireEditorLifecycleCallbacks()
         replacement.focusCurrentPresentation()
     }
+
+    private func wireEditorLifecycleCallbacks() {
+        editorViewController.documentDirtyStateDidChange = { [weak self] isDirty in
+            self?.externalFileMonitor?.setDocumentIsClean(!isDirty)
+        }
+        editorViewController.documentErrorHandler = { [weak self] error in
+            self?.handleDocumentError(error) ?? false
+        }
+    }
+
+    private func configureExternalFileMonitoring() {
+        guard externalFileMonitor == nil,
+              let document = document as? LighTxtDocument,
+              let url = document.fileURL,
+              !document.session.isScratchDocument else { return }
+        do {
+            let monitor = try ExternalFileMonitor(
+                url: url,
+                deliveryQueue: .main,
+                documentIsClean: !document.session.isEdited,
+                onFailure: { [weak self] error in
+                    MainActor.assumeIsolated {
+                        self?.editorViewController.showStatusError(error.localizedDescription)
+                    }
+                },
+                onChange: { [weak self] change in
+                    MainActor.assumeIsolated { self?.receiveExternalFileChange(change) }
+                }
+            )
+            externalFileMonitor = monitor
+            monitor.start()
+        } catch {
+            editorViewController.showStatusError(error.localizedDescription)
+        }
+    }
+
+    private func restartExternalFileMonitoring() {
+        externalFileMonitor?.stop()
+        externalFileMonitor = nil
+        externalChangeDecisions.reset()
+        latestExternalFileChange = nil
+        editorViewController.dismissExternalChange()
+        configureExternalFileMonitoring()
+    }
+
+    private func documentDidFinishSaving() {
+        guard let url = (document as? LighTxtDocument)?.fileURL else { return }
+        if externalFileMonitor?.url.standardizedFileURL != url.standardizedFileURL {
+            restartExternalFileMonitoring()
+        } else {
+            _ = try? externalFileMonitor?.acknowledgeCurrentFileState()
+            externalFileMonitor?.setDocumentIsClean(true)
+            externalChangeDecisions.reset()
+            latestExternalFileChange = nil
+            editorViewController.dismissExternalChange()
+        }
+    }
+
+    private func receiveExternalFileChange(_ change: ExternalFileChange) {
+        guard let document = document as? LighTxtDocument else { return }
+        externalFileMonitor?.setDocumentIsClean(!document.session.isEdited)
+        let documentIsCurrentlyClean = !document.session.isEdited
+            && !document.isDocumentEdited
+        guard externalChangeDecisions.beginDecision(for: change) else { return }
+        latestExternalFileChange = change
+
+        // NSDocument also compares this token during ordinary AppKit activity.
+        // The piece-table fingerprint remains the authoritative save guard, so
+        // acknowledging the observed metadata here prevents a competing native
+        // OK-only warning without permitting an unsafe overwrite.
+        acknowledgeNSDocumentMetadata(for: change.current)
+
+        if change.current != nil,
+           change.documentWasClean,
+           documentIsCurrentlyClean,
+           (automaticallyReloadsCleanFiles || (followsEndOfFile && change.followEOFRange != nil)) {
+            if !performReloadFromDisk(
+                scrollToEnd: followsEndOfFile && change.followEOFRange != nil,
+                resolving: change
+            ) {
+                presentExternalFileDecision(change)
+            }
+            return
+        }
+
+        presentExternalFileDecision(change)
+    }
+
+    private func presentExternalFileDecision(_ change: ExternalFileChange) {
+#if LIGHTXT_RUNTIME_QA
+        runtimeQAExternalChangePresentationCount += 1
+#endif
+        editorViewController.presentExternalChange(
+            change,
+            onReload: { [weak self] in self?.requestReloadFromDisk(resolving: change) },
+            onKeep: { [weak self] in self?.declineExternalFileChange(change) },
+            onSaveAs: { [weak self] in
+                guard let document = self?.document as? LighTxtDocument else { return }
+                document.saveAs(nil)
+            }
+        )
+    }
+
+    private func declineExternalFileChange(_ change: ExternalFileChange) {
+        externalChangeDecisions.decline(change)
+        acknowledgeNSDocumentMetadata(for: change.current)
+        editorViewController.dismissExternalChange()
+        editorViewController.showStatus(
+            "Keeping the current version; a later disk change will be shown."
+        )
+    }
+
+    /// Returns true when an editor/session error was consumed by the unified
+    /// external-change workflow. In particular, `fileChangedExternally` must
+    /// never fall through to AppKit's generic OK-only error presentation.
+    private func handleDocumentError(_ error: Error) -> Bool {
+        guard let coreError = error as? LighTxtCoreError,
+              case .fileChangedExternally = coreError else { return false }
+        guard let document = document as? LighTxtDocument,
+              let url = document.fileURL else {
+            editorViewController.showStatusError(error.localizedDescription)
+            return true
+        }
+
+        do {
+            let current = try ExternalFileState.inspect(at: url)
+            let documentIsClean = !document.session.isEdited
+                && !document.isDocumentEdited
+            let change: ExternalFileChange
+            if let latestExternalFileChange,
+               latestExternalFileChange.current == current {
+                change = latestExternalFileChange
+            } else if let classified = ExternalFileChange.classify(
+                previous: externalFileMonitor?.baselineState,
+                current: current,
+                documentWasClean: documentIsClean
+            ) {
+                change = classified
+            } else {
+                // The monitor updates its baseline before delivering on the
+                // main queue. A failed editor read can therefore arrive in the
+                // narrow interval where both states already compare equal.
+                change = ExternalFileChange(
+                    previous: externalFileMonitor?.baselineState,
+                    current: current,
+                    kind: current == nil ? .removed : .modified,
+                    documentWasClean: documentIsClean
+                )
+            }
+            receiveExternalFileChange(change)
+        } catch {
+            editorViewController.showStatusError(error.localizedDescription)
+        }
+        return true
+    }
+
+    private func acknowledgeNSDocumentMetadata(for state: ExternalFileState?) {
+        guard let document = document as? LighTxtDocument else { return }
+        guard let state else {
+            document.fileModificationDate = nil
+            return
+        }
+        let seconds = TimeInterval(state.modificationTime.seconds)
+        let fractional = TimeInterval(state.modificationTime.nanoseconds) / 1_000_000_000
+        document.fileModificationDate = Date(timeIntervalSince1970: seconds + fractional)
+    }
+
+    func requestReloadFromDisk(resolving change: ExternalFileChange? = nil) {
+        guard let document = document as? LighTxtDocument,
+              document.fileURL != nil,
+              !document.isSaving,
+              !document.session.isBulkEditing else {
+            NSSound.beep()
+            return
+        }
+        guard document.session.isEdited || document.isDocumentEdited else {
+            _ = performReloadFromDisk(
+                scrollToEnd: followsEndOfFile,
+                resolving: change
+            )
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Reload and discard current edits?"
+        alert.informativeText = "The version on disk will replace the unsaved version currently shown in LighTxt."
+        alert.addButton(withTitle: "Reload")
+        alert.addButton(withTitle: "Cancel")
+        let finish: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            _ = self?.performReloadFromDisk(
+                scrollToEnd: self?.followsEndOfFile == true,
+                resolving: change
+            )
+        }
+        if let window { alert.beginSheetModal(for: window, completionHandler: finish) }
+        else { finish(alert.runModal()) }
+    }
+
+    @discardableResult
+    private func performReloadFromDisk(
+        scrollToEnd: Bool,
+        resolving change: ExternalFileChange? = nil
+    ) -> Bool {
+        guard let document = document as? LighTxtDocument,
+              let url = document.fileURL else { return false }
+        do {
+            let type = try LighTxtDocumentController.active?.typeForContents(of: url)
+                ?? document.fileType
+                ?? "public.plain-text"
+            try document.replaceContentsForNavigation(with: url, ofType: type)
+            installFreshEditor(for: document)
+            _ = try? externalFileMonitor?.acknowledgeCurrentFileState()
+            externalFileMonitor?.setDocumentIsClean(true)
+            if let change = change ?? latestExternalFileChange {
+                externalChangeDecisions.accept(change)
+            } else {
+                externalChangeDecisions.reset()
+            }
+            latestExternalFileChange = nil
+            editorViewController.dismissExternalChange()
+            if scrollToEnd { editorViewController.scrollToEndOfDocument() }
+            return true
+        } catch {
+            editorViewController.showStatusError(error.localizedDescription)
+            if !handleDocumentError(error) {
+                window?.presentError(error)
+            }
+            return false
+        }
+    }
+
+    func toggleFollowEndOfFile() {
+        followsEndOfFile.toggle()
+        if followsEndOfFile {
+            editorViewController.scrollToEndOfDocument()
+            editorViewController.showStatus("Following end of file")
+        } else {
+            editorViewController.showStatus("Stopped following end of file")
+        }
+    }
+
+    func toggleAutomaticReloadCleanFiles() {
+        automaticallyReloadsCleanFiles.toggle()
+        editorViewController.showStatus(
+            automaticallyReloadsCleanFiles
+                ? "Automatic reload enabled for clean files"
+                : "Automatic reload disabled"
+        )
+    }
+
+    func exportCurrentView() {
+        editorViewController.exportCurrentView()
+    }
+
+    func cancelExport() {
+        editorViewController.cancelExport()
+    }
+
+#if LIGHTXT_RUNTIME_QA
+    func qaConfigureInactiveResidentPurge(
+        minimumDocumentByteCount: Int64,
+        delay: TimeInterval
+    ) {
+        runtimeQAInactivePurgeMinimumByteCount = max(0, minimumDocumentByteCount)
+        runtimeQAInactivePurgeDelay = max(0, delay)
+        runtimeQAInactivePurgeAttemptCount = 0
+        runtimeQAInactivePurgeAcceptedCount = 0
+        runtimeQAResidentReactivationCount = 0
+    }
+
+    var qaIsResidentPresentationPurged: Bool {
+        editorViewController.qaIsResidentPresentationPurged
+    }
+
+    func qaPrepareCSVExportProbe(_ probe: @escaping () -> Void) {
+        editorViewController.qaPrepareCSVExportProbe(probe)
+    }
+
+    var qaIsExportControlReady: Bool {
+        editorViewController.qaIsExportControlReady
+    }
+
+    func qaActivateExportControl() {
+        editorViewController.qaActivateExportControl()
+    }
+
+    var qaExternalChangeBannerIsVisible: Bool {
+        editorViewController.qaExternalChangeBannerIsVisible
+    }
+
+    var qaExternalChangeActionTitles: (reload: String, keep: String) {
+        editorViewController.qaExternalChangeActionTitles
+    }
+
+    var qaExternalChangePresentationCount: Int {
+        runtimeQAExternalChangePresentationCount
+    }
+
+    func qaActivateDontReload() {
+        editorViewController.qaActivateDontReload()
+    }
+
+    func qaActivateExternalReload() {
+        editorViewController.qaActivateExternalReload()
+    }
+
+    func qaDeliverDocumentError(_ error: Error) {
+        editorViewController.qaDeliverDocumentError(error)
+    }
+#endif
 }
 
 @MainActor
@@ -220,6 +734,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private let session: LighTxtDocumentSession
     private let header = DocumentHeaderView()
     private let findBar = FindBarView()
+    private let externalChangeBanner = ExternalChangeBannerView()
     private let statusBar = DocumentStatusBar()
     private let structureSidebar = StructureSidebarView()
     private let workspaceSplitView = LighTxtWorkspaceSplitView()
@@ -234,7 +749,17 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private lazy var csvTableView: CSVTableView = {
         let table = CSVTableView()
         table.onStatusChange = { [weak self] text, busy in
-            self?.statusBar.setState(text, busy: busy)
+            guard let self else { return }
+            if !busy, let notice = self.session.readOnlyNotice {
+                self.statusBar.setState(
+                    notice,
+                    busy: self.session.isSourceEncodingValidationPending,
+                    isError: self.session.readOnlyNoticeIsError
+                )
+            } else {
+                self.statusBar.setState(text, busy: busy)
+            }
+            self.refreshExportAvailability()
         }
         table.onEditingRegistrationChange = { [weak self, weak table] isEditing in
             guard let self, let table, let document = self.document else { return }
@@ -250,16 +775,22 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private lazy var parquetTableView: ParquetTableView = {
         let table = ParquetTableView()
         table.onStatusChange = { [weak self] text, busy in
-            self?.statusBar.setState(text, busy: busy)
+            guard let self else { return }
+            self.statusBar.setState(text, busy: busy)
+            self.refreshExportAvailability()
         }
         return table
     }()
     private lazy var prettifiedViewportView = PrettifiedViewportView()
     private weak var installedPrimaryContentView: NSView?
     private var findHeightConstraint: NSLayoutConstraint!
+    private var externalBannerHeightConstraint: NSLayoutConstraint!
     private var structureIsVisible = false
     private var editModeStructureWasVisible = false
     private var presentationMode: DocumentPresentationMode = .edit
+#if LIGHTXT_RUNTIME_QA
+    private var runtimeQAExportProbe: (() -> Void)?
+#endif
     private var preferredStructureWidth: CGFloat = 340
     private var sidebarShowsSearchResults = false
     private var searchPreviewGeneration: UInt64 = 0
@@ -283,6 +814,8 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private var jsonPresentedGeneration: UInt64?
     private var pendingEditRevealRange: Range<Int64>?
     private var lastEditorViewport: Range<Int64> = 0..<0
+    private var lastSelectionRange: Range<Int64> = 0..<0
+    private var detachedEditorPresentationState: VirtualTextEditorPresentationState?
     private var observedSyntaxFileType: SyntaxFileType
     private var syntaxChangedDuringSave = false
     private var prettifyGeneration: UInt64 = 0
@@ -297,6 +830,10 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     /// after this callback. The chrome and split view do not depend on a JSON,
     /// Markdown, or CSV parser.
     var presentationModeDidChange: ((DocumentPresentationMode) -> Void)?
+    var documentDirtyStateDidChange: ((Bool) -> Void)?
+    /// Return true when the owning window consumed an error through a richer
+    /// document workflow and generic AppKit presentation must be skipped.
+    var documentErrorHandler: ((Error) -> Bool)?
 
     init(document: LighTxtDocument) {
         self.document = document
@@ -327,6 +864,49 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         (installedPrimaryContentView as? ParquetTableView)?.deactivate()
     }
 
+    /// Releases only state that can be rebuilt from the immutable snapshot or
+    /// file-backed indexes. User-visible projection state, undo history,
+    /// recovery data, selection, and unsaved bytes remain authoritative.
+    @discardableResult
+    func purgeRebuildableResidentMemory() -> Bool {
+        var accepted = editorView.purgeRebuildableResidentMemory()
+            || editorView.hasPurgedRebuildableResidentMemory
+        if let table = installedPrimaryContentView as? CSVTableView {
+            accepted = (table.purgeRebuildableResidentMemory()
+                || table.hasPurgedRebuildableResidentMemory) && accepted
+        }
+        if let table = installedPrimaryContentView as? ParquetTableView {
+            accepted = (table.purgeRebuildableResidentMemory()
+                || table.hasPurgedRebuildableResidentMemory) && accepted
+        }
+        guard accepted else { return false }
+
+        _ = session.purgeRebuildableResidentMemory()
+        if session.syntaxFileType == .json {
+            jsonRebuildWork?.cancel()
+            jsonRebuildWork = nil
+            if jsonStructureController.isBuilding {
+                jsonStructureController.cancel()
+            }
+            jsonStructureController.purgeRebuildableResidentMemory()
+        }
+        return true
+    }
+
+    /// Rehydrates only the prior bounded viewport/page and resumes lazy index
+    /// warmup. Every callee is idempotent, so ordinary window activation is
+    /// cheap when no inactive purge occurred.
+    func reactivateAfterResidentPurge() {
+        session.reactivateAfterResidentPurge()
+        editorView.reactivateAfterResidentPurge()
+        jsonStructureController.reactivateAfterResidentPurge()
+        (installedPrimaryContentView as? CSVTableView)?.reactivateAfterResidentPurge()
+        (installedPrimaryContentView as? ParquetTableView)?.reactivateAfterResidentPurge()
+        if presentationMode == .view, session.syntaxFileType == .json {
+            startJSONStructureIfNeeded()
+        }
+    }
+
     override func loadView() {
         let root = NSView()
         view = root
@@ -340,6 +920,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         editorView.editorDelegate = session
         header.onFind = { [weak self] in self?.showFindPanel(nil) }
         header.onStructure = { [weak self] in self?.toggleStructure(nil) }
+        header.onExport = { [weak self] in self?.exportCurrentView() }
         header.onOpenFolder = { [weak self] url in
             let workspace = NSWorkspace.shared
             guard !workspace.open(url) else { return }
@@ -383,7 +964,9 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
 
     func refreshChrome() {
         guard let document else { return }
-        let title = document.fileURL?.lastPathComponent ?? "Untitled"
+        let title = document.fileURL?.lastPathComponent
+            ?? session.originalSourceURL.map { "\($0.lastPathComponent) — UTF-8 Copy" }
+            ?? "Untitled"
         let isEdited = session.isEdited || document.isDocumentEdited
         header.update(
             fileURL: document.fileURL,
@@ -395,25 +978,85 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             structureAvailable: canToggleStructure
         )
         let textDocument = !session.isReadOnly
-        header.setEditingAvailable(textDocument)
-        header.setFindAvailable(textDocument)
+        header.setEditingAvailable(
+            textDocument,
+            unavailableReason: session.readOnlyNotice
+        )
+        header.setFindAvailable(
+            textDocument,
+            unavailableReason: session.hasUnresolvedSourceEncoding
+                ? session.readOnlyNotice.map {
+                    "\($0) Find remains available after reopening with an explicit encoding."
+                }
+                : session.readOnlyNotice
+        )
         header.setPrettifyAvailable(
             textDocument
                 && presentationMode == .edit
                 && (session.syntaxFileType == .json || session.syntaxFileType == .yaml)
         )
         header.setPrettifyOn(isPrettifyPreviewActive)
+        refreshExportAvailability()
         view.window?.title = title
         view.window?.representedURL = document.fileURL
         view.window?.isDocumentEdited = isEdited
+        if let notice = session.readOnlyNotice {
+            statusBar.setState(
+                notice,
+                busy: session.isSourceEncodingValidationPending,
+                isError: session.readOnlyNoticeIsError
+            )
+        }
+    }
+
+    func showStatus(_ text: String) {
+        statusBar.setState(text, busy: false)
+    }
+
+    func showStatusError(_ text: String) {
+        statusBar.setState(text, busy: false, isError: true)
+    }
+
+    func scrollToEndOfDocument() {
+        let end = session.byteCount
+        let lower = max(0, end - 1)
+        if presentationMode != .edit {
+            setPresentationMode(.edit, notifyIntegration: true)
+        }
+        editorView.scrollTo(byteRange: lower..<end)
+    }
+
+    func presentExternalChange(
+        _ change: ExternalFileChange,
+        onReload: @escaping () -> Void,
+        onKeep: @escaping () -> Void,
+        onSaveAs: @escaping () -> Void
+    ) {
+        externalChangeBanner.onReload = onReload
+        externalChangeBanner.onKeep = onKeep
+        externalChangeBanner.onSaveAs = onSaveAs
+        externalChangeBanner.present(change)
+        externalBannerHeightConstraint.constant = 48
+        view.needsLayout = true
+        statusBar.setState("File changed on disk", busy: false, isError: true)
+    }
+
+    func dismissExternalChange() {
+        externalChangeBanner.isHidden = true
+        externalChangeBanner.onReload = nil
+        externalChangeBanner.onKeep = nil
+        externalChangeBanner.onSaveAs = nil
+        externalBannerHeightConstraint.constant = 0
+        view.needsLayout = true
     }
 
     private func configureLayout() {
-        [header, findBar, workspaceSplitView, statusBar].forEach {
+        [header, findBar, externalChangeBanner, workspaceSplitView, statusBar].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview($0)
         }
         findHeightConstraint = findBar.heightAnchor.constraint(equalToConstant: 0)
+        externalBannerHeightConstraint = externalChangeBanner.heightAnchor.constraint(equalToConstant: 0)
 
         editorView.translatesAutoresizingMaskIntoConstraints = false
         primaryContentHost.addSubview(editorView)
@@ -448,6 +1091,11 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             findBar.topAnchor.constraint(equalTo: header.bottomAnchor),
             findHeightConstraint,
 
+            externalChangeBanner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            externalChangeBanner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            externalChangeBanner.topAnchor.constraint(equalTo: findBar.bottomAnchor),
+            externalBannerHeightConstraint,
+
             statusBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -455,15 +1103,17 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
 
             workspaceSplitView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             workspaceSplitView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            workspaceSplitView.topAnchor.constraint(equalTo: findBar.bottomAnchor),
+            workspaceSplitView.topAnchor.constraint(equalTo: externalChangeBanner.bottomAnchor),
             workspaceSplitView.bottomAnchor.constraint(equalTo: statusBar.topAnchor)
         ])
         findBar.isHidden = true
+        externalChangeBanner.isHidden = true
     }
 
     private func installSessionCallbacks() {
         session.callbacks.documentChanged = { [weak self] byteCount, edited in
             guard let self, let document = self.document else { return }
+            self.documentDirtyStateDidChange?(edited)
             if self.isPrettifyPreviewActive {
                 self.endPrettifyPreview(focusEditor: false)
             }
@@ -499,19 +1149,32 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             if self.presentationMode == .edit {
                 self.statusBar.updateByteWindow(range, totalByteCount: total)
             }
+            self.persistRecoveryMetadata()
         }
         session.callbacks.selectionChanged = { [weak self] range, line, column in
+            self?.lastSelectionRange = range
             self?.statusBar.updatePosition(
                 line: line,
                 column: column,
                 selectionByteCount: Int64(range.count)
             )
+            self?.persistRecoveryMetadata()
         }
         session.callbacks.statusChanged = { [weak self] text, busy, isError in
-            self?.statusBar.setState(text, busy: busy, isError: isError)
-            if self?.findBar.isHidden == false {
-                self?.findBar.setStatus(text, isError: isError)
+            guard let self else { return }
+            if !busy, let notice = self.session.readOnlyNotice {
+                self.statusBar.setState(notice, busy: false, isError: true)
+            } else {
+                self.statusBar.setState(text, busy: busy, isError: isError)
             }
+            if self.findBar.isHidden == false {
+                self.findBar.setStatus(text, isError: isError)
+            }
+        }
+        session.callbacks.accessStateChanged = { [weak self] in
+            guard let self else { return }
+            self.refreshChrome()
+            (self.installedPrimaryContentView as? CSVTableView)?.refreshDocumentAccessState()
         }
         session.callbacks.matchChanged = { [weak self] match in
             guard let self, let match else { return }
@@ -579,8 +1242,10 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             )
         }
         session.callbacks.error = { [weak self] error in
-            self?.statusBar.setState(error.localizedDescription, busy: false, isError: true)
-            if let window = self?.view.window {
+            guard let self else { return }
+            if self.documentErrorHandler?(error) == true { return }
+            self.statusBar.setState(error.localizedDescription, busy: false, isError: true)
+            if let window = self.view.window {
                 window.presentError(error)
             } else {
                 NSApp.presentError(error)
@@ -2014,6 +2679,9 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     /// the editor restores the default byte-window editing surface.
     func installPrimaryContentView(_ contentView: NSView) {
         guard installedPrimaryContentView !== contentView else { return }
+        if installedPrimaryContentView === editorView, contentView !== editorView {
+            detachedEditorPresentationState = editorView.capturePresentationState()
+        }
         (installedPrimaryContentView as? MarkdownPreviewView)?.deactivate()
         (installedPrimaryContentView as? CSVTableView)?.deactivate()
         (installedPrimaryContentView as? ParquetTableView)?.deactivate()
@@ -2027,12 +2695,61 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             contentView.topAnchor.constraint(equalTo: primaryContentHost.topAnchor),
             contentView.bottomAnchor.constraint(equalTo: primaryContentHost.bottomAnchor)
         ])
+        if contentView === editorView, let state = detachedEditorPresentationState {
+            detachedEditorPresentationState = nil
+            editorView.restorePresentationState(state)
+        }
     }
 
 #if LIGHTXT_RUNTIME_QA
     var qaIsPrettifyPreviewActive: Bool { isPrettifyPreviewActive }
     var qaPrettifyPreviewText: String { prettifiedViewportView.qaText }
     var qaPrettifyPreviewStatus: String { prettifiedViewportView.qaStatus }
+    var qaIsResidentPresentationPurged: Bool {
+        guard editorView.hasPurgedRebuildableResidentMemory else { return false }
+        if let table = installedPrimaryContentView as? CSVTableView {
+            return table.hasPurgedRebuildableResidentMemory
+        }
+        if let table = installedPrimaryContentView as? ParquetTableView {
+            return table.hasPurgedRebuildableResidentMemory
+        }
+        return true
+    }
+
+    func qaPrepareCSVExportProbe(_ probe: @escaping () -> Void) {
+        runtimeQAExportProbe = probe
+        setPresentationMode(.view, notifyIntegration: true)
+    }
+
+    var qaIsExportControlReady: Bool {
+        header.qaExportIsVisible
+            && header.qaExportIsEnabled
+            && canExportCurrentView
+    }
+
+    func qaActivateExportControl() {
+        header.qaActivateExport()
+    }
+
+    var qaExternalChangeBannerIsVisible: Bool {
+        !externalChangeBanner.isHidden && externalBannerHeightConstraint.constant > 0
+    }
+
+    var qaExternalChangeActionTitles: (reload: String, keep: String) {
+        (externalChangeBanner.qaReloadButtonTitle, externalChangeBanner.qaKeepButtonTitle)
+    }
+
+    func qaActivateDontReload() {
+        externalChangeBanner.qaActivateKeep()
+    }
+
+    func qaActivateExternalReload() {
+        externalChangeBanner.qaActivateReload()
+    }
+
+    func qaDeliverDocumentError(_ error: Error) {
+        session.callbacks.error?(error)
+    }
 #endif
 
     func restoreEditorAsPrimaryContent() {
@@ -2188,12 +2905,189 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             }
         }
         refreshChrome()
+        persistRecoveryMetadata()
         if notifyIntegration { presentationModeDidChange?(mode) }
+    }
+
+    func currentRecoveryMetadata() -> RecoveryMetadata {
+        let windowFrame = view.window?.frame
+        let frame = windowFrame.map {
+            RecoveryWindowMetadata.Frame(
+                x: Double($0.origin.x),
+                y: Double($0.origin.y),
+                width: Double($0.width),
+                height: Double($0.height)
+            )
+        }
+        var values: [String: String] = [
+            "delimiter": String(session.delimitedTextDelimiter.rawValue),
+            "searchQuery": session.searchQuery,
+            "searchRegex": session.searchUsesRegularExpression ? "true" : "false",
+            "searchCaseSensitive": session.searchIsCaseSensitive ? "true" : "false",
+            "searchWholeWords": session.searchMatchesWholeWords ? "true" : "false",
+            "untitled": document?.fileURL == nil ? "true" : "false",
+        ]
+        if values["searchQuery"]?.isEmpty == true { values.removeValue(forKey: "searchQuery") }
+        return RecoveryMetadata(
+            window: RecoveryWindowMetadata(
+                frame: frame,
+                selectionLowerByteOffset: lastSelectionRange.lowerBound,
+                selectionUpperByteOffset: lastSelectionRange.upperBound,
+                viewportByteOffset: lastEditorViewport.lowerBound,
+                presentationMode: String(presentationMode.rawValue),
+                structureSidebarVisible: structureIsVisible,
+                structureSidebarWidth: Double(preferredStructureWidth)
+            ),
+            task: RecoveryTaskMetadata(
+                displayName: document?.fileURL?.lastPathComponent
+                    ?? session.originalSourceURL?.lastPathComponent,
+                fileType: session.syntaxFileType.rawValue,
+                values: values
+            )
+        )
+    }
+
+    func applyRestoredMetadata(_ metadata: RecoveryMetadata) {
+        let restoredQuery = metadata.task?.values["searchQuery"] ?? ""
+        let restoredRegex = metadata.task?.values["searchRegex"] == "true"
+        let restoredCaseSensitivity = metadata.task?.values["searchCaseSensitive"] == "true"
+        let restoredWholeWords = metadata.task?.values["searchWholeWords"] == "true"
+        findBar.restoreSearchState(
+            query: restoredQuery,
+            regularExpression: restoredRegex,
+            caseSensitive: restoredCaseSensitivity,
+            wholeWords: restoredWholeWords
+        )
+        if let raw = metadata.task?.values["delimiter"],
+           let byte = UInt8(raw),
+           let delimiter = DelimitedTextDelimiter(rawValue: byte) {
+            session.setDelimitedTextDelimiter(delimiter)
+        }
+        if !restoredQuery.isEmpty {
+            session.configureSearch(
+                query: restoredQuery,
+                regularExpression: restoredRegex,
+                caseSensitive: restoredCaseSensitivity,
+                wholeWords: restoredWholeWords
+            )
+        }
+        if let width = metadata.window?.structureSidebarWidth,
+           (260...560).contains(width) {
+            preferredStructureWidth = CGFloat(width)
+        }
+        if let raw = metadata.window?.presentationMode.flatMap(Int.init),
+           let mode = DocumentPresentationMode(rawValue: raw) {
+            setPresentationMode(mode, notifyIntegration: false)
+        }
+        if metadata.window?.structureSidebarVisible == true, canToggleStructure {
+            setStructureVisible(true)
+        }
+        let selectionLower = min(
+            max(0, metadata.window?.selectionLowerByteOffset ?? 0),
+            session.byteCount
+        )
+        let selectionUpper = min(
+            max(selectionLower, metadata.window?.selectionUpperByteOffset ?? selectionLower),
+            session.byteCount
+        )
+        let selection = selectionLower..<selectionUpper
+        let viewport = min(
+            max(0, metadata.window?.viewportByteOffset ?? selectionLower),
+            session.byteCount
+        )
+        lastSelectionRange = selection
+        lastEditorViewport = viewport..<viewport
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if selection.isEmpty {
+                self.editorView.scrollTo(byteRange: viewport..<viewport, select: false)
+            } else {
+                self.editorView.scrollTo(byteRange: selection, select: true)
+            }
+        }
+        persistRecoveryMetadata()
+    }
+
+    func persistRecoveryMetadata() {
+        session.updateRecoveryMetadata(currentRecoveryMetadata())
     }
 
     @discardableResult
     func commitPendingPresentationEdit() -> Bool {
         (installedPrimaryContentView as? CSVTableView)?.commitPendingEdit() ?? true
+    }
+
+    var canExportCurrentView: Bool {
+        guard presentationMode == .view else { return false }
+        if let table = installedPrimaryContentView as? CSVTableView {
+            return table.canExportCurrentView
+        }
+        if let table = installedPrimaryContentView as? ParquetTableView {
+            return table.canExportCurrentView
+        }
+        return false
+    }
+
+    var isExportingCurrentView: Bool {
+        if let table = installedPrimaryContentView as? CSVTableView {
+            return table.isExporting
+        }
+        if let table = installedPrimaryContentView as? ParquetTableView {
+            return table.isExporting
+        }
+        return false
+    }
+
+    private func refreshExportAvailability() {
+        let tableVisible = presentationMode == .view
+            && (session.syntaxFileType == .csv || session.syntaxFileType == .parquet)
+        let unavailableReason: String?
+        if let notice = session.readOnlyNotice {
+            unavailableReason = notice
+        } else if isExportingCurrentView {
+            unavailableReason = "An export is already in progress"
+        } else {
+            unavailableReason = "Finish the current table operation before exporting"
+        }
+        header.setExportAvailable(
+            tableVisible && canExportCurrentView,
+            visible: tableVisible,
+            unavailableReason: unavailableReason
+        )
+    }
+
+    func exportCurrentView() {
+        guard presentationMode == .view else {
+            NSSound.beep()
+            return
+        }
+        if let table = installedPrimaryContentView as? CSVTableView {
+#if LIGHTXT_RUNTIME_QA
+            if table.canExportCurrentView, let runtimeQAExportProbe {
+                runtimeQAExportProbe()
+                return
+            }
+#endif
+            table.exportCurrentView()
+        } else if let table = installedPrimaryContentView as? ParquetTableView {
+#if LIGHTXT_RUNTIME_QA
+            if table.canExportCurrentView, let runtimeQAExportProbe {
+                runtimeQAExportProbe()
+                return
+            }
+#endif
+            table.exportCurrentView()
+        } else {
+            NSSound.beep()
+        }
+    }
+
+    func cancelExport() {
+        if let table = installedPrimaryContentView as? CSVTableView {
+            table.cancelExport()
+        } else if let table = installedPrimaryContentView as? ParquetTableView {
+            table.cancelExport()
+        }
     }
 
     private func prepareMarkdownPreview() {
@@ -2207,6 +3101,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
 
     private func prepareCSVTable() {
         installPrimaryContentView(csvTableView)
+        csvTableView.setDelimiter(session.delimitedTextDelimiter, reload: false)
         if csvTableView.editorDelegate !== session {
             csvTableView.editorDelegate = session
         } else {

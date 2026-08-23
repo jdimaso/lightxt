@@ -112,24 +112,49 @@ struct PrettifyLifecycleRuntimeQA {
         lightCapture: URL,
         darkCapture: URL
     ) throws {
-        let rows = (0..<180).map { #"{"id":\#($0),"marker":"target-\#($0)"}"# }
-        let bytes = Data(("[" + rows.joined(separator: ",") + "]").utf8)
+        let padding = String(repeating: "x", count: 160)
+        let rows = (0..<4_000).map {
+            #"{"id":\#($0),"padding":"\#(padding)","marker":"target-\#($0)"}"#
+        }
+        let bytes = Data(("[\n" + rows.joined(separator: ",\n") + "\n]").utf8)
         let delegate = QAEditorDelegate(bytes: bytes, revision: 42)
         let editor = VirtualTextEditorView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 620))
         editor.editorDelegate = delegate
         let hostView = NSView(frame: editor.frame)
         install(editor, in: hostView)
-        let window = host(hostView, size: hostView.frame.size, appearance: .aqua)
+        let pinnedHostSize = hostView.frame.size
+        let window = host(hostView, size: pinnedHostSize, appearance: .aqua)
         defer { window.close() }
-        try wait(until: { (try? editor.presentationSnapshot().data.count) == bytes.count })
+        try wait(until: {
+            guard let count = try? editor.presentationSnapshot().data.count else { return false }
+            return count > 0 && count <= VirtualTextEditorView.maximumViewportBytes
+        })
 
-        let needle = Data("target-120".utf8)
+        let needle = Data("target-3000".utf8)
         let local = try XCTUnwrap(bytes.range(of: needle), "Missing selection fixture")
         let selected = Int64(local.lowerBound)..<Int64(local.upperBound)
         editor.scrollTo(byteRange: selected)
         try wait(until: { editor.selectedGlobalByteRange == selected })
+        settle(window)
+        try wait(until: { editor.selectedGlobalByteRange == selected })
+        try assertHostSize(hostView, window: window, expected: pinnedHostSize, stage: "source")
         let selectionBefore = editor.selectedGlobalByteRange
-        let visibleBefore = editor.visibleGlobalByteRange
+        let presentationBefore = editor.capturePresentationState()
+        let geometryBefore = editorGeometry(editor)
+        guard let sourceScrollView = descendant(of: editor, as: NSScrollView.self) else {
+            throw QAError.failed("Could not inspect source editor geometry")
+        }
+        let physicalHorizontalBefore = sourceScrollView.contentView.bounds.minX
+        guard presentationBefore.anchorByteOffset > 0,
+              presentationBefore.horizontalOffset > 100,
+              abs(physicalHorizontalBefore - presentationBefore.horizontalOffset) < 0.5 else {
+            throw QAError.failed(
+                "Prettify fixture did not exercise off-origin vertical and horizontal state: "
+                    + "anchor=\(presentationBefore.anchorByteOffset), "
+                    + "remembered horizontal=\(presentationBefore.horizontalOffset), "
+                    + "physical horizontal=\(physicalHorizontalBefore)"
+            )
+        }
         let revisionBefore = delegate.revision
         let dirtyBefore = delegate.isDirty
         let undoBefore = delegate.undoCount
@@ -148,6 +173,7 @@ struct PrettifyLifecycleRuntimeQA {
         install(preview, in: hostView)
         preview.show(formatted)
         settle(window)
+        try assertHostSize(hostView, window: window, expected: pinnedHostSize, stage: "preview")
         guard !preview.qaIsEditable,
               preview.qaIsSelectable,
               preview.qaAccessibilityLabel == "Read-only prettified viewport",
@@ -165,15 +191,94 @@ struct PrettifyLifecycleRuntimeQA {
         try capture(hostView, to: darkCapture)
 
         install(editor, in: hostView)
+        editor.restorePresentationState(presentationBefore)
         settle(window)
+        try assertHostSize(hostView, window: window, expected: pinnedHostSize, stage: "restored source")
+        let presentationAfter = editor.capturePresentationState()
+        let geometryAfter = editorGeometry(editor)
+        guard let restoredScrollView = descendant(of: editor, as: NSScrollView.self),
+              let restoredTextView = descendant(of: editor, as: NSTextView.self) else {
+            throw QAError.failed("Could not inspect restored editor geometry")
+        }
+        let restoredLeadingX = -(restoredScrollView.verticalRulerView?.ruleThickness ?? 0)
+        let restoredMaximumX = restoredLeadingX + max(
+            0,
+            restoredTextView.frame.width - restoredScrollView.contentView.bounds.width
+        )
+        let expectedHorizontalOffset = min(
+            max(restoredLeadingX, presentationBefore.horizontalOffset),
+            restoredMaximumX
+        )
         guard delegate.revision == revisionBefore,
               delegate.isDirty == dirtyBefore,
               delegate.undoCount == undoBefore,
               editor.selectedGlobalByteRange == selectionBefore,
-              editor.visibleGlobalByteRange == visibleBefore else {
+              editor.visibleGlobalByteRange.lowerBound == presentationBefore.anchorByteOffset,
+              abs(expectedHorizontalOffset - presentationBefore.horizontalOffset) < 0.5,
+              abs(
+                presentationAfter.horizontalOffset
+                    - expectedHorizontalOffset
+              ) < 0.5,
+              abs(
+                restoredScrollView.contentView.bounds.minX
+                    - presentationAfter.horizontalOffset
+              ) < 0.5 else {
             throw QAError.failed(
-                "Toggle changed source state or editor geometry: selection \(selectionBefore) -> \(editor.selectedGlobalByteRange), "
-                    + "visible \(visibleBefore) -> \(editor.visibleGlobalByteRange)"
+                "Toggle changed source state or editor geometry: "
+                    + "revision \(revisionBefore) -> \(delegate.revision), "
+                    + "dirty \(dirtyBefore) -> \(delegate.isDirty), "
+                    + "undo \(undoBefore) -> \(delegate.undoCount), "
+                    + "selection \(selectionBefore) -> \(editor.selectedGlobalByteRange), "
+                    + "anchor \(presentationBefore.anchorByteOffset) -> \(editor.visibleGlobalByteRange), "
+                    + "horizontal \(presentationBefore.horizontalOffset) -> \(presentationAfter.horizontalOffset) "
+                    + "(expected clamped \(expectedHorizontalOffset)), "
+                    + "geometry [\(geometryBefore)] -> [\(geometryAfter)]"
+            )
+        }
+    }
+
+    private static func editorGeometry(_ editor: NSView) -> String {
+        guard let scrollView = descendant(of: editor, as: NSScrollView.self),
+              let textView = descendant(of: editor, as: NSTextView.self) else {
+            return "unavailable"
+        }
+        let usedWidth: CGFloat
+        if let manager = textView.layoutManager,
+           let container = textView.textContainer {
+            manager.ensureLayout(for: container)
+            usedWidth = manager.usedRect(for: container).width
+        } else {
+            usedWidth = -1
+        }
+        return "clipX=\(scrollView.contentView.bounds.minX), "
+            + "clipW=\(scrollView.contentView.bounds.width), "
+            + "contentW=\(scrollView.contentSize.width), "
+            + "frameW=\(textView.frame.width), minW=\(textView.minSize.width), "
+            + "usedW=\(usedWidth)"
+    }
+
+    private static func descendant<T: NSView>(of root: NSView, as type: T.Type) -> T? {
+        if let match = root as? T { return match }
+        for child in root.subviews {
+            if let match = descendant(of: child, as: type) { return match }
+        }
+        return nil
+    }
+
+    private static func assertHostSize(
+        _ hostView: NSView,
+        window: NSWindow,
+        expected: NSSize,
+        stage: String
+    ) throws {
+        let contentSize = window.contentView?.bounds.size ?? .zero
+        guard abs(hostView.bounds.width - expected.width) < 0.5,
+              abs(hostView.bounds.height - expected.height) < 0.5,
+              abs(contentSize.width - expected.width) < 0.5,
+              abs(contentSize.height - expected.height) < 0.5 else {
+            throw QAError.failed(
+                "Prettify QA host resized during \(stage): "
+                    + "expected \(expected), host \(hostView.bounds.size), window \(contentSize)"
             )
         }
     }
@@ -195,6 +300,13 @@ struct PrettifyLifecycleRuntimeQA {
         )
         window.appearance = NSAppearance(named: appearance)
         window.contentView = view
+        window.setContentSize(size)
+        window.contentMinSize = size
+        window.contentMaxSize = size
+        NSLayoutConstraint.activate([
+            view.widthAnchor.constraint(equalToConstant: size.width),
+            view.heightAnchor.constraint(equalToConstant: size.height),
+        ])
         window.layoutIfNeeded()
         return window
     }

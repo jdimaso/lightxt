@@ -43,6 +43,8 @@ struct CSVSessionMutationRuntimeQA {
         )
         defer { try? FileManager.default.removeItem(at: directory) }
 
+        try proveAutomaticOpenResolution(in: directory)
+        try proveUntitledExtensionInference()
         try proveSuccessfulTransaction(in: directory)
         try proveStaleSnapshotIsRejected(in: directory)
         try proveLargeBatchCancellation(in: directory)
@@ -53,6 +55,67 @@ struct CSVSessionMutationRuntimeQA {
                 + "cancel and stale snapshot publish nothing; success is one undo/redo step "
                 + "with one final document event; close drops late completion"
         )
+    }
+
+    private static func proveAutomaticOpenResolution(in directory: URL) throws {
+        let csvURL = directory.appendingPathComponent("yaml-like.CSV")
+        let csv = [
+            "name,description,network",
+            "one,service: special,Clinic & Rehabilitation",
+            "two,service: advanced,Research & Development",
+            "three,service: routine,Hospital & Medical Center",
+        ].joined(separator: "\n") + "\n"
+        try Data(csv.utf8).write(to: csvURL)
+        let csvSession = try LighTxtDocumentSession(opening: csvURL)
+        guard csvSession.syntaxFileType == .csv,
+              csvSession.delimitedTextDelimiter == .comma else {
+            throw QAError.failed("Known CSV suffix did not survive YAML-like sampled content")
+        }
+        csvSession.prepareForClose()
+
+        let tsvURL = directory.appendingPathComponent("comma-rich.tsv")
+        let tsv = [
+            "id\tLast, First, Credential",
+            "1\tSmith, Ada, MD",
+            "2\tJones, Grace, PhD",
+            "3\tDoe, Lin, RN",
+        ].joined(separator: "\n") + "\n"
+        try Data(tsv.utf8).write(to: tsvURL)
+        let tsvSession = try LighTxtDocumentSession(opening: tsvURL)
+        guard tsvSession.syntaxFileType == .csv,
+              tsvSession.delimitedTextDelimiter == .tab else {
+            throw QAError.failed("Known TSV suffix did not preserve its tab dialect")
+        }
+        tsvSession.prepareForClose()
+    }
+
+    private static func proveUntitledExtensionInference() throws {
+        let json = LighTxtDocumentSession(memoryOnlyEmptyDocument: ())
+        try json.editorReplaceBytes(
+            in: 0..<0,
+            with: Data(#"{"name":"LighTxt","items":[1,2,3]}"#.utf8)
+        )
+        guard json.prepareUntitledSaveSuggestion() == "json" else {
+            throw QAError.failed("Untitled JSON did not infer the .json extension")
+        }
+        json.prepareForClose()
+
+        let pipe = LighTxtDocumentSession(memoryOnlyEmptyDocument: ())
+        try pipe.editorReplaceBytes(
+            in: 0..<0,
+            with: Data("name|age\nAda|36\nLin|29\nGrace|85\n".utf8)
+        )
+        guard pipe.prepareUntitledSaveSuggestion() == "psv",
+              pipe.delimitedTextDelimiter == .pipe else {
+            throw QAError.failed("Untitled pipe-delimited data did not infer the .psv extension")
+        }
+        pipe.prepareForClose()
+
+        let empty = LighTxtDocumentSession(memoryOnlyEmptyDocument: ())
+        guard empty.prepareUntitledSaveSuggestion() == "txt" else {
+            throw QAError.failed("Empty untitled documents no longer default to .txt")
+        }
+        empty.prepareForClose()
     }
 
     private static func proveSuccessfulTransaction(in directory: URL) throws {
@@ -141,6 +204,10 @@ struct CSVSessionMutationRuntimeQA {
         let url = directory.appendingPathComponent("cancel.csv")
         try original.write(to: url)
         let session = try LighTxtDocumentSession(opening: url)
+        try wait(
+            until: { session.isSourceTextValidated },
+            failure: "Large cancellation fixture did not finish UTF-8 validation"
+        )
         let snapshot = try session.editorSnapshot()
         let edits = largeReplacementBatch()
         var events: [(Int64, Bool)] = []
@@ -150,18 +217,31 @@ struct CSVSessionMutationRuntimeQA {
         session.editorApplyCSVRowEdits(edits, replacing: snapshot) { completion = $0 }
         session.editorCancelCSVMutation()
         try wait(until: { completion != nil }, failure: "Cancelled row mutation did not finish")
-        guard case .failure(let error)? = completion,
-              error is CancellationError,
+        let finalSnapshot = try session.engine.snapshot()
+        let finalData = try finalSnapshot.data(in: 0..<finalSnapshot.byteCount)
+        let wasCancelled: Bool
+        if case .failure(let error)? = completion {
+            wasCancelled = error is CancellationError
+        } else {
+            wasCancelled = false
+        }
+        guard wasCancelled,
               !session.isBulkEditing,
               !session.isEdited,
               !session.engine.canUndo,
               !session.engine.canRedo,
-              try session.engine.snapshot().revision == snapshot.revision,
-              try session.engine.snapshot().data(in: 0..<snapshot.byteCount) == original,
+              finalSnapshot.revision == snapshot.revision,
+              finalData == original,
               events.count == 2,
               events.first?.1 == true,
               events.last?.1 == false else {
-            throw QAError.failed("Cancelling a large row batch published partial state")
+            throw QAError.failed(
+                "Cancelling a large row batch published partial state: "
+                    + "cancelled=\(wasCancelled), bulk=\(session.isBulkEditing), "
+                    + "edited=\(session.isEdited), undo=\(session.engine.canUndo), "
+                    + "redo=\(session.engine.canRedo), revision=\(finalSnapshot.revision)/\(snapshot.revision), "
+                    + "bytesMatch=\(finalData == original), events=\(events)"
+            )
         }
         session.prepareForClose()
     }
@@ -171,6 +251,10 @@ struct CSVSessionMutationRuntimeQA {
         let url = directory.appendingPathComponent("close.csv")
         try original.write(to: url)
         let session = try LighTxtDocumentSession(opening: url)
+        try wait(
+            until: { session.isSourceTextValidated },
+            failure: "Large close fixture did not finish UTF-8 validation"
+        )
         let snapshot = try session.editorSnapshot()
         var completionCalled = false
 

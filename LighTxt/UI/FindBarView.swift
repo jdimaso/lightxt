@@ -108,6 +108,23 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
         statusLabel.toolTip = text
     }
 
+    /// Restores persisted controls without feeding the values back through the
+    /// delegate while the owning session is itself being restored.
+    func restoreSearchState(
+        query: String,
+        regularExpression: Bool,
+        caseSensitive: Bool,
+        wholeWords: Bool
+    ) {
+        pendingChange?.cancel()
+        pendingChange = nil
+        searchField.stringValue = query
+        regexButton.state = regularExpression ? .on : .off
+        caseButton.state = caseSensitive ? .on : .off
+        wholeWordButton.state = wholeWords && !regularExpression ? .on : .off
+        wholeWordButton.isEnabled = !regularExpression
+    }
+
     func controlTextDidChange(_ notification: Notification) {
         guard notification.object as AnyObject? === searchField else { return }
         notifyQueryChanged(immediately: false)

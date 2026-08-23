@@ -19,6 +19,7 @@ struct EditorViewportPresentationSnapshot: Sendable {
 protocol VirtualTextEditorDelegate: AnyObject {
     var editorDocumentByteCount: Int64 { get }
     var editorSyntaxFileType: SyntaxFileType { get }
+    var editorCSVDelimiter: UInt8 { get }
 
     func editorSnapshot() throws -> DocumentSnapshot
     func editorReadBytes(in range: Range<Int64>) throws -> Data
@@ -34,6 +35,10 @@ protocol VirtualTextEditorDelegate: AnyObject {
         viewportBaseOffset: Int64
     )
     func editorDidFail(_ error: Error)
+}
+
+extension VirtualTextEditorDelegate {
+    var editorCSVDelimiter: UInt8 { 0x2C }
 }
 
 private final class ViewportSyntaxCancellation: @unchecked Sendable {
@@ -211,6 +216,12 @@ private enum ViewportSyntaxWorker {
 /// The full document remains in the file-backed piece table owned by the
 /// delegate. This prevents UTF-16, glyph, and attribute memory from scaling
 /// with file size.
+struct VirtualTextEditorPresentationState: Equatable {
+    let selection: Range<Int64>
+    let anchorByteOffset: Int64
+    let horizontalOffset: CGFloat
+}
+
 @MainActor
 final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     static let maximumViewportBytes = 512 * 1_024
@@ -221,6 +232,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     weak var editorDelegate: VirtualTextEditorDelegate? {
         didSet {
             if oldValue !== editorDelegate {
+                residentPurgeState = nil
                 rememberedHorizontalOffset = leadingHorizontalOrigin
                     ?? scrollView.contentView.bounds.minX
                 loadViewport(centeredAt: 0, preferredSelection: nil)
@@ -230,7 +242,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
 
     private let scrollView = NSScrollView()
     private let textView = NSTextView(frame: .zero)
-    private let virtualScroller = NSScroller()
+    private let virtualScroller = LighTxtComfortScroller()
     private lazy var rulerView = ViewportLineNumberRuler(scrollView: scrollView, orientation: .verticalRuler)
 
     private var sourceBytes = Data()
@@ -254,6 +266,9 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     private var lastGeometryContentWidth: CGFloat = 0
     private var rememberedHorizontalOffset: CGFloat = 0
     private var leadingHorizontalOrigin: CGFloat?
+    private var presentationRestoreGeneration: UInt64 = 0
+
+    private var residentPurgeState: VirtualTextEditorPresentationState?
 
     private struct PendingReplacement {
         let localByteRange: Range<Int>
@@ -319,6 +334,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     }
 
     override func becomeFirstResponder() -> Bool {
+        reactivateAfterResidentPurge()
         window?.makeFirstResponder(textView)
         return true
     }
@@ -334,10 +350,15 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     }
 
     var selectedGlobalByteRange: Range<Int64> {
-        localUTF16RangeToGlobalBytes(textView.selectedRange()) ?? viewportRange.lowerBound..<viewportRange.lowerBound
+        if let residentPurgeState { return residentPurgeState.selection }
+        return localUTF16RangeToGlobalBytes(textView.selectedRange())
+            ?? viewportRange.lowerBound..<viewportRange.lowerBound
     }
 
     var visibleGlobalByteRange: Range<Int64> {
+        if let residentPurgeState {
+            return residentPurgeState.anchorByteOffset..<residentPurgeState.anchorByteOffset
+        }
         guard !sourceBytes.isEmpty,
               let layoutManager = textView.layoutManager,
               let textContainer = textView.textContainer else { return viewportRange }
@@ -353,6 +374,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     }
 
     func presentationSnapshot() throws -> EditorViewportPresentationSnapshot {
+        reactivateAfterResidentPurge()
         let contextStart = max(
             0,
             viewportRange.lowerBound - Int64(Self.maximumViewportBytes)
@@ -375,6 +397,10 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     }
 
     func reloadPreservingSelection() {
+        if residentPurgeState != nil {
+            reactivateAfterResidentPurge()
+            return
+        }
         let selection = selectedGlobalByteRange
         let visible = visibleGlobalByteRange
         let anchor = visible.lowerBound
@@ -389,7 +415,57 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
         )
     }
 
+    /// Captures the logical editor location before the view is temporarily
+    /// detached for View mode or a Prettify preview. NSScrollView does not
+    /// guarantee that its clip origin survives removal from a hierarchy.
+    func capturePresentationState() -> VirtualTextEditorPresentationState {
+        if let residentPurgeState { return residentPurgeState }
+        return VirtualTextEditorPresentationState(
+            selection: selectedGlobalByteRange,
+            anchorByteOffset: visibleGlobalByteRange.lowerBound,
+            horizontalOffset: rememberedHorizontalOffset
+        )
+    }
+
+    /// Rebuilds the same bounded viewport and restores its selection/anchor.
+    /// This also keeps the caret visible when AppKit reset a detached clip view
+    /// to the top-left while another presentation occupied the split pane.
+    func restorePresentationState(_ state: VirtualTextEditorPresentationState) {
+        if residentPurgeState != nil {
+            residentPurgeState = state
+            return
+        }
+        let anchor = ViewportScrollAnchor(
+            byteOffset: state.anchorByteOffset,
+            screenOffset: 0,
+            horizontalOffset: state.horizontalOffset
+        )
+        loadViewport(
+            centeredAt: state.anchorByteOffset,
+            preferredSelection: state.selection,
+            preserving: anchor
+        )
+
+        // NSScrollView performs another document-view tiling pass after a
+        // detached editor is reattached. NSTextView can be temporarily shrunk
+        // to the clip width during that pass even though its no-wrap content
+        // extent was measured synchronously above. Re-measure after forcing
+        // the pending tile, then restore the anchor once more. The generation
+        // prevents a later viewport load from being overwritten by this work.
+        let restoreGeneration = presentationRestoreGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.presentationRestoreGeneration == restoreGeneration,
+                  self.residentPurgeState == nil else { return }
+            self.layoutSubtreeIfNeeded()
+            self.scrollView.tile()
+            self.synchronizeTextViewGeometry()
+            self.restore(anchor)
+        }
+    }
+
     func scrollTo(byteRange: Range<Int64>, select: Bool = true) {
+        reactivateAfterResidentPurge()
         guard let delegate = editorDelegate else { return }
         let total = delegate.editorDocumentByteCount
         let clampedLower = max(0, min(byteRange.lowerBound, total))
@@ -404,6 +480,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     }
 
     func useSelectionForFind() -> String? {
+        reactivateAfterResidentPurge()
         let range = textView.selectedRange()
         guard range.length > 0, range.length <= 16_384 else { return nil }
         return (textView.string as NSString).substring(with: range)
@@ -424,6 +501,63 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             #selector(LighTxtEditorViewController.undoDocumentEdit(_:)),
             with: self
         )
+    }
+
+    /// Releases only the bounded viewport's copied UTF-8/UTF-16 text, syntax
+    /// decorations, and TextKit glyph/layout storage. Every accepted edit has
+    /// already been committed synchronously to the file-backed piece table, so
+    /// this remains safe while the document is dirty. A replacement currently
+    /// crossing the AppKit delegate boundary is left resident.
+    var hasPurgedRebuildableResidentMemory: Bool { residentPurgeState != nil }
+
+    @discardableResult
+    func purgeRebuildableResidentMemory() -> Bool {
+        guard residentPurgeState == nil else { return false }
+        guard !isCommittingEdit, pendingReplacement == nil else { return false }
+
+        let state = capturePresentationState()
+        residentPurgeState = state
+        reloadWork?.cancel()
+        reloadWork = nil
+        _ = invalidateSyntaxAnalysis()
+        requestedSelectionAfterLoad = nil
+
+        isApplyingSnapshot = true
+        sourceBytes = Data()
+        decoder = ViewportUTF8Map(data: Data())
+        viewportRange = state.anchorByteOffset..<state.anchorByteOffset
+        configureTextLayoutForViewport(wrappingLongLines: false)
+        resetTextViewGeometryForSnapshot()
+        if let layoutManager = textView.layoutManager {
+            layoutManager.replaceTextStorage(NSTextStorage())
+        } else {
+            textView.string = ""
+        }
+        applyPlainTextAppearance()
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        rulerView.needsDisplay = true
+        isApplyingSnapshot = false
+        updateVirtualScroller(visibleOffset: state.anchorByteOffset)
+        return true
+    }
+
+    /// Re-materializes the prior viewport and selection on demand. Repeated
+    /// calls are no-ops, and a failed read keeps the saved state for retry.
+    func reactivateAfterResidentPurge() {
+        guard let state = residentPurgeState else { return }
+        residentPurgeState = nil
+        loadViewport(
+            centeredAt: state.anchorByteOffset,
+            preferredSelection: state.selection,
+            preserving: ViewportScrollAnchor(
+                byteOffset: state.anchorByteOffset,
+                screenOffset: 0,
+                horizontalOffset: state.horizontalOffset
+            )
+        )
+        if sourceBytes.isEmpty, (editorDelegate?.editorDocumentByteCount ?? 0) > 0 {
+            residentPurgeState = state
+        }
     }
 
     private func configureTextSystem() {
@@ -473,6 +607,11 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
         // contradictory thumb. Trackpad/wheel events still scroll the clip.
         scrollView.hasVerticalScroller = false
         scrollView.hasHorizontalScroller = true
+        LighTxtComfortScroller.install(
+            in: scrollView,
+            vertical: false,
+            horizontal: true
+        )
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = true
@@ -509,7 +648,12 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             virtualScroller.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
             virtualScroller.topAnchor.constraint(equalTo: topAnchor, constant: 2),
             virtualScroller.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
-            virtualScroller.widthAnchor.constraint(equalToConstant: 12)
+            virtualScroller.widthAnchor.constraint(equalToConstant:
+                LighTxtComfortScroller.scrollerWidth(
+                    for: .small,
+                    scrollerStyle: .overlay
+                )
+            )
         ])
     }
 
@@ -575,6 +719,15 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             : max(contentSize.width, ceil(used.maxX + insets.width * 2))
         let height = max(contentSize.height, ceil(used.maxY + insets.height * 2))
         let target = NSSize(width: width, height: height)
+        // NSTextView's default minimum remains the clip width even after its
+        // frame has been expanded to fit a no-wrap line. NSScrollView may use
+        // that stale minimum on a later tiling pass and collapse the document
+        // view, losing horizontal position. Publish the measured extent as the
+        // minimum until the next snapshot/geometry measurement resets it.
+        textView.minSize = NSSize(
+            width: usesWrappedLongLineViewport ? contentSize.width : width,
+            height: contentSize.height
+        )
         if target != textView.frame.size {
             textView.setFrameSize(target)
         }
@@ -591,7 +744,20 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     private func configureTextLayoutForViewport(wrappingLongLines: Bool) {
         usesWrappedLongLineViewport = wrappingLongLines
         scrollView.hasHorizontalScroller = !wrappingLongLines
+        if !wrappingLongLines {
+            LighTxtComfortScroller.install(
+                in: scrollView,
+                vertical: false,
+                horizontal: true
+            )
+        }
         textView.isHorizontallyResizable = !wrappingLongLines
+        // A no-wrap document view owns its measured content width. Leaving
+        // `.width` set lets NSScrollView's next tiling pass collapse a wide
+        // detached/re-attached editor back to the clip width, destroying the
+        // horizontal position we just restored. Wrapped viewports do track
+        // the clip width and therefore retain the normal autoresizing mask.
+        textView.autoresizingMask = wrappingLongLines ? [.width] : []
         textView.textContainer?.widthTracksTextView = wrappingLongLines
         textView.textContainer?.lineBreakMode = wrappingLongLines ? .byCharWrapping : .byWordWrapping
 
@@ -624,6 +790,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
         preferredSelection: Range<Int64>?,
         preserving anchor: ViewportScrollAnchor? = nil
     ) {
+        presentationRestoreGeneration &+= 1
         reloadWork?.cancel()
         let generation = invalidateSyntaxAnalysis()
         guard let delegate = editorDelegate else { return }
@@ -843,6 +1010,12 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             y: min(max(0, requestedY), maximumY)
         ))
         scrollView.reflectScrolledClipView(clip)
+        // Bounds-change notifications are intentionally ignored while a new
+        // viewport snapshot is being installed. Programmatic restoration
+        // still has to publish the clamped value, otherwise a detach/reattach
+        // can visually restore the horizontal position while leaving the
+        // remembered position at AppKit's temporary leading-edge value.
+        rememberedHorizontalOffset = clip.bounds.minX
     }
 
     private func selectGlobalByteRange(_ global: Range<Int64>, scroll: Bool) {
@@ -852,7 +1025,18 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
         let upperUTF16 = decoder.utf16Offset(forByteOffset: upperByte, bias: .trailing)
         let range = NSRange(location: lowerUTF16, length: max(0, upperUTF16 - lowerUTF16))
         textView.setSelectedRange(range)
-        if scroll { textView.scrollRangeToVisible(range) }
+        if scroll {
+            textView.scrollRangeToVisible(range)
+            let clip = scrollView.contentView
+            scrollClip(
+                toY: clip.bounds.minY,
+                horizontalOffset: clip.bounds.minX
+            )
+            // Loading a new bounded viewport keeps `isApplyingSnapshot` true,
+            // so the bounds observer deliberately ignores this programmatic
+            // selection scroll. `scrollClip` both normalizes the result to the
+            // editor's ruler-aware extent and publishes the physical offset.
+        }
     }
 
     func textView(
@@ -1039,7 +1223,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             maximumFoldRanges: 2_048,
             maximumNestingDepth: 512,
             maximumTokenBytes: Self.maximumViewportBytes,
-            csvDelimiter: 0x2C
+            csvDelimiter: editorDelegate.editorCSVDelimiter
         )
         let input = ViewportSyntaxInput(
             generation: generation,

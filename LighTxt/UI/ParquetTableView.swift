@@ -1,5 +1,16 @@
 import AppKit
 
+private nonisolated enum ParquetTableExportError: Error, LocalizedError, Sendable {
+    case truncatedCell(row: Int64, column: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case let .truncatedCell(row, column):
+            "Row \(row + 1), column \(column + 1) exceeds the Parquet reader's exact export limit. No partial file was written."
+        }
+    }
+}
+
 /// Read-only, bounded Parquet table presentation. The selected file remains on
 /// disk; DuckDB returns only the visible 64-row pages and bounded facet/summary
 /// results. No text editor or mutable document snapshot is installed.
@@ -69,11 +80,15 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private var openTask: Task<Void, Never>?
     private var uniqueValuesTask: Task<Void, Never>?
     private var summaryTask: Task<Void, Never>?
+    private var exportTask: Task<Void, Never>?
+    private var exportID: UUID?
     private var generation: UInt64 = 0
     private var presentedPopover: NSPopover?
     private weak var presentedFilterController: CSVFilterPopoverViewController?
     private var presentedFilterColumn: Int?
     private var isSettingSortDescriptors = false
+    private var isResidentStatePurged = false
+    private var residentPurgeAnchorRow: Int64 = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -90,6 +105,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         openTask?.cancel()
         uniqueValuesTask?.cancel()
         summaryTask?.cancel()
+        exportTask?.cancel()
         pageTasks.values.forEach { $0.task.cancel() }
         structuredDetailTasks.values.forEach { $0.task.cancel() }
         service?.cancelCurrentQuery()
@@ -108,6 +124,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
 
     func load(url: URL) {
         deactivate(showPausedStatus: false)
+        isResidentStatePurged = false
         generation &+= 1
         let currentGeneration = generation
         sourceURL = url.standardizedFileURL
@@ -143,10 +160,71 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     func deactivate() { deactivate(showPausedStatus: true) }
 
     func focusTable() {
+        reactivateAfterResidentPurge()
         window?.makeFirstResponder(tableView)
     }
 
-    private func deactivate(showPausedStatus: Bool) {
+    var canExportCurrentView: Bool {
+        metadata != nil && service != nil && exportTask == nil && !isResidentStatePurged
+    }
+
+    var isExporting: Bool { exportTask != nil }
+
+    func exportCurrentView() {
+        guard canExportCurrentView, let metadata else {
+            NSSound.beep()
+            return
+        }
+
+        let accessory = TabularExportAccessoryView(
+            selectedRowCount: tableView.selectedRowIndexes.count,
+            hasHeaders: !metadata.columns.isEmpty
+        )
+        let panel = NSSavePanel()
+        panel.title = "Export Parquet Table"
+        panel.prompt = "Export"
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        let baseName = sourceURL?.deletingPathExtension().lastPathComponent ?? "Parquet"
+        panel.nameFieldStringValue = "\(baseName)-export.csv"
+        panel.accessoryView = accessory
+        accessory.onFormatChange = { [weak panel] format in
+            guard let panel else { return }
+            let base = URL(fileURLWithPath: panel.nameFieldStringValue)
+                .deletingPathExtension().lastPathComponent
+            panel.nameFieldStringValue = "\(base).\(format.preferredPathExtension)"
+        }
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self, weak panel] response in
+            guard response == .OK, let self, let url = panel?.url else { return }
+            self.beginExport(to: url, request: accessory.request)
+        }
+        if let window {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
+    func cancelExport() {
+        guard let exportTask else { return }
+        exportTask.cancel()
+        setBusy(true, text: "Cancelling export…")
+    }
+
+    /// Closes the per-document DuckDB connection and drops decoded table/detail
+    /// pages while retaining schema chrome, filters, sort, expanded-cell intent,
+    /// and row selection. Parquet is read-only, so there is no dirty edit state
+    /// to flush. Active exports and popovers are conservatively left resident.
+    var hasPurgedRebuildableResidentMemory: Bool { isResidentStatePurged }
+
+    @discardableResult
+    func purgeRebuildableResidentMemory() -> Bool {
+        guard !isResidentStatePurged else { return false }
+        guard exportTask == nil, presentedPopover == nil else { return false }
+
+        isResidentStatePurged = true
+        residentPurgeAnchorRow = preferredResidentReactivationRow()
         generation &+= 1
         openTask?.cancel()
         uniqueValuesTask?.cancel()
@@ -154,6 +232,92 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         openTask = nil
         uniqueValuesTask = nil
         summaryTask = nil
+        cancelPageTasks()
+        structuredDetailTasks.values.forEach { $0.task.cancel() }
+        structuredDetailTasks.removeAll(keepingCapacity: false)
+        structuredDetailTaskOrder.removeAll(keepingCapacity: false)
+        structuredDetails.removeAll(keepingCapacity: false)
+        structuredPresentations.removeAll(keepingCapacity: false)
+        structuredDetailErrors.removeAll(keepingCapacity: false)
+        cachedPages.removeAll(keepingCapacity: false)
+        cacheOrder.removeAll(keepingCapacity: false)
+
+        let closingService = service
+        closingService?.cancelCurrentQuery()
+        service = nil
+        if let closingService { Task { await closingService.close() } }
+        reloadTablePreservingSelection()
+        setBusy(false, text: "Parquet table paused while inactive")
+        return true
+    }
+
+    /// Reopens DuckDB and lazily restores only the page near the prior viewport.
+    /// Repeated calls are no-ops; a reopen failure remains retryable.
+    func reactivateAfterResidentPurge() {
+        guard isResidentStatePurged, openTask == nil, let sourceURL else { return }
+        generation &+= 1
+        let currentGeneration = generation
+        let previousColumns = metadata?.columns
+        setBusy(true, text: "Restoring Parquet table…")
+
+        do {
+            let service = try ParquetQueryService(url: sourceURL)
+            self.service = service
+            openTask = Task { [weak self] in
+                do {
+                    let reopenedMetadata = try await service.open()
+                    guard !Task.isCancelled,
+                          let self,
+                          self.generation == currentGeneration,
+                          self.service === service else {
+                        await service.close()
+                        return
+                    }
+                    self.openTask = nil
+                    self.isResidentStatePurged = false
+                    self.metadata = reopenedMetadata
+                    if self.activeFilters.isEmpty {
+                        self.totalRowCount = reopenedMetadata.rowCount
+                    }
+                    if previousColumns != reopenedMetadata.columns {
+                        self.configureColumns(reopenedMetadata.columns)
+                    }
+                    self.updateFilterStrip()
+                    self.reloadTablePreservingSelection()
+                    self.materializeHeaderFilterControls()
+                    self.updateStatus()
+                    let maximumRow = max(0, self.totalRowCount - 1)
+                    self.requestPage(containing: min(self.residentPurgeAnchorRow, maximumRow))
+                    self.startWaitingStructuredDetails()
+                } catch {
+                    guard let self,
+                          self.generation == currentGeneration,
+                          self.service === service else { return }
+                    self.openTask = nil
+                    self.service = nil
+                    self.isResidentStatePurged = true
+                    await service.close()
+                    self.report(error)
+                }
+            }
+        } catch {
+            isResidentStatePurged = true
+            report(error)
+        }
+    }
+
+    private func deactivate(showPausedStatus: Bool) {
+        isResidentStatePurged = false
+        generation &+= 1
+        openTask?.cancel()
+        uniqueValuesTask?.cancel()
+        summaryTask?.cancel()
+        exportTask?.cancel()
+        openTask = nil
+        uniqueValuesTask = nil
+        summaryTask = nil
+        exportTask = nil
+        exportID = nil
         cancelPageTasks()
         clearStructuredExpansionState(reload: false)
         presentedPopover?.close()
@@ -244,6 +408,11 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         scrollView.tile()
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
+        LighTxtComfortScroller.install(
+            in: scrollView,
+            vertical: true,
+            horizontal: true
+        )
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
     }
@@ -512,8 +681,26 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         return page.sourceRowOrdinals[local]
     }
 
+    private func preferredResidentReactivationRow() -> Int64 {
+        if tableView.selectedRow >= 0 { return Int64(tableView.selectedRow) }
+        let visibleRows = tableView.rows(in: tableView.visibleRect)
+        if visibleRows.location != NSNotFound { return Int64(visibleRows.location) }
+        return 0
+    }
+
+    private func reloadTablePreservingSelection() {
+        let selection = tableView.selectedRowIndexes
+        tableView.reloadData()
+        let rowCount = numberOfRows(in: tableView)
+        var validSelection = IndexSet()
+        for row in selection where row >= 0 && row < rowCount {
+            validSelection.insert(row)
+        }
+        tableView.selectRowIndexes(validSelection, byExtendingSelection: false)
+    }
+
     private func requestPage(containing row: Int64) {
-        guard row >= 0, let service else { return }
+        guard !isResidentStatePurged, row >= 0, let service else { return }
         let offset = row / Int64(Self.pageSize) * Int64(Self.pageSize)
         guard cachedPages[offset] == nil, pageTasks[offset] == nil else { return }
         if pageTasks.count >= 2,
@@ -882,6 +1069,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     private func resetQuery() {
+        guard !isResidentStatePurged else { return }
         generation &+= 1
         cancelPageTasks()
         clearStructuredExpansionState(reload: false)
@@ -1283,7 +1471,237 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         }
     }
 
+    private func beginExport(to url: URL, request: TabularExportRequest) {
+        guard let service, let metadata, exportTask == nil else {
+            NSSound.beep()
+            return
+        }
+        let expectedDestination: FileFingerprint?
+        do {
+            // Bind overwrite authorization to the state accepted in the save
+            // panel, before any detached export work can be delayed.
+            let accessStarted = url.startAccessingSecurityScopedResource()
+            defer { if accessStarted { url.stopAccessingSecurityScopedResource() } }
+            expectedDestination = try TabularExportSink.expectedDestination(at: url)
+        } catch {
+            report(error)
+            return
+        }
+
+        let selectedRows: IndexSet?
+        if request.scope == .selectedRows {
+            let selection = tableView.selectedRowIndexes
+            guard !selection.isEmpty else {
+                NSSound.beep()
+                return
+            }
+            selectedRows = selection
+        } else {
+            selectedRows = nil
+        }
+
+        let query = serviceQuery()
+        let headers = request.includesHeaders ? metadata.columns.map(\.name) : nil
+        let format = request.format
+        let pageSize = Self.pageSize
+        let identifier = UUID()
+        exportID = identifier
+        setBusy(true, text: "Exporting table…")
+
+        let onProgress: @Sendable (TabularExportProgress) async -> Void = { [weak self] update in
+            await MainActor.run { [weak self] in
+                guard let self, self.exportID == identifier else { return }
+                if let total = update.totalRows,
+                   let fraction = update.fractionCompleted {
+                    let percent = Int(fraction * 100)
+                    self.setBusy(
+                        true,
+                        text: "Exporting \(percent)%  ·  \(update.rowsWritten.formatted()) of \(total.formatted()) rows"
+                    )
+                } else {
+                    self.setBusy(
+                        true,
+                        text: "Exporting…  ·  \(update.rowsWritten.formatted()) rows"
+                    )
+                }
+            }
+        }
+
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
+            let result: Result<Int64, Error>
+            do {
+                let rows = try await Self.performExport(
+                    to: url,
+                    format: format,
+                    headers: headers,
+                    service: service,
+                    query: query,
+                    selectedRows: selectedRows,
+                    expectedDestination: expectedDestination,
+                    pageSize: pageSize,
+                    onProgress: onProgress
+                )
+                result = .success(rows)
+            } catch {
+                result = .failure(error)
+            }
+
+            await MainActor.run { [weak self] in
+                guard let self, self.exportID == identifier else { return }
+                self.exportTask = nil
+                self.exportID = nil
+                switch result {
+                case let .success(rows):
+                    self.setBusy(false, text: "Exported \(rows.formatted()) rows")
+                case .failure(let error) where error is CancellationError:
+                    self.setBusy(false, text: "Export cancelled")
+                case .failure(let error as ParquetQueryError) where error == .cancelled:
+                    self.setBusy(false, text: "Export cancelled")
+                case let .failure(error):
+                    self.report(error)
+                }
+            }
+        }
+        exportTask = task
+    }
+
+    private nonisolated static func performExport(
+        to url: URL,
+        format: TabularExportFormat,
+        headers: [String]?,
+        service: ParquetQueryService,
+        query: ParquetTableQuery,
+        selectedRows: IndexSet?,
+        expectedDestination: FileFingerprint?,
+        pageSize: Int,
+        onProgress: @escaping @Sendable (TabularExportProgress) async -> Void
+    ) async throws -> Int64 {
+        if Task.isCancelled { throw CancellationError() }
+        let accessStarted = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessStarted { url.stopAccessingSecurityScopedResource() }
+        }
+
+        let sink = try TabularExportSink(
+            targetURL: url,
+            format: format,
+            headers: headers,
+            expectedDestination: expectedDestination
+        )
+        do {
+            var completed: Int64 = 0
+            var progressTotal = selectedRows.map { Int64($0.count) }
+            var lastProgress = ContinuousClock.now
+
+            if let selectedRows {
+                var iterator = selectedRows.makeIterator()
+                var nextSelectedRow = iterator.next()
+                selectedRowsLoop: while let selectedRow = nextSelectedRow {
+                    if Task.isCancelled { throw CancellationError() }
+                    let displayedRow = Int64(selectedRow)
+                    let pageOffset = displayedRow / Int64(pageSize) * Int64(pageSize)
+                    let page = try await service.page(
+                        offset: pageOffset,
+                        limit: pageSize,
+                        query: query
+                    )
+                    guard displayedRow < page.totalRowCount, !page.rows.isEmpty else { break }
+                    let pageEnd = pageOffset + Int64(page.rows.count)
+                    guard displayedRow < pageEnd else { break }
+
+                    while let candidate = nextSelectedRow {
+                        let candidateRow = Int64(candidate)
+                        guard candidateRow < pageEnd else { break }
+                        if candidateRow >= pageOffset {
+                            let localRow = Int(candidateRow - pageOffset)
+                            try appendExactExportRow(
+                                page.rows[localRow],
+                                displayedRow: candidateRow,
+                                to: sink
+                            )
+                            completed += 1
+                        }
+                        nextSelectedRow = iterator.next()
+                    }
+
+                    let now = ContinuousClock.now
+                    if now - lastProgress >= .milliseconds(120) {
+                        lastProgress = now
+                        await onProgress(TabularExportProgress(
+                            rowsWritten: completed,
+                            totalRows: progressTotal
+                        ))
+                    }
+
+                    if page.rows.count < pageSize, nextSelectedRow != nil {
+                        break selectedRowsLoop
+                    }
+                }
+            } else {
+                var offset: Int64 = 0
+                while true {
+                    if Task.isCancelled { throw CancellationError() }
+                    let page = try await service.page(
+                        offset: offset,
+                        limit: pageSize,
+                        query: query
+                    )
+                    progressTotal = page.totalRowCount
+                    guard !page.rows.isEmpty else { break }
+                    for (localRow, cells) in page.rows.enumerated() {
+                        if Task.isCancelled { throw CancellationError() }
+                        try appendExactExportRow(
+                            cells,
+                            displayedRow: offset + Int64(localRow),
+                            to: sink
+                        )
+                        completed += 1
+                    }
+                    offset += Int64(page.rows.count)
+
+                    let now = ContinuousClock.now
+                    if now - lastProgress >= .milliseconds(120) {
+                        lastProgress = now
+                        await onProgress(TabularExportProgress(
+                            rowsWritten: completed,
+                            totalRows: progressTotal
+                        ))
+                    }
+                    if offset >= page.totalRowCount { break }
+                }
+            }
+
+            if Task.isCancelled { throw CancellationError() }
+            try sink.finish()
+            await onProgress(TabularExportProgress(
+                rowsWritten: completed,
+                totalRows: progressTotal
+            ))
+            return completed
+        } catch {
+            sink.cancel()
+            throw error
+        }
+    }
+
+    private nonisolated static func appendExactExportRow(
+        _ cells: [ParquetCell],
+        displayedRow: Int64,
+        to sink: TabularExportSink
+    ) throws {
+        if let column = cells.firstIndex(where: \.isTruncated) {
+            throw ParquetTableExportError.truncatedCell(
+                row: displayedRow,
+                column: column
+            )
+        }
+        // Preserve Parquet NULL as nil so delimited formats emit an empty field
+        // and JSON Lines emits a real JSON null rather than the text "NULL".
+        try sink.append(row: cells.map(\.value))
+    }
+
     private func updateStatus() {
+        guard exportTask == nil else { return }
         guard let metadata else { return }
         let filtered = !activeFilters.isEmpty
         let sorted = activeSort != nil
@@ -1394,6 +1812,12 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         presentedFilterController?.qaToggle(key)
     }
     var qaHasPresentedPopover: Bool { presentedPopover?.isShown == true }
+    var qaIsResidentStatePurged: Bool { isResidentStatePurged }
+    var qaSelectedRows: IndexSet { tableView.selectedRowIndexes }
+    func qaSelectRows(_ rows: IndexSet) {
+        tableView.selectRowIndexes(rows, byExtendingSelection: false)
+    }
+    func qaClosePopover() { replacePresentedPopover() }
     var qaFilterChipCount: Int {
         filterContainer.subviews.compactMap { $0 as? CSVFilterChipView }.count
     }

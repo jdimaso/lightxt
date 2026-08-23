@@ -267,6 +267,24 @@ final class CSVDocumentIndexTests: XCTestCase {
         XCTAssertFalse(CSVHeaderDetector.isLikelyHeader(first: dataFirst, second: nil))
     }
 
+    func testHeaderDetectionDoesNotHideFirstAllTextDataRow() {
+        let first = CSVParsedRecord(fields: [
+            CSVFieldValue(byteRange: 0..<8, value: "New York", wasTruncated: false),
+            CSVFieldValue(byteRange: 9..<17, value: "John Doe", wasTruncated: false),
+        ], hadMoreFields: false)
+        let second = CSVParsedRecord(fields: [
+            CSVFieldValue(byteRange: 18..<29, value: "Los Angeles", wasTruncated: false),
+            CSVFieldValue(byteRange: 30..<38, value: "Jane Roe", wasTruncated: false),
+        ], hadMoreFields: false)
+        XCTAssertFalse(CSVHeaderDetector.isLikelyHeader(first: first, second: second))
+
+        let textHeader = CSVParsedRecord(fields: [
+            CSVFieldValue(byteRange: 0..<10, value: "First Name", wasTruncated: false),
+            CSVFieldValue(byteRange: 11..<20, value: "Last Name", wasTruncated: false),
+        ], hadMoreFields: false)
+        XCTAssertTrue(CSVHeaderDetector.isLikelyHeader(first: textHeader, second: first))
+    }
+
     func testCancellationStopsBeforeARead() throws {
         let index = try CSVRowIndex(byteCount: 1_000, reader: { _ in
             XCTFail("Cancelled indexing must not read")
@@ -324,6 +342,46 @@ final class CSVDocumentIndexTests: XCTestCase {
             "\"hello,\n\"\"world\"\"\""
         )
         XCTAssertFalse(try XCTUnwrap(selected.fields[1]).wasTruncated)
+    }
+
+    func testPipeDelimiterFlowsThroughIndexSelectionAndColumnMutation() throws {
+        let original = "id|name|note\n1|Ada|\"a|b\"\n2|Lin|calm\n"
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(Data(original.utf8), at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(
+            snapshot: snapshot,
+            configuration: .init(delimiter: 0x7C)
+        )
+        let location = try XCTUnwrap(index.recordLocation(forRecord: 1))
+
+        let selected = try CSVRecordParser.selectedFields(
+            snapshot: snapshot,
+            location: location,
+            columns: [1, 2],
+            delimiter: index.delimiter,
+            maximumValueBytesPerField: 128,
+            maximumRetainedValueBytes: 256
+        )
+        XCTAssertEqual(selected.fieldCount, 3)
+        XCTAssertEqual(selected.fields[1]?.value, "Ada")
+        XCTAssertEqual(selected.fields[2]?.value, "a|b")
+
+        _ = try engine.applyCSVColumnMutation(
+            .insert(CSVColumnInsertion(
+                column: 1,
+                headerRecord: 0,
+                headerValue: "score"
+            )),
+            snapshot: snapshot,
+            index: index,
+            delimiter: index.delimiter
+        )
+        let result = try engine.snapshot()
+        XCTAssertEqual(
+            try result.utf8String(in: 0..<result.byteCount),
+            "id|score|name|note\n1||Ada|\"a|b\"\n2||Lin|calm\n"
+        )
     }
 
     func testFilteredRowMapComposesColumnPredicatesAndSkipsHeader() throws {
@@ -847,6 +905,141 @@ final class CSVDocumentIndexTests: XCTestCase {
                 + "\(result.progress.checkpointCount) checkpoints "
                 + "(\(result.progress.checkpointPayloadByteCount) payload bytes), \(elapsed), "
                 + "firstPageSeconds=\(firstPageSeconds), randomPageSeconds=\(randomPageSeconds)"
+        )
+    }
+
+    func testRealLargeCSVFilteringReleaseQAWhenRequested() throws {
+        guard let path = ProcessInfo.processInfo.environment["LIGHTXT_CSV_FILTER_TARGET"],
+              !path.isEmpty else {
+            throw XCTSkip(
+                "Set LIGHTXT_CSV_FILTER_TARGET for the opt-in read-only CSV filtering release QA"
+            )
+        }
+        let distinctColumn = ProcessInfo.processInfo.environment["LIGHTXT_CSV_FILTER_COLUMN"]
+            .flatMap(Int.init) ?? 2
+        let npiColumn = ProcessInfo.processInfo.environment["LIGHTXT_CSV_NPI_COLUMN"]
+            .flatMap(Int.init) ?? 17
+        let url = URL(fileURLWithPath: path)
+        let before = try FileManager.default.attributesOfItem(atPath: url.path)
+        let engine = try FileBackedPieceTable(opening: url)
+        defer { engine.close() }
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: snapshot)
+        let clock = ContinuousClock()
+
+        let indexStarted = clock.now
+        let indexResult = try index.scanToEnd()
+        let indexSeconds = durationSeconds(indexStarted.duration(to: clock.now))
+        let totalRecords = try XCTUnwrap(indexResult.progress.totalRecordCount)
+        XCTAssertGreaterThan(totalRecords, 1)
+
+        let legacyDistinctStarted = clock.now
+        let legacyDistinct = try CSVUniqueValueProvider.collect(
+            snapshot: snapshot,
+            index: try CSVRowIndex(snapshot: snapshot),
+            column: distinctColumn,
+            firstRecord: 1
+        )
+        let legacyDistinctSeconds = durationSeconds(
+            legacyDistinctStarted.duration(to: clock.now)
+        )
+
+        let projectedDistinctStarted = clock.now
+        let projectedDistinct = try CSVUniqueValueProvider.collect(
+            snapshot: snapshot,
+            index: index,
+            column: distinctColumn,
+            firstRecord: 1
+        )
+        let projectedDistinctSeconds = durationSeconds(
+            projectedDistinctStarted.duration(to: clock.now)
+        )
+        XCTAssertEqual(projectedDistinct, legacyDistinct)
+        XCTAssertGreaterThan(projectedDistinct.scannedRecordCount, 0)
+        XCTAssertFalse(projectedDistinct.values.isEmpty)
+
+        var npiValue: String?
+        var npiRecord: Int64 = 1
+        while npiValue == nil, npiRecord < totalRecords {
+            let locations = try index.recordLocations(startingAt: npiRecord, limit: 4_096)
+            guard !locations.isEmpty else { break }
+            for location in locations {
+                let selected = try CSVRecordParser.selectedFields(
+                    snapshot: snapshot,
+                    location: location,
+                    columns: [npiColumn],
+                    delimiter: index.delimiter,
+                    maximumValueBytesPerField: 64 << 10,
+                    maximumRetainedValueBytes: 64 << 10
+                )
+                if let value = selected.fields[npiColumn]?.value, !value.isEmpty {
+                    npiValue = value
+                    break
+                }
+            }
+            npiRecord = locations[locations.count - 1].record + 1
+        }
+        let exactNPIValue = try XCTUnwrap(npiValue)
+        let npiQuery = CSVRowQuery(firstRecord: 1, filters: [
+            CSVColumnFilter(
+                column: npiColumn,
+                containsText: "",
+                selectedValues: [exactNPIValue]
+            ),
+        ])
+
+        let legacyNPIStarted = clock.now
+        let legacyNPIMap = try CSVRowQueryEngine.execute(
+            snapshot: snapshot,
+            index: try CSVRowIndex(snapshot: snapshot),
+            query: npiQuery
+        )
+        let legacyNPISeconds = durationSeconds(legacyNPIStarted.duration(to: clock.now))
+        let legacyNPICount = legacyNPIMap.rowCount
+        legacyNPIMap.close()
+
+        let projectedNPIStarted = clock.now
+        let projectedNPIMap = try CSVRowQueryEngine.execute(
+            snapshot: snapshot,
+            index: index,
+            query: npiQuery
+        )
+        let projectedNPISeconds = durationSeconds(projectedNPIStarted.duration(to: clock.now))
+        let projectedNPICount = projectedNPIMap.rowCount
+        projectedNPIMap.close()
+        XCTAssertEqual(projectedNPICount, legacyNPICount)
+
+        let absentStarted = clock.now
+        let absentMap = try CSVRowQueryEngine.execute(
+            snapshot: snapshot,
+            index: index,
+            query: CSVRowQuery(firstRecord: 1, filters: [
+                CSVColumnFilter(
+                    column: distinctColumn,
+                    containsText: "__LIGHTXT_BENCHMARK_ABSENT__"
+                ),
+            ])
+        )
+        let absentSeconds = durationSeconds(absentStarted.duration(to: clock.now))
+        let absentCount = absentMap.rowCount
+        absentMap.close()
+
+        let after = try FileManager.default.attributesOfItem(atPath: url.path)
+        XCTAssertEqual(before[.size] as? NSNumber, after[.size] as? NSNumber)
+        XCTAssertEqual(before[.modificationDate] as? Date, after[.modificationDate] as? Date)
+        XCTAssertFalse(engine.hasUnsavedChanges)
+        print(
+            "LighTxt CSV filtering release QA: bytes=\(snapshot.byteCount), "
+                + "records=\(totalRecords), distinctColumn=\(distinctColumn), "
+                + "npiColumn=\(npiColumn), indexSeconds=\(indexSeconds), "
+                + "legacyDistinctSeconds=\(legacyDistinctSeconds), "
+                + "projectedDistinctSeconds=\(projectedDistinctSeconds), "
+                + "distinctScanned=\(projectedDistinct.scannedRecordCount), "
+                + "distinctCount=\(projectedDistinct.values.count), "
+                + "legacyExactNPISeconds=\(legacyNPISeconds), "
+                + "projectedExactNPISeconds=\(projectedNPISeconds), "
+                + "exactNPICount=\(projectedNPICount), "
+                + "absentFilterSeconds=\(absentSeconds), absentCount=\(absentCount)"
         )
     }
 

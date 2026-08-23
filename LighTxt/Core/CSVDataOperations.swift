@@ -244,6 +244,358 @@ private nonisolated func csvCaseFold(_ value: String) -> String {
     )
 }
 
+/// Per-record state shared by the completed-index projection scanner. It keeps
+/// only requested logical values and their exact source ranges; unrequested
+/// fields are scanned for RFC-4180 structure without being retained.
+private nonisolated struct CSVProjectedFieldAccumulator {
+    private let columns: Set<Int>
+    private let perFieldLimit: Int
+    private let aggregateLimit: Int
+    private var selected: [Int: CSVFieldValue] = [:]
+    private var fieldIndex = 0
+    private var fieldStart: Int64
+    private var current = Data()
+    private var truncated = false
+    private var retainedBytes = 0
+    private var retainsCurrentField: Bool
+    private var atFieldStart = true
+    private var inQuotedField = false
+    private var pendingQuote = false
+
+    var canScanQuotedRun: Bool { inQuotedField && !pendingQuote }
+    var canScanUnquotedRun: Bool { !inQuotedField && !atFieldStart }
+
+    init(
+        recordStart: Int64,
+        columns: Set<Int>,
+        maximumValueBytesPerField: Int,
+        maximumRetainedValueBytes: Int
+    ) {
+        self.columns = columns
+        self.perFieldLimit = max(0, maximumValueBytesPerField)
+        self.aggregateLimit = max(0, maximumRetainedValueBytes)
+        self.fieldStart = recordStart
+        self.retainsCurrentField = columns.contains(0)
+        selected.reserveCapacity(columns.count)
+        current.reserveCapacity(min(256, perFieldLimit))
+    }
+
+    /// Returns true when `byte` is an unquoted record terminator. The caller
+    /// owns CRLF coalescing and record emission so it can stop immediately when
+    /// a bounded consumer has enough results.
+    mutating func consume(
+        _ byte: UInt8,
+        at absoluteOffset: Int64,
+        delimiter: UInt8
+    ) -> Bool {
+        if inQuotedField {
+            if pendingQuote {
+                if byte == 0x22 {
+                    appendValueByte(0x22)
+                    pendingQuote = false
+                    return false
+                }
+                inQuotedField = false
+                pendingQuote = false
+                // This byte belongs to the unquoted delimiter/newline context.
+            } else if byte == 0x22 {
+                pendingQuote = true
+                return false
+            } else {
+                appendValueByte(byte)
+                return false
+            }
+        }
+
+        if atFieldStart, byte == 0x22 {
+            inQuotedField = true
+            atFieldStart = false
+        } else if byte == delimiter {
+            finishField(at: absoluteOffset)
+        } else if byte == 0x0A || byte == 0x0D {
+            return true
+        } else {
+            appendValueByte(byte)
+            atFieldStart = false
+        }
+        return false
+    }
+
+    mutating func finishRecord(at end: Int64) -> CSVSelectedFields {
+        finishField(at: end)
+        return CSVSelectedFields(fieldCount: fieldIndex, fields: selected)
+    }
+
+    mutating func consumeQuotedRun(_ bytes: UnsafeRawBufferPointer) {
+        appendValueBytes(bytes)
+    }
+
+    mutating func consumeUnquotedRun(_ bytes: UnsafeRawBufferPointer) {
+        guard !bytes.isEmpty else { return }
+        appendValueBytes(bytes)
+        atFieldStart = false
+    }
+
+    private mutating func appendValueByte(_ byte: UInt8) {
+        guard retainsCurrentField else { return }
+        if current.count < perFieldLimit, retainedBytes < aggregateLimit {
+            current.append(byte)
+            retainedBytes += 1
+        } else {
+            truncated = true
+        }
+    }
+
+    private mutating func appendValueBytes(_ bytes: UnsafeRawBufferPointer) {
+        guard retainsCurrentField, !bytes.isEmpty else { return }
+        let fieldCapacity = max(0, perFieldLimit - current.count)
+        let recordCapacity = max(0, aggregateLimit - retainedBytes)
+        let retainedCount = min(bytes.count, fieldCapacity, recordCapacity)
+        if retainedCount > 0, let baseAddress = bytes.baseAddress {
+            current.append(
+                baseAddress.assumingMemoryBound(to: UInt8.self),
+                count: retainedCount
+            )
+            retainedBytes += retainedCount
+        }
+        if retainedCount < bytes.count { truncated = true }
+    }
+
+    private mutating func finishField(at end: Int64) {
+        if retainsCurrentField {
+            selected[fieldIndex] = CSVFieldValue(
+                byteRange: fieldStart..<end,
+                value: String(decoding: current, as: UTF8.self),
+                wasTruncated: truncated
+            )
+        }
+        fieldIndex += 1
+        retainsCurrentField = columns.contains(fieldIndex)
+        current.removeAll(keepingCapacity: true)
+        truncated = false
+        fieldStart = end + 1
+        atFieldStart = true
+        inQuotedField = false
+        pendingQuote = false
+    }
+}
+
+@inline(__always)
+private nonisolated func csvProjectionWordContainsByte(_ word: UInt64, _ byte: UInt8) -> Bool {
+    let ones: UInt64 = 0x0101_0101_0101_0101
+    let highs: UInt64 = 0x8080_8080_8080_8080
+    let repeated = UInt64(byte) &* ones
+    let value = word ^ repeated
+    return ((value &- ones) & ~value & highs) != 0
+}
+
+@inline(__always)
+private nonisolated func csvProjectionScanUntilByte(
+    _ base: UnsafeRawPointer,
+    from start: Int,
+    to end: Int,
+    byte: UInt8
+) -> Int {
+    var cursor = start
+    while cursor + MemoryLayout<UInt64>.size <= end {
+        let word = base.loadUnaligned(fromByteOffset: cursor, as: UInt64.self)
+        if csvProjectionWordContainsByte(word, byte) { break }
+        cursor += MemoryLayout<UInt64>.size
+    }
+    while cursor < end,
+          base.load(fromByteOffset: cursor, as: UInt8.self) != byte {
+        cursor += 1
+    }
+    return cursor
+}
+
+@inline(__always)
+private nonisolated func csvProjectionScanUntilUnquotedSpecial(
+    _ base: UnsafeRawPointer,
+    from start: Int,
+    to end: Int,
+    delimiter: UInt8
+) -> Int {
+    var cursor = start
+    while cursor + MemoryLayout<UInt64>.size <= end {
+        let word = base.loadUnaligned(fromByteOffset: cursor, as: UInt64.self)
+        if csvProjectionWordContainsByte(word, delimiter)
+            || csvProjectionWordContainsByte(word, 0x0A)
+            || csvProjectionWordContainsByte(word, 0x0D) {
+            break
+        }
+        cursor += MemoryLayout<UInt64>.size
+    }
+    while cursor < end {
+        let byte = base.load(fromByteOffset: cursor, as: UInt8.self)
+        if byte == delimiter || byte == 0x0A || byte == 0x0D { break }
+        cursor += 1
+    }
+    return cursor
+}
+
+private nonisolated enum CSVProjectedRecordScannerStop: Error {
+    case consumerFinished
+}
+
+/// Streams projected records in a single bounded pass once the sparse row
+/// index is complete. The old page/location path remains the fallback while an
+/// index is still growing because callers historically complete that index as
+/// a side effect of a query.
+private nonisolated enum CSVProjectedRecordScanner {
+    /// Returns false only when `consume` asks to stop early. Backing reads stay
+    /// capped by `DocumentSnapshot.forEachByteSlice` (currently one MiB), and no
+    /// record-location or projected-row array is accumulated.
+    static func scan(
+        snapshot: DocumentSnapshot,
+        index: CSVRowIndex,
+        firstRecord: Int64,
+        columns: Set<Int>,
+        maximumValueBytesPerField: Int,
+        maximumRetainedValueBytes: Int,
+        cancellation: CSVRowIndex.CancellationCheck?,
+        consume: (Int64, CSVSelectedFields) throws -> Bool
+    ) throws -> Bool {
+        let indexProgress = index.progress
+        guard indexProgress.isComplete,
+              let totalRecordCount = indexProgress.totalRecordCount else {
+            return false
+        }
+        guard firstRecord < totalRecordCount else { return true }
+        if cancellation?() == true { throw CancellationError() }
+
+        guard let firstLocation = try index.recordLocation(
+            forRecord: firstRecord,
+            cancellation: cancellation
+        ) else {
+            throw CSVRowIndex.IndexError.inconsistentCheckpointData
+        }
+        var scanStart = firstLocation.contentRange.lowerBound
+        if firstRecord == 0,
+           scanStart == 0,
+           snapshot.byteCount >= 3,
+           try snapshot.data(in: 0..<3) == Data([0xEF, 0xBB, 0xBF]) {
+            scanStart = 3
+        }
+
+        var record = firstRecord
+        var pendingCarriageReturn = false
+        var accumulator = CSVProjectedFieldAccumulator(
+            recordStart: scanStart,
+            columns: columns,
+            maximumValueBytesPerField: maximumValueBytesPerField,
+            maximumRetainedValueBytes: maximumRetainedValueBytes
+        )
+        var absoluteOffset = scanStart
+
+        func emitRecord(endingAt end: Int64) throws {
+            if cancellation?() == true { throw CancellationError() }
+            let projected = accumulator.finishRecord(at: end)
+            guard try consume(record, projected) else {
+                throw CSVProjectedRecordScannerStop.consumerFinished
+            }
+            record += 1
+        }
+
+        do {
+            try snapshot.forEachByteSlice(in: scanStart..<snapshot.byteCount) { bytes in
+                if cancellation?() == true { throw CancellationError() }
+                guard let baseAddress = bytes.baseAddress else { return }
+                var cursor = 0
+                var nextCancellationCheck = 0
+                while cursor < bytes.count {
+                    if cursor >= nextCancellationCheck {
+                        if cancellation?() == true { throw CancellationError() }
+                        nextCancellationCheck = cursor + (16 << 10)
+                    }
+                    if record >= totalRecordCount { return }
+                    let scanLimit = min(bytes.count, nextCancellationCheck)
+                    let byte = baseAddress.load(fromByteOffset: cursor, as: UInt8.self)
+
+                    if pendingCarriageReturn {
+                        pendingCarriageReturn = false
+                        if byte == 0x0A {
+                            cursor += 1
+                            absoluteOffset += 1
+                            accumulator = CSVProjectedFieldAccumulator(
+                                recordStart: absoluteOffset,
+                                columns: columns,
+                                maximumValueBytesPerField: maximumValueBytesPerField,
+                                maximumRetainedValueBytes: maximumRetainedValueBytes
+                            )
+                            continue
+                        }
+                    }
+
+                    if accumulator.canScanQuotedRun {
+                        let end = csvProjectionScanUntilByte(
+                            baseAddress,
+                            from: cursor,
+                            to: scanLimit,
+                            byte: 0x22
+                        )
+                        if end > cursor {
+                            let count = end - cursor
+                            accumulator.consumeQuotedRun(UnsafeRawBufferPointer(
+                                start: baseAddress.advanced(by: cursor),
+                                count: count
+                            ))
+                            cursor = end
+                            absoluteOffset += Int64(count)
+                            continue
+                        }
+                    } else if accumulator.canScanUnquotedRun {
+                        let end = csvProjectionScanUntilUnquotedSpecial(
+                            baseAddress,
+                            from: cursor,
+                            to: scanLimit,
+                            delimiter: index.delimiter
+                        )
+                        if end > cursor {
+                            let count = end - cursor
+                            accumulator.consumeUnquotedRun(UnsafeRawBufferPointer(
+                                start: baseAddress.advanced(by: cursor),
+                                count: count
+                            ))
+                            cursor = end
+                            absoluteOffset += Int64(count)
+                            continue
+                        }
+                    }
+
+                    if accumulator.consume(
+                        byte,
+                        at: absoluteOffset,
+                        delimiter: index.delimiter
+                    ) {
+                        try emitRecord(endingAt: absoluteOffset)
+                        pendingCarriageReturn = byte == 0x0D
+                        accumulator = CSVProjectedFieldAccumulator(
+                            recordStart: absoluteOffset + 1,
+                            columns: columns,
+                            maximumValueBytesPerField: maximumValueBytesPerField,
+                            maximumRetainedValueBytes: maximumRetainedValueBytes
+                        )
+                    }
+                    cursor += 1
+                    absoluteOffset += 1
+                }
+            }
+
+            if record < totalRecordCount {
+                try emitRecord(endingAt: snapshot.byteCount)
+            }
+        } catch CSVProjectedRecordScannerStop.consumerFinished {
+            return false
+        }
+
+        guard record == totalRecordCount else {
+            throw CSVRowIndex.IndexError.inconsistentCheckpointData
+        }
+        return true
+    }
+}
+
 public nonisolated enum CSVSortOrder: Sendable, Equatable {
     case ascending
     case descending
@@ -400,7 +752,6 @@ public nonisolated enum CSVRowQueryEngine {
         // finishes can exhaust RLIMIT_NOFILE long before memory is pressured on
         // multi-gigabyte CSVs with long keys.
         var sortRunLevels: [[CSVTemporarySortRun]] = []
-        var nextRecord = query.firstRecord
         var scanned: Int64 = 0
         var matched: Int64 = 0
         var pendingMatches: [Int64] = []
@@ -416,90 +767,123 @@ public nonisolated enum CSVRowQueryEngine {
             ))
         }
 
-        report()
-        while true {
+        func consume(record: Int64, selected: CSVSelectedFields) throws {
             if cancellation?() == true { throw CancellationError() }
-            let locations = try index.recordLocations(
-                startingAt: nextRecord,
-                limit: configuration.pageRecordCount,
-                cancellation: cancellation
-            )
-            guard !locations.isEmpty else { break }
-
-            pendingMatches.removeAll(keepingCapacity: true)
-            for location in locations {
-                if cancellation?() == true { throw CancellationError() }
-                let selected: CSVSelectedFields
-                if columns.isEmpty {
-                    selected = CSVSelectedFields(fieldCount: 0, fields: [:])
-                } else {
-                    selected = try CSVRecordParser.selectedFields(
-                        snapshot: snapshot,
-                        location: location,
-                        columns: columns,
-                        maximumValueBytesPerField: configuration.maximumValueBytesPerField,
-                        maximumRetainedValueBytes: configuration.maximumRetainedValueBytesPerRecord,
-                        cancellation: cancellation
+            var matches = true
+            for group in filterGroups {
+                let field = selected.fields[group.column]
+                if field?.wasTruncated == true {
+                    throw CSVDataOperationError.queryValueTooLarge(
+                        record: record,
+                        column: group.column,
+                        limit: configuration.maximumValueBytesPerField
                     )
                 }
-                var matches = true
-                for group in filterGroups {
-                    let field = selected.fields[group.column]
-                    if field?.wasTruncated == true {
-                        throw CSVDataOperationError.queryValueTooLarge(
-                            record: location.record,
-                            column: group.column,
-                            limit: configuration.maximumValueBytesPerField
-                        )
-                    }
-                    if !group.matches(field?.value ?? "") {
-                        matches = false
-                        break
-                    }
-                }
-                scanned += 1
-                if matches {
-                    if query.sortDescriptors.isEmpty {
-                        pendingMatches.append(location.record)
-                    } else {
-                        let entry = try makeSortEntry(
-                            record: location.record,
-                            selected: selected,
-                            descriptors: query.sortDescriptors,
-                            exactValueLimit: configuration.maximumValueBytesPerField
-                        )
-                        let estimatedBytes = entry.estimatedResidentByteCount
-                        let projected = sortEntryBytes.addingReportingOverflow(estimatedBytes)
-                        if !sortEntries.isEmpty,
-                           projected.overflow
-                            || projected.partialValue > configuration.sortRunMemoryByteCount {
-                            let run = try spillSortedRun(
-                                &sortEntries,
-                                descriptors: query.sortDescriptors
-                            )
-                            try retainCompactedSortRun(
-                                run,
-                                levels: &sortRunLevels,
-                                descriptors: query.sortDescriptors,
-                                fanIn: configuration.mergeFanIn,
-                                cancellation: cancellation
-                            )
-                            sortEntryBytes = 0
-                        }
-                        sortEntries.append(entry)
-                        let next = sortEntryBytes.addingReportingOverflow(estimatedBytes)
-                        sortEntryBytes = next.overflow ? Int.max : next.partialValue
-                    }
-                    matched += 1
+                if !group.matches(field?.value ?? "") {
+                    matches = false
+                    break
                 }
             }
+            scanned += 1
+            guard matches else { return }
+
             if query.sortDescriptors.isEmpty {
-                try directStore.append(pendingMatches)
+                pendingMatches.append(record)
+            } else {
+                let entry = try makeSortEntry(
+                    record: record,
+                    selected: selected,
+                    descriptors: query.sortDescriptors,
+                    exactValueLimit: configuration.maximumValueBytesPerField
+                )
+                let estimatedBytes = entry.estimatedResidentByteCount
+                let projected = sortEntryBytes.addingReportingOverflow(estimatedBytes)
+                if !sortEntries.isEmpty,
+                   projected.overflow
+                    || projected.partialValue > configuration.sortRunMemoryByteCount {
+                    let run = try spillSortedRun(
+                        &sortEntries,
+                        descriptors: query.sortDescriptors
+                    )
+                    try retainCompactedSortRun(
+                        run,
+                        levels: &sortRunLevels,
+                        descriptors: query.sortDescriptors,
+                        fanIn: configuration.mergeFanIn,
+                        cancellation: cancellation
+                    )
+                    sortEntryBytes = 0
+                }
+                sortEntries.append(entry)
+                let next = sortEntryBytes.addingReportingOverflow(estimatedBytes)
+                sortEntryBytes = next.overflow ? Int.max : next.partialValue
             }
-            nextRecord = locations[locations.count - 1].record + 1
-            report()
-            if locations.count < configuration.pageRecordCount, index.progress.isComplete { break }
+            matched += 1
         }
+
+        func flushDirectMatches() throws {
+            guard query.sortDescriptors.isEmpty, !pendingMatches.isEmpty else { return }
+            try directStore.append(pendingMatches)
+            pendingMatches.removeAll(keepingCapacity: true)
+        }
+
+        report()
+        if index.progress.isComplete {
+            _ = try CSVProjectedRecordScanner.scan(
+                snapshot: snapshot,
+                index: index,
+                firstRecord: query.firstRecord,
+                columns: columns,
+                maximumValueBytesPerField: configuration.maximumValueBytesPerField,
+                maximumRetainedValueBytes: configuration.maximumRetainedValueBytesPerRecord,
+                cancellation: cancellation,
+                consume: { record, selected in
+                    try consume(record: record, selected: selected)
+                    if scanned.isMultiple(of: Int64(configuration.pageRecordCount)) {
+                        try flushDirectMatches()
+                        report()
+                    }
+                    return true
+                }
+            )
+        } else {
+            var nextRecord = query.firstRecord
+            while true {
+                if cancellation?() == true { throw CancellationError() }
+                let locations = try index.recordLocations(
+                    startingAt: nextRecord,
+                    limit: configuration.pageRecordCount,
+                    cancellation: cancellation
+                )
+                guard !locations.isEmpty else { break }
+
+                for location in locations {
+                    if cancellation?() == true { throw CancellationError() }
+                    let selected: CSVSelectedFields
+                    if columns.isEmpty {
+                        selected = CSVSelectedFields(fieldCount: 0, fields: [:])
+                    } else {
+                        selected = try CSVRecordParser.selectedFields(
+                            snapshot: snapshot,
+                            location: location,
+                            columns: columns,
+                            delimiter: index.delimiter,
+                            maximumValueBytesPerField: configuration.maximumValueBytesPerField,
+                            maximumRetainedValueBytes: configuration.maximumRetainedValueBytesPerRecord,
+                            cancellation: cancellation
+                        )
+                    }
+                    try consume(record: location.record, selected: selected)
+                }
+                try flushDirectMatches()
+                nextRecord = locations[locations.count - 1].record + 1
+                report()
+                if locations.count < configuration.pageRecordCount, index.progress.isComplete {
+                    break
+                }
+            }
+        }
+        try flushDirectMatches()
         report()
         if query.sortDescriptors.isEmpty {
             return try CSVRowMap(store: directStore)
@@ -959,93 +1343,121 @@ public nonisolated enum CSVUniqueValueProvider {
             )
         }
 
-        report(force: true)
-        while true {
+        func consume(
+            record: Int64,
+            selected: CSVSelectedFields
+        ) throws -> CSVUniqueValuesTruncationReason? {
             if cancellation?() == true { throw CancellationError() }
-            let locations = try index.recordLocations(
-                startingAt: nextRecord,
-                limit: configuration.pageRecordCount,
-                cancellation: cancellation
-            )
-            guard !locations.isEmpty else { break }
+            scannedRecordCount += 1
+            nextRecord = record + 1
 
-            for location in locations {
+            for group in filterGroups {
+                let field = selected.fields[group.column]
+                if field?.wasTruncated == true
+                    || (field?.value.utf8.count ?? 0)
+                        > configuration.maximumFilterValueBytesPerField {
+                    throw CSVDataOperationError.queryValueTooLarge(
+                        record: record,
+                        column: group.column,
+                        limit: configuration.maximumFilterValueBytesPerField
+                    )
+                }
+                if !group.matches(field?.value ?? "") { return nil }
+            }
+
+            eligibleRecordCount += 1
+            let field = selected.fields[column]
+            guard field?.wasTruncated != true else { return .valueByteLimit }
+            let value = field?.value ?? ""
+            let valueByteCount = value.utf8.count
+            guard valueByteCount <= configuration.maximumValueBytes else {
+                return .valueByteLimit
+            }
+            guard !uniqueValues.contains(value) else { return nil }
+            guard uniqueValues.count < configuration.maximumUniqueValueCount else {
+                return .uniqueValueCountLimit
+            }
+            let projectedBytes = retainedUniqueValueBytes.addingReportingOverflow(valueByteCount)
+            guard !projectedBytes.overflow,
+                  projectedBytes.partialValue <= configuration.maximumRetainedValueBytes else {
+                return .retainedValueBytesLimit
+            }
+            uniqueValues.insert(value)
+            retainedUniqueValueBytes = projectedBytes.partialValue
+            return nil
+        }
+
+        report(force: true)
+        if index.progress.isComplete {
+            var truncationReason: CSVUniqueValuesTruncationReason?
+            _ = try CSVProjectedRecordScanner.scan(
+                snapshot: snapshot,
+                index: index,
+                firstRecord: firstRecord,
+                columns: selectedColumns,
+                maximumValueBytesPerField: max(
+                    configuration.maximumValueBytes,
+                    configuration.maximumFilterValueBytesPerField
+                ),
+                maximumRetainedValueBytes: configuration.maximumRetainedValueBytesPerRecord,
+                cancellation: cancellation,
+                consume: { record, selected in
+                    truncationReason = try consume(record: record, selected: selected)
+                    if truncationReason != nil {
+                        report(force: true)
+                        return false
+                    }
+                    if scannedRecordCount.isMultiple(of: Int64(configuration.pageRecordCount)) {
+                        report()
+                    }
+                    return true
+                }
+            )
+            if let truncationReason {
+                return makeResult(
+                    isCompleteDataset: false,
+                    truncationReason: truncationReason
+                )
+            }
+        } else {
+            while true {
                 if cancellation?() == true { throw CancellationError() }
-                let selected = try CSVRecordParser.selectedFields(
-                    snapshot: snapshot,
-                    location: location,
-                    columns: selectedColumns,
-                    maximumValueBytesPerField: max(
-                        configuration.maximumValueBytes,
-                        configuration.maximumFilterValueBytesPerField
-                    ),
-                    maximumRetainedValueBytes: configuration.maximumRetainedValueBytesPerRecord,
+                let locations = try index.recordLocations(
+                    startingAt: nextRecord,
+                    limit: configuration.pageRecordCount,
                     cancellation: cancellation
                 )
-                scannedRecordCount += 1
-                nextRecord = location.record + 1
+                guard !locations.isEmpty else { break }
 
-                var matchesOtherFilters = true
-                for group in filterGroups {
-                    let field = selected.fields[group.column]
-                    if field?.wasTruncated == true
-                        || (field?.value.utf8.count ?? 0)
-                            > configuration.maximumFilterValueBytesPerField {
-                        throw CSVDataOperationError.queryValueTooLarge(
-                            record: location.record,
-                            column: group.column,
-                            limit: configuration.maximumFilterValueBytesPerField
-                        )
-                    }
-                    if !group.matches(field?.value ?? "") {
-                        matchesOtherFilters = false
-                        break
-                    }
-                }
-                guard matchesOtherFilters else { continue }
-
-                eligibleRecordCount += 1
-                let field = selected.fields[column]
-                guard field?.wasTruncated != true else {
-                    report(force: true)
-                    return makeResult(
-                        isCompleteDataset: false,
-                        truncationReason: .valueByteLimit
+                for location in locations {
+                    if cancellation?() == true { throw CancellationError() }
+                    let selected = try CSVRecordParser.selectedFields(
+                        snapshot: snapshot,
+                        location: location,
+                        columns: selectedColumns,
+                        delimiter: index.delimiter,
+                        maximumValueBytesPerField: max(
+                            configuration.maximumValueBytes,
+                            configuration.maximumFilterValueBytesPerField
+                        ),
+                        maximumRetainedValueBytes: configuration.maximumRetainedValueBytesPerRecord,
+                        cancellation: cancellation
                     )
-                }
-                let value = field?.value ?? ""
-                let valueByteCount = value.utf8.count
-                guard valueByteCount <= configuration.maximumValueBytes else {
-                    report(force: true)
-                    return makeResult(
-                        isCompleteDataset: false,
-                        truncationReason: .valueByteLimit
-                    )
-                }
-                if !uniqueValues.contains(value) {
-                    guard uniqueValues.count < configuration.maximumUniqueValueCount else {
+                    if let truncationReason = try consume(
+                        record: location.record,
+                        selected: selected
+                    ) {
                         report(force: true)
                         return makeResult(
                             isCompleteDataset: false,
-                            truncationReason: .uniqueValueCountLimit
+                            truncationReason: truncationReason
                         )
                     }
-                    let projectedBytes = retainedUniqueValueBytes.addingReportingOverflow(valueByteCount)
-                    guard !projectedBytes.overflow,
-                          projectedBytes.partialValue <= configuration.maximumRetainedValueBytes else {
-                        report(force: true)
-                        return makeResult(
-                            isCompleteDataset: false,
-                            truncationReason: .retainedValueBytesLimit
-                        )
-                    }
-                    uniqueValues.insert(value)
-                    retainedUniqueValueBytes = projectedBytes.partialValue
                 }
-            }
-            report()
-            if locations.count < configuration.pageRecordCount, index.progress.isComplete {
-                break
+                report()
+                if locations.count < configuration.pageRecordCount, index.progress.isComplete {
+                    break
+                }
             }
         }
 
@@ -1165,6 +1577,7 @@ public nonisolated enum CSVColumnProfiler {
                     snapshot: snapshot,
                     location: location,
                     columns: [column],
+                    delimiter: index.delimiter,
                     maximumValueBytesPerField: configuration.maximumPreviewBytesPerValue,
                     maximumRetainedValueBytes: configuration.maximumPreviewBytesPerValue,
                     cancellation: cancellation

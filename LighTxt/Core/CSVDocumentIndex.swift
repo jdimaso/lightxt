@@ -154,6 +154,11 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
         withStateLock { makeProgress($0) }
     }
 
+    /// The byte that defines field boundaries for every parser/query sharing
+    /// this index. Keeping it on the index prevents a detected TSV/PSV dialect
+    /// from accidentally falling back to comma during a later operation.
+    public var delimiter: UInt8 { configuration.delimiter }
+
     @discardableResult
     public func scanNextChunk(
         cancellation: CancellationCheck? = nil
@@ -1075,7 +1080,7 @@ public nonisolated enum CSVHeaderDetector {
         guard identifierLike * 4 >= labels.count * 3 else { return false }
         let textualLabels = labels.filter { scalarKind($0) == .text }.count
         guard textualLabels * 4 >= labels.count * 3 else { return false }
-        guard let second else { return true }
+        guard let second else { return hasStrongHeaderVocabulary(labels) }
 
         let values = second.fields.map(\.value)
         let comparisonCount = min(labels.count, values.count)
@@ -1083,7 +1088,29 @@ public nonisolated enum CSVHeaderDetector {
         for index in 0..<comparisonCount where scalarKind(labels[index]) != scalarKind(values[index]) {
             if scalarKind(labels[index]) == .text, scalarKind(values[index]) != .text { return true }
         }
-        return labels.contains { $0.contains("_") || $0.contains(" ") }
+        return hasStrongHeaderVocabulary(labels)
+    }
+
+    /// All-text data is fundamentally ambiguous. Spaces alone are not header
+    /// evidence—ordinary values such as city and person names contain them.
+    /// Prefer a conservative false negative (the user can enable the header)
+    /// over silently hiding the first data record.
+    private static func hasStrongHeaderVocabulary(_ labels: [String]) -> Bool {
+        let commonHeaderWords: Set<String> = [
+            "id", "name", "title", "description", "type", "status", "value",
+            "date", "time", "timestamp", "address", "city", "state", "country",
+            "zip", "postal", "code", "email", "phone", "first", "last",
+            "amount", "price", "quantity", "count", "total", "category",
+        ]
+        let signaled = labels.filter { label in
+            if label.contains("_") { return true }
+            let words = label
+                .lowercased()
+                .split { !$0.isLetter && !$0.isNumber }
+                .map(String.init)
+            return words.contains { commonHeaderWords.contains($0) }
+        }.count
+        return signaled * 2 >= labels.count
     }
 
     private enum ScalarKind { case empty, number, boolean, text }

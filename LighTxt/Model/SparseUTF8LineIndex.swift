@@ -217,6 +217,39 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
         progress.totalLineCount
     }
 
+    /// Releases the sparse checkpoints accumulated for the current immutable
+    /// source without changing that source. The first checkpoint and reader
+    /// are retained, so line lookups rebuild lazily and remain byte-exact.
+    ///
+    /// Advancing the generation prevents a scanner or lookup that captured the
+    /// pre-purge checkpoint array from publishing work after the reset. The
+    /// source revision deliberately stays unchanged because no document bytes
+    /// were edited.
+    @discardableResult
+    public func purgeRebuildableResidentMemory() -> Int {
+        withStateLock { state in
+            let reclaimed = max(
+                0,
+                (state.checkpoints.count - 1) * MemoryLayout<Int64>.stride
+            )
+            let next = Generation(
+                rawValue: state.generation.rawValue &+ 1,
+                sourceRevision: state.generation.sourceRevision
+            )
+            state = State(
+                generation: next,
+                byteCount: state.byteCount,
+                reader: state.reader,
+                checkpoints: [0],
+                scannedByteOffset: 0,
+                completedLineBreakCount: 0,
+                hasPendingCarriageReturn: false,
+                isComplete: state.byteCount == 0
+            )
+            return reclaimed
+        }
+    }
+
     /// Installs a new immutable source after an edit and invalidates all work
     /// captured from the previous generation. In-flight scans may finish their
     /// current bounded read, but can never commit stale checkpoints afterward.

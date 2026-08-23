@@ -37,6 +37,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         qos: .userInitiated,
         autoreleaseFrequency: .workItem
     )
+    private static let exportQueue = DispatchQueue(
+        label: "app.lightxt.csv-export",
+        qos: .userInitiated,
+        autoreleaseFrequency: .workItem
+    )
     private static let maximumSelectedRowMutationCount = 50_000
     private static let maximumPresentedColumns = 512
     private static let sampledRowsForColumns = 32
@@ -60,6 +65,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     var onEditingRegistrationChange: ((Bool) -> Void)?
 
     private let controls = NSView()
+    private let delimiterPopup = NSPopUpButton()
     private let headerCheckbox = NSButton(checkboxWithTitle: "First row is header", target: nil, action: nil)
     private lazy var clearFiltersButton = QuietButton(
         title: "Clear Filters",
@@ -75,6 +81,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     private let progressIndicator = NSProgressIndicator()
     private let scrollView = NSScrollView()
     private let tableView = LighTxtCSVTableView()
+    private let queryLoadingOverlay = CSVQueryLoadingOverlayView()
 
     private var snapshot: DocumentSnapshot?
     private var rowIndex: CSVRowIndex?
@@ -83,16 +90,19 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     private var queryCancellation: CancellationToken?
     private var summaryCancellation: CancellationToken?
     private var mutationCancellation: CancellationToken?
+    private var exportCancellation: CancellationToken?
     private var generation: UInt64 = 0
     private var pageDecodeGeneration: UInt64 = 0
     private var queryGeneration: UInt64 = 0
     private var summaryGeneration: UInt64 = 0
     private var mutationGeneration: UInt64 = 0
     private var firstRowIsHeader = false
+    private var delimiter: DelimitedTextDelimiter = .comma
     private var headerDetectionCompleted = false
     private var columnCount = 0
     private var cachedRecords: [Int64: CSVParsedRecord] = [:]
     private var cacheOrder: [Int64] = []
+    private var isResidentPresentationPurged = false
     /// Record zero supplies stable header titles even after ordinary row cache
     /// eviction. It is bounded to one parsed record and refreshed separately
     /// whenever record zero changes.
@@ -116,7 +126,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     private var uniqueValuesTask: Task<Void, Never>?
     private var pendingFilterQuery: DispatchWorkItem?
     private var activeSort: (column: Int, ascending: Bool)?
+    private var publishedFilters: [Int: CSVFilterDraft] = [:]
+    private var publishedSort: (column: Int, ascending: Bool)?
     private var isTableOperationInFlight = false
+    private var isQueryLoadingOverlayVisible = false
     private var isSettingSortDescriptors = false
 #if LIGHTXT_STANDALONE_CSV_QA
     private var qaQueryLaunchCountStorage = 0
@@ -145,12 +158,14 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         queryCancellation?.cancel()
         summaryCancellation?.cancel()
         mutationCancellation?.cancel()
+        exportCancellation?.cancel()
         uniqueValuesTask?.cancel()
         pendingFilterQuery?.cancel()
         displayedRowMap?.close()
     }
 
     func reloadDocument() {
+        isResidentPresentationPurged = false
         generation &+= 1
         let currentGeneration = generation
         indexingCancellation?.cancel()
@@ -184,11 +199,24 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
         do {
             let captured = try delegate.editorSnapshot()
-            let index = try CSVRowIndex(snapshot: captured)
+            let index = try CSVRowIndex(
+                snapshot: captured,
+                configuration: CSVRowIndex.Configuration(delimiter: delimiter.rawValue)
+            )
             snapshot = captured
             rowIndex = index
             latestProgress = index.progress
-            setBusy(true, text: "Indexing rows…")
+            if !activeFilters.isEmpty || activeSort != nil {
+                isTableOperationInFlight = true
+                showQueryLoadingOverlay(
+                    title: projectionVerb,
+                    detail: "Building the row index before applying this view…",
+                    fraction: index.progress.fractionCompleted
+                )
+                setOperationBusy(text: "Preparing \(projectionVerb.lowercased())…", fraction: 0)
+            } else {
+                setBusy(true, text: "Indexing rows…")
+            }
             startIndexing(
                 snapshot: captured,
                 index: index,
@@ -202,12 +230,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     func deactivate() {
         guard commitPendingEdit() else { return }
+        isResidentPresentationPurged = false
         generation &+= 1
         indexingCancellation?.cancel()
         indexingCancellation = nil
         cancelQueryAndCloseRowMap()
         cancelColumnSummaryRequest()
         cancelCSVMutation()
+        exportCancellation?.cancel()
+        exportCancellation = nil
+        isTableOperationInFlight = false
         cancelUniqueValueRequest()
         pendingFilterQuery?.cancel()
         pendingFilterQuery = nil
@@ -223,6 +255,95 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         pendingPages.removeAll(keepingCapacity: true)
         tableView.reloadData()
         setBusy(false, text: "CSV table paused")
+    }
+
+    /// Releases parsed presentation rows and visible cell strings without
+    /// touching the source snapshot, sparse row index, disk-backed projection
+    /// map, filters, sort, or selection. Since CSV edits commit before AppKit
+    /// ends field editing, an active field is conservatively left resident.
+    var hasPurgedRebuildableResidentMemory: Bool { isResidentPresentationPurged }
+
+    @discardableResult
+    func purgeRebuildableResidentMemory() -> Bool {
+        guard !isResidentPresentationPurged else { return false }
+        guard !isEditingRegistered, presentedPopover == nil else { return false }
+
+        isResidentPresentationPurged = true
+        pageDecodeGeneration &+= 1
+        pendingPages.removeAll(keepingCapacity: false)
+        cachedRecords.removeAll(keepingCapacity: false)
+        cacheOrder.removeAll(keepingCapacity: false)
+        firstParsedRecord = nil
+        reloadTablePreservingSelection()
+        return true
+    }
+
+    /// Visible pages are decoded lazily after reactivation. This is idempotent
+    /// and preserves the exact disk-backed filter/sort projection.
+    func reactivateAfterResidentPurge() {
+        guard isResidentPresentationPurged else { return }
+        isResidentPresentationPurged = false
+        reloadTablePreservingSelection()
+        if firstRowIsHeader { _ = recordForDisplay(0) }
+    }
+
+    var canExportCurrentView: Bool {
+        let session = editorDelegate as? LighTxtDocumentSession
+        return snapshot != nil
+            && rowIndex != nil
+            && !isResidentPresentationPurged
+            && !isTableOperationInFlight
+            && exportCancellation == nil
+            && session?.isSourceTextValidated != false
+    }
+
+    var isExporting: Bool { exportCancellation != nil }
+
+    func refreshDocumentAccessState() {
+        reloadVisibleEditableCells()
+    }
+
+    func exportCurrentView() {
+        guard canExportCurrentView else {
+            NSSound.beep()
+            return
+        }
+        guard commitPendingEdit() else { return }
+
+        let selectedRows = tableView.selectedRowIndexes
+        let accessory = TabularExportAccessoryView(
+            selectedRowCount: selectedRows.count,
+            hasHeaders: firstRowIsHeader
+        )
+        let panel = NSSavePanel()
+        panel.title = "Export Table"
+        panel.prompt = "Export"
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        panel.nameFieldStringValue = "Export.csv"
+        panel.accessoryView = accessory
+        accessory.onFormatChange = { [weak panel] format in
+            guard let panel else { return }
+            let base = URL(fileURLWithPath: panel.nameFieldStringValue)
+                .deletingPathExtension().lastPathComponent
+            panel.nameFieldStringValue = "\(base).\(format.preferredPathExtension)"
+        }
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self, weak panel] response in
+            guard response == .OK, let self, let url = panel?.url else { return }
+            self.beginExport(to: url, request: accessory.request)
+        }
+        if let window {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
+    func cancelExport() {
+        guard let exportCancellation else { return }
+        exportCancellation.cancel()
+        setOperationBusy(text: "Cancelling export…", fraction: nil)
     }
 
     @discardableResult
@@ -291,6 +412,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         requestApplyQuery()
     }
 
+    func setDelimiter(_ delimiter: DelimitedTextDelimiter, reload: Bool = true) {
+        guard self.delimiter != delimiter else {
+            synchronizeDelimiterPopup()
+            return
+        }
+        self.delimiter = delimiter
+        synchronizeDelimiterPopup()
+        if reload { reloadDocument() }
+    }
+
     /// A table cell commit installs a rebased sparse index before notifying
     /// the document session. The window controller consumes this one-shot flag
     /// so the same synchronous callback does not discard that index and start
@@ -309,6 +440,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     private func configureControls() {
         controls.wantsLayer = true
+        for delimiter in DelimitedTextDelimiter.allCases {
+            delimiterPopup.addItem(withTitle: delimiter.displayName)
+            delimiterPopup.lastItem?.representedObject = Int(delimiter.rawValue)
+        }
+        delimiterPopup.target = self
+        delimiterPopup.action = #selector(delimiterSettingChanged(_:))
+        delimiterPopup.controlSize = .regular
+        delimiterPopup.setAccessibilityLabel("Table delimiter")
+        delimiterPopup.setAccessibilityHelp("Choose comma, tab, semicolon, or pipe-separated fields")
+        synchronizeDelimiterPopup()
         headerCheckbox.target = self
         headerCheckbox.action = #selector(headerSettingChanged(_:))
         headerCheckbox.controlSize = .regular
@@ -394,6 +535,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         scrollView.tile()
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
+        LighTxtComfortScroller.install(
+            in: scrollView,
+            vertical: true,
+            horizontal: true
+        )
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = true
@@ -414,11 +560,12 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     private func configureLayout() {
-        [controls, scrollView].forEach {
+        [controls, scrollView, queryLoadingOverlay].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             addSubview($0)
         }
-        [headerCheckbox, filterStripScrollView, statusLabel, progressIndicator].forEach {
+        queryLoadingOverlay.isHidden = true
+        [delimiterPopup, headerCheckbox, filterStripScrollView, statusLabel, progressIndicator].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             controls.addSubview($0)
         }
@@ -437,7 +584,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             controls.topAnchor.constraint(equalTo: topAnchor),
             controls.heightAnchor.constraint(equalToConstant: 48),
 
-            headerCheckbox.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 16),
+            delimiterPopup.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 16),
+            delimiterPopup.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
+            delimiterPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
+            headerCheckbox.leadingAnchor.constraint(equalTo: delimiterPopup.trailingAnchor, constant: 12),
             headerCheckbox.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
             filterStripScrollView.leadingAnchor.constraint(equalTo: headerCheckbox.trailingAnchor, constant: 12),
             filterStripScrollView.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
@@ -455,6 +605,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: controls.bottomAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            queryLoadingOverlay.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            queryLoadingOverlay.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+            queryLoadingOverlay.topAnchor.constraint(equalTo: scrollView.topAnchor),
+            queryLoadingOverlay.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
         ])
     }
 
@@ -493,6 +648,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                     sample.append(try CSVRecordParser.parse(
                         snapshot: snapshot,
                         location: location,
+                        delimiter: index.delimiter,
                         limits: parseLimits,
                         cancellation: { cancellation.isCancelled }
                     ))
@@ -531,7 +687,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             } catch {
                 DispatchQueue.main.async { [weak self] in
                     guard self?.generation == generation else { return }
-                    self?.report(error)
+                    self?.handleIndexingFailure(error)
                 }
             }
         }
@@ -568,10 +724,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             } catch {
                 DispatchQueue.main.async { [weak self] in
                     guard self?.generation == generation else { return }
-                    self?.report(error)
+                    self?.handleIndexingFailure(error)
                 }
             }
         }
+    }
+
+    private func handleIndexingFailure(_ error: Error) {
+        indexingCancellation = nil
+        cancelQueryAndCloseRowMap()
+        report(error)
     }
 
     private func receiveInitialSample(
@@ -615,6 +777,13 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         if progress.isComplete {
             setBusy(false, text: "\(rows.formatted()) rows")
         } else {
+            if !activeFilters.isEmpty || activeSort != nil {
+                showQueryLoadingOverlay(
+                    title: projectionVerb,
+                    detail: "Finishing the row index  ·  \(rows.formatted()) rows ready",
+                    fraction: progress.fractionCompleted
+                )
+            }
             setBusy(
                 true,
                 text: "Indexing \(Int(progress.fractionCompleted * 100))%  ·  \(rows.formatted()) rows"
@@ -798,13 +967,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             // An absent field is intentionally editable: committing it appends
             // the required delimiters to this record without touching any
             // other bytes.
-            cell.isEditable = !isTableOperationInFlight
+            let documentIsReadOnly = (editorDelegate as? LighTxtDocumentSession)?.isReadOnly == true
+            cell.isEditable = !documentIsReadOnly && !isTableOperationInFlight
             cell.originalFieldCount = parsed.fields.count
             if let field = parsed.fields[safe: column] {
                 cell.stringValue = field.value
                 cell.originalValue = field.value
                 cell.byteRange = field.byteRange
-                cell.isEditable = !field.wasTruncated && !isTableOperationInFlight
+                cell.isEditable = !documentIsReadOnly
+                    && !field.wasTruncated
+                    && !isTableOperationInFlight
                 if field.wasTruncated {
                     cell.toolTip = "This field is larger than the table preview limit. Edit it safely in text mode."
                 }
@@ -909,6 +1081,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     private func recordForDisplay(_ record: Int64) -> CSVParsedRecord? {
+        guard !isResidentPresentationPurged else { return nil }
         if let cached = cachedRecords[record] {
             touchCache(record)
             return cached
@@ -928,6 +1101,17 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         return nil
     }
 
+    private func reloadTablePreservingSelection() {
+        let selection = tableView.selectedRowIndexes
+        tableView.reloadData()
+        let rowCount = numberOfRows(in: tableView)
+        var validSelection = IndexSet()
+        for row in selection where row >= 0 && row < rowCount {
+            validSelection.insert(row)
+        }
+        tableView.selectRowIndexes(validSelection, byExtendingSelection: false)
+    }
+
     private func schedulePageDecode(
         pageStart: Int64,
         pageRecordCount: Int,
@@ -937,6 +1121,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         pageGeneration: UInt64,
         cancellation: CancellationToken
     ) {
+        guard !isResidentPresentationPurged else { return }
         guard pendingPages.insert(pageStart).inserted else { return }
         let limits = Self.presentationParseLimits
         Self.pageDecodingQueue.async { [weak self] in
@@ -954,6 +1139,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                         try CSVRecordParser.parse(
                             snapshot: snapshot,
                             location: location,
+                            delimiter: rowIndex.delimiter,
                             limits: limits,
                             cancellation: { cancellation.isCancelled }
                         )
@@ -1020,7 +1206,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             return
         }
         do {
-            let replacement = CSVRecordParser.encodedField(field.stringValue)
+            let replacement = CSVRecordParser.encodedField(
+                field.stringValue,
+                delimiter: rowIndex.delimiter
+            )
             let editRange: Range<Int64>
             let replacementBytes: Data
             if let existing = field.byteRange {
@@ -1031,7 +1220,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                     throw CSVRowIndex.IndexError.inconsistentCheckpointData
                 }
                 let missingSeparators = max(1, field.column - field.originalFieldCount + 1)
-                var appended = Data(repeating: 0x2C, count: missingSeparators)
+                var appended = Data(
+                    repeating: rowIndex.delimiter,
+                    count: missingSeparators
+                )
                 appended.append(replacement)
                 editRange = location.contentRange.upperBound..<location.contentRange.upperBound
                 replacementBytes = appended
@@ -1169,6 +1361,27 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         setFirstRowIsHeader(sender.state == .on)
     }
 
+    @objc private func delimiterSettingChanged(_ sender: NSPopUpButton) {
+        guard !isTableOperationInFlight,
+              commitPendingEdit(),
+              let raw = sender.selectedItem?.representedObject as? Int,
+              let selected = DelimitedTextDelimiter(rawValue: UInt8(clamping: raw)) else {
+            synchronizeDelimiterPopup()
+            NSSound.beep()
+            return
+        }
+        (editorDelegate as? LighTxtDocumentSession)?.setDelimitedTextDelimiter(selected)
+        setDelimiter(selected)
+    }
+
+    private func synchronizeDelimiterPopup() {
+        if let item = delimiterPopup.itemArray.first(where: {
+            ($0.representedObject as? Int) == Int(delimiter.rawValue)
+        }) {
+            delimiterPopup.select(item)
+        }
+    }
+
     private func columnMenu(forTableColumn tableColumn: Int) -> NSMenu? {
         guard let column = dataColumn(forTableColumnIndex: tableColumn) else { return nil }
         focusedDataColumn = column
@@ -1210,16 +1423,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
         let before = menuItem("Add Column Before", symbol: "arrow.left.to.line.compact", action: #selector(addColumnBefore(_:)))
         before.representedObject = column
-        before.isEnabled = canStartDatasetOperation
+        before.isEnabled = canStartDatasetMutation
         menu.addItem(before)
         let after = menuItem("Add Column After", symbol: "arrow.right.to.line.compact", action: #selector(addColumnAfter(_:)))
         after.representedObject = column
-        after.isEnabled = canStartDatasetOperation
+        after.isEnabled = canStartDatasetMutation
             && column + 1 < Self.maximumPresentedColumns
         menu.addItem(after)
         let delete = menuItem("Delete Column…", symbol: "trash", action: #selector(deleteCurrentColumn(_:)))
         delete.representedObject = column
-        delete.isEnabled = canStartDatasetOperation
+        delete.isEnabled = canStartDatasetMutation
         menu.addItem(delete)
         return menu
     }
@@ -1234,7 +1447,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                 symbol: "plus.rectangle.on.rectangle",
                 action: #selector(addRowBelow(_:))
             )
-            addRow.isEnabled = canStartDatasetOperation
+            addRow.isEnabled = canStartDatasetMutation
             menu.addItem(addRow)
             if columnCount == 0 {
                 let addColumn = menuItem(
@@ -1242,7 +1455,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                     symbol: "rectangle.split.1x2",
                     action: #selector(addFirstColumn(_:))
                 )
-                addColumn.isEnabled = canStartDatasetOperation
+                addColumn.isEnabled = canStartDatasetMutation
                 menu.addItem(addColumn)
             }
             return menu
@@ -1260,14 +1473,14 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             symbol: "arrow.up.to.line.compact",
             action: #selector(addRowAbove(_:))
         )
-        above.isEnabled = canStartDatasetOperation
+        above.isEnabled = canStartDatasetMutation
         menu.addItem(above)
         let below = menuItem(
             "Add Row Below",
             symbol: "arrow.down.to.line.compact",
             action: #selector(addRowBelow(_:))
         )
-        below.isEnabled = canStartDatasetOperation
+        below.isEnabled = canStartDatasetMutation
         menu.addItem(below)
         menu.addItem(.separator())
         let deleteTitle = selectedRows.count > 1
@@ -1278,7 +1491,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             symbol: "trash",
             action: #selector(deleteSelectedRows(_:))
         )
-        deleteRows.isEnabled = canStartDatasetOperation && !selectedRows.isEmpty
+        deleteRows.isEnabled = canStartDatasetMutation && !selectedRows.isEmpty
         menu.addItem(deleteRows)
         return menu
     }
@@ -1348,9 +1561,23 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         latestProgress?.isComplete == true && !isTableOperationInFlight
     }
 
+    private var canStartDatasetMutation: Bool {
+        canStartDatasetOperation
+            && (editorDelegate as? LighTxtDocumentSession)?.isReadOnly != true
+    }
+
     @discardableResult
     private func guardDatasetOperationAvailable() -> Bool {
         guard canStartDatasetOperation else {
+            NSSound.beep()
+            return false
+        }
+        return true
+    }
+
+    @discardableResult
+    private func guardDatasetMutationAvailable() -> Bool {
+        guard canStartDatasetMutation else {
             NSSound.beep()
             return false
         }
@@ -1383,7 +1610,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     @objc private func addRowAbove(_ sender: Any?) {
-        guard guardDatasetOperationAvailable() else { return }
+        guard guardDatasetMutationAvailable() else { return }
         do {
             let sourceRecord: Int64
             if let selected = selectedVisibleRows().first {
@@ -1398,7 +1625,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     @objc private func addRowBelow(_ sender: Any?) {
-        guard guardDatasetOperationAvailable() else { return }
+        guard guardDatasetMutationAvailable() else { return }
         do {
             let sourceRecord: Int64
             if let selected = selectedVisibleRows().last {
@@ -1415,22 +1642,22 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     @objc private func addColumnBefore(_ sender: Any?) {
-        guard guardDatasetOperationAvailable() else { return }
+        guard guardDatasetMutationAvailable() else { return }
         requestAddColumn(at: representedColumn(sender))
     }
 
     @objc private func addFirstColumn(_ sender: Any?) {
-        guard guardDatasetOperationAvailable() else { return }
+        guard guardDatasetMutationAvailable() else { return }
         requestAddColumn(at: 0)
     }
 
     @objc private func addColumnAfter(_ sender: Any?) {
-        guard guardDatasetOperationAvailable() else { return }
+        guard guardDatasetMutationAvailable() else { return }
         requestAddColumn(at: representedColumn(sender) + 1)
     }
 
     @objc private func deleteSelectedRows(_ sender: Any?) {
-        guard guardDatasetOperationAvailable() else { return }
+        guard guardDatasetMutationAvailable() else { return }
         let rows = selectedVisibleRows()
         guard !rows.isEmpty else { return }
         guard rows.count <= Self.maximumSelectedRowMutationCount else {
@@ -1463,7 +1690,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     @objc private func deleteCurrentColumn(_ sender: Any?) {
-        guard guardDatasetOperationAvailable() else { return }
+        guard guardDatasetMutationAvailable() else { return }
         guard columnCount > 0 else { return }
         let column = representedColumn(sender)
         let title = tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
@@ -1613,6 +1840,18 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         queryCancellation?.cancel()
         queryCancellation = nil
         pendingFilterQuery?.cancel()
+        isTableOperationInFlight = true
+        showQueryLoadingOverlay(
+            title: activeFilters.isEmpty && activeSort == nil ? "Restoring all rows" : projectionVerb,
+            detail: "Preparing a fresh table view…",
+            fraction: nil
+        )
+        setOperationBusy(
+            text: activeFilters.isEmpty && activeSort == nil
+                ? "Restoring all rows…"
+                : "\(projectionVerb)…",
+            fraction: nil
+        )
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingFilterQuery = nil
@@ -1801,6 +2040,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     /// Core integration lives behind these methods so the native AppKit state
     /// machine stays independent from the bounded, file-backed algorithms.
     private func requestSort(column: Int?, ascending: Bool) {
+        guard !isEditingRegistered || commitPendingEdit() else { return }
         activeSort = column.map { ($0, ascending) }
         requestApplyQuery()
     }
@@ -1809,7 +2049,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         // Filter controls have their own committed/draft lifecycle. Ending all
         // window editing here would steal focus from a popover or inline
         // search field shortly after the user typed the first characters.
-        guard !isEditingRegistered || commitPendingEdit() else { return }
+        guard !isEditingRegistered || commitPendingEdit() else {
+            restorePublishedProjectionAfterQueryRefusal()
+            return
+        }
 #if LIGHTXT_STANDALONE_CSV_QA
         qaQueryLaunchCountStorage += 1
 #endif
@@ -1826,20 +2069,31 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             pageDecodeGeneration &+= 1
             pendingPages.removeAll(keepingCapacity: true)
             isTableOperationInFlight = false
+            publishedFilters = activeFilters
+            publishedSort = activeSort
             tableView.deselectAll(nil)
             tableView.reloadData()
+            hideQueryLoadingOverlay()
             restoreTableStatus()
             return
         }
         guard latestProgress?.isComplete == true else {
             let rows = latestProgress?.knownRecordCount ?? 0
+            showQueryLoadingOverlay(
+                title: projectionVerb,
+                detail: "Finishing the row index  ·  \(rows.formatted()) rows ready",
+                fraction: latestProgress?.fractionCompleted
+            )
             setOperationBusy(
                 text: "Preparing \(projectionVerb.lowercased())…  ·  \(rows.formatted()) rows indexed",
                 fraction: latestProgress?.fractionCompleted
             )
             return
         }
-        guard let snapshot, let rowIndex else { return }
+        guard let snapshot, let rowIndex else {
+            hideQueryLoadingOverlay()
+            return
+        }
 
         let filters = coreFilters()
         let sortDescriptors: [CSVSortDescriptor]
@@ -1861,6 +2115,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         let cancellation = CancellationToken()
         queryCancellation = cancellation
         isTableOperationInFlight = true
+        showQueryLoadingOverlay(
+            title: projectionVerb,
+            detail: "Scanning rows and building the new result…",
+            fraction: 0
+        )
         setOperationBusy(text: "\(projectionVerb)…", fraction: 0)
 
         Self.queryQueue.async { [weak self] in
@@ -1903,8 +2162,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                     self.pendingPages.removeAll(keepingCapacity: true)
                     self.queryCancellation = nil
                     self.isTableOperationInFlight = false
+                    self.publishedFilters = self.activeFilters
+                    self.publishedSort = self.activeSort
                     self.tableView.deselectAll(nil)
                     self.tableView.reloadData()
+                    self.hideQueryLoadingOverlay()
                     self.restorePendingScrollIfPossible()
                     self.restoreTableStatus()
                 }
@@ -1930,6 +2192,28 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                 }
             }
         }
+    }
+
+    private func restorePublishedProjectionAfterQueryRefusal() {
+        activeFilters = publishedFilters
+        activeSort = publishedSort
+        isSettingSortDescriptors = true
+        if let publishedSort,
+           let tableColumn = tableColumn(forDataColumn: publishedSort.column) {
+            tableView.sortDescriptors = [
+                NSSortDescriptor(
+                    key: tableColumn.identifier.rawValue,
+                    ascending: publishedSort.ascending
+                ),
+            ]
+        } else {
+            tableView.sortDescriptors = []
+        }
+        isSettingSortDescriptors = false
+        isTableOperationInFlight = false
+        updateFilterChrome()
+        hideQueryLoadingOverlay()
+        restoreTableStatus()
     }
 
     private func coreFilters(excluding excludedColumn: Int? = nil) -> [CSVColumnFilter] {
@@ -1967,6 +2251,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         }
         let fraction = total.flatMap { $0 > 0 ? Double(progress.scannedRecordCount) / Double($0) : 1 }
         let percent = Int(min(1, max(0, fraction ?? progress.indexedFractionCompleted)) * 100)
+        showQueryLoadingOverlay(
+            title: projectionVerb,
+            detail: "\(progress.matchedRecordCount.formatted()) matches  ·  \(progress.scannedRecordCount.formatted()) rows checked",
+            fraction: fraction ?? progress.indexedFractionCompleted
+        )
         setOperationBusy(
             text: "\(projectionVerb) \(percent)%  ·  \(progress.matchedRecordCount.formatted()) matches",
             fraction: fraction ?? progress.indexedFractionCompleted
@@ -1982,10 +2271,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         pageDecodeGeneration &+= 1
         pendingPages.removeAll(keepingCapacity: true)
         isTableOperationInFlight = false
+        hideQueryLoadingOverlay()
     }
 
     private func requestAddRow(atSourceRecord record: Int64) {
-        guard guardDatasetOperationAvailable(),
+        guard guardDatasetMutationAvailable(),
               commitPendingEdit(),
               let snapshot,
               let rowIndex,
@@ -2007,7 +2297,8 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                 values: Array(repeating: "", count: columnCount),
                 beforeRecord: record,
                 snapshot: snapshot,
-                index: rowIndex
+                index: rowIndex,
+                delimiter: rowIndex.delimiter
             )]
         } apply: { [weak self] edits, generation, cancellation in
             guard let self else { return }
@@ -2029,7 +2320,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             NSSound.beep()
             return
         }
-        guard guardDatasetOperationAvailable(),
+        guard guardDatasetMutationAvailable(),
               commitPendingEdit(),
               let snapshot,
               let rowIndex,
@@ -2107,7 +2398,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     private func requestAddColumn(at column: Int) {
-        guard guardDatasetOperationAvailable() else { return }
+        guard guardDatasetMutationAvailable() else { return }
         guard guardVisibleColumnInsertion(at: column) else { return }
         let isEmptyDocument = snapshot?.byteCount == 0
         guard firstRowIsHeader || isEmptyDocument else {
@@ -2174,12 +2465,12 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     private func requestDeleteColumn(_ column: Int) {
-        guard guardDatasetOperationAvailable() else { return }
+        guard guardDatasetMutationAvailable() else { return }
         applyColumnMutation(.delete(column: column), label: "Deleting column")
     }
 
     private func requestBootstrapColumn(named name: String) {
-        guard guardDatasetOperationAvailable(),
+        guard guardDatasetMutationAvailable(),
               commitPendingEdit(),
               let snapshot,
               snapshot.byteCount == 0,
@@ -2191,7 +2482,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         }
         beginMutationPlanning(status: "Adding column…") { cancellation in
             if cancellation.isCancelled { throw CancellationError() }
-            var bytes = CSVRecordParser.encodedField(name)
+            var bytes = CSVRecordParser.encodedField(
+                name,
+                delimiter: self.delimiter.rawValue
+            )
             bytes.append(0x0A)
             return [ByteEdit(byteRange: 0..<0, replacement: bytes)]
         } apply: { [weak self] edits, generation, cancellation in
@@ -2277,7 +2571,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     private func applyColumnMutation(_ mutation: CSVColumnMutation, label: String) {
-        guard guardDatasetOperationAvailable(),
+        guard guardDatasetMutationAvailable(),
               commitPendingEdit(),
               let snapshot,
               let rowIndex,
@@ -2712,6 +3006,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     var qaStructuralMutationInFlight: Bool { mutationCancellation != nil }
     var qaQueryLaunchCount: Int { qaQueryLaunchCountStorage }
     var qaHeaderRetileCount: Int { qaHeaderRetileCountStorage }
+    var qaIsQueryLoadingOverlayVisible: Bool {
+        isQueryLoadingOverlayVisible && !queryLoadingOverlay.isHidden
+    }
+    var qaQueryOverlayConsumesHitTest: Bool {
+        queryLoadingOverlay.hitTest(
+            NSPoint(x: queryLoadingOverlay.bounds.midX, y: queryLoadingOverlay.bounds.midY)
+        ) != nil
+    }
+    var qaPresentedTableAlpha: CGFloat { scrollView.alphaValue }
+    var qaPresentedTableIsEnabled: Bool { tableView.isEnabled }
     var qaPopoverContentView: NSView? { presentedPopover?.contentViewController?.view }
 
     func qaPreparePopoverCaptureBackground() {
@@ -2823,6 +3127,8 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         cancelColumnSummaryRequest()
         activeSort = nil
         activeFilters.removeAll(keepingCapacity: true)
+        publishedSort = nil
+        publishedFilters.removeAll(keepingCapacity: true)
         isSettingSortDescriptors = true
         tableView.sortDescriptors = []
         isSettingSortDescriptors = false
@@ -2835,6 +3141,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         progressIndicator.doubleValue = latestProgress?.fractionCompleted ?? (busy ? 0 : 1)
         progressIndicator.isHidden = !busy
         headerCheckbox.isEnabled = latestProgress?.isComplete == true && !isTableOperationInFlight
+        delimiterPopup.isEnabled = !isTableOperationInFlight
         onStatusChange?(text, busy)
     }
 
@@ -2845,8 +3152,72 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         progressIndicator.doubleValue = min(1, max(0, fraction ?? 0))
         progressIndicator.isHidden = false
         headerCheckbox.isEnabled = false
+        delimiterPopup.isEnabled = false
         onStatusChange?(text, true)
         reloadVisibleEditableCells()
+    }
+
+    /// A query is transactional from the user's point of view: the rows
+    /// underneath remain the last complete result until the next row map is
+    /// ready. Fade and cover those stale rows so they can never be mistaken
+    /// for the filter currently shown in the header.
+    private func showQueryLoadingOverlay(
+        title: String,
+        detail: String,
+        fraction: Double?
+    ) {
+        queryLoadingOverlay.update(title: title, detail: detail, progress: fraction)
+        queryLoadingOverlay.blocksInteraction = true
+        tableView.isEnabled = false
+        scrollView.setAccessibilityHidden(true)
+        queryLoadingOverlay.startAnimating()
+
+        guard !isQueryLoadingOverlayVisible else { return }
+        isQueryLoadingOverlayVisible = true
+        queryLoadingOverlay.isHidden = false
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if reduceMotion {
+            scrollView.alphaValue = 0.30
+            queryLoadingOverlay.alphaValue = 1
+            return
+        }
+        queryLoadingOverlay.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            scrollView.animator().alphaValue = 0.30
+            queryLoadingOverlay.animator().alphaValue = 1
+        }
+    }
+
+    private func hideQueryLoadingOverlay() {
+        queryLoadingOverlay.blocksInteraction = false
+        tableView.isEnabled = true
+        scrollView.setAccessibilityHidden(false)
+        queryLoadingOverlay.stopAnimating()
+        guard isQueryLoadingOverlayVisible || !queryLoadingOverlay.isHidden else {
+            scrollView.alphaValue = 1
+            return
+        }
+        isQueryLoadingOverlayVisible = false
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if reduceMotion {
+            scrollView.alphaValue = 1
+            queryLoadingOverlay.alphaValue = 0
+            queryLoadingOverlay.isHidden = true
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.14
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            scrollView.animator().alphaValue = 1
+            queryLoadingOverlay.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isQueryLoadingOverlayVisible else { return }
+                self.queryLoadingOverlay.isHidden = true
+            }
+        }
     }
 
     private func restoreTableStatus() {
@@ -2889,6 +3260,215 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         )
     }
 
+    private func beginExport(to url: URL, request: TabularExportRequest) {
+        guard let snapshot, let rowIndex, !isTableOperationInFlight else {
+            NSSound.beep()
+            return
+        }
+        let expectedDestination: FileFingerprint?
+        do {
+            // Freeze the destination at save-panel acceptance. Capturing this
+            // later on the worker could silently bless a file changed during
+            // the handoff from the sheet to the export queue.
+            let accessStarted = url.startAccessingSecurityScopedResource()
+            defer { if accessStarted { url.stopAccessingSecurityScopedResource() } }
+            expectedDestination = try TabularExportSink.expectedDestination(at: url)
+        } catch {
+            report(error)
+            return
+        }
+
+        // Export scope is row-based in the shared accessory. Always preserve
+        // the complete presented schema, matching Parquet table export.
+        let columns = Array(0..<columnCount)
+        let columnNames = columns.map { column in
+            tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
+        }
+        let selectedDisplayedRows = request.scope == .selectedRows
+            ? tableView.selectedRowIndexes
+            : nil
+        guard request.scope != .selectedRows || selectedDisplayedRows?.isEmpty == false else {
+            NSSound.beep()
+            return
+        }
+
+        let displayedMap = displayedRowMap
+        let firstRecord: Int64 = firstRowIsHeader ? 1 : 0
+        let totalRows: Int64? = selectedDisplayedRows.map { Int64($0.count) }
+            ?? displayedMap?.rowCount
+            ?? latestProgress?.totalRecordCount.map { max(0, $0 - firstRecord) }
+        let headers = request.includesHeaders ? columnNames : nil
+        let format = request.format
+        let cancellation = CancellationToken()
+        exportCancellation = cancellation
+        isTableOperationInFlight = true
+        setOperationBusy(text: "Exporting table…", fraction: 0)
+
+        Self.exportQueue.async { [weak self] in
+            let accessStarted = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessStarted { url.stopAccessingSecurityScopedResource() }
+            }
+            let result: Result<Int64, Error>
+            do {
+                let sink = try TabularExportSink(
+                    targetURL: url,
+                    format: format,
+                    headers: headers,
+                    expectedDestination: expectedDestination
+                )
+                var completed: Int64 = 0
+                var lastProgress = ContinuousClock.now
+
+                func reportProgress(force: Bool = false) {
+                    let now = ContinuousClock.now
+                    guard force || now - lastProgress >= .milliseconds(120) else { return }
+                    lastProgress = now
+                    let update = TabularExportProgress(rowsWritten: completed, totalRows: totalRows)
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.exportCancellation === cancellation else { return }
+                        if let fraction = update.fractionCompleted {
+                            let percent = Int(fraction * 100)
+                            self.setOperationBusy(
+                                text: "Exporting \(percent)%  ·  \(completed.formatted()) rows",
+                                fraction: fraction
+                            )
+                        } else {
+                            self.setOperationBusy(
+                                text: "Exporting…  ·  \(completed.formatted()) rows",
+                                fraction: nil
+                            )
+                        }
+                    }
+                }
+
+                func append(location: CSVRowIndex.RecordLocation) throws {
+                    if cancellation.isCancelled { throw CancellationError() }
+                    let selected = try CSVRecordParser.selectedFields(
+                        snapshot: snapshot,
+                        location: location,
+                        columns: Set(columns),
+                        delimiter: rowIndex.delimiter,
+                        maximumValueBytesPerField: 4 << 20,
+                        maximumRetainedValueBytes: 16 << 20,
+                        cancellation: { cancellation.isCancelled }
+                    )
+                    for column in columns where selected.fields[column]?.wasTruncated == true {
+                        throw NSError(
+                            domain: "app.lightxt.table-export",
+                            code: 1,
+                            userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "Row \(location.record + 1), column \(column + 1) is larger than the 4 MB exact export limit. No partial file was written."
+                            ]
+                        )
+                    }
+                    try sink.append(row: columns.map { selected.fields[$0]?.value })
+                    completed += 1
+                    reportProgress()
+                }
+
+                do {
+                    if let selectedDisplayedRows {
+                        // Iterate the existing compact IndexSet and translate
+                        // filtered/sorted rows in bounded pages. Do not build a
+                        // second O(selection) source-record array.
+                        for contiguous in selectedDisplayedRows.rangeView {
+                            var displayed = Int64(contiguous.lowerBound)
+                            let upper = Int64(contiguous.upperBound)
+                            while displayed < upper {
+                                if cancellation.isCancelled { throw CancellationError() }
+                                let pageUpper = min(upper, displayed + 4_096)
+                                if let displayedMap {
+                                    let records = try displayedMap.records(in: displayed..<pageUpper)
+                                    for record in records {
+                                        guard let location = try rowIndex.recordLocation(
+                                            forRecord: record,
+                                            cancellation: { cancellation.isCancelled }
+                                        ) else { continue }
+                                        try append(location: location)
+                                    }
+                                } else {
+                                    var row = displayed
+                                    while row < pageUpper {
+                                        guard let location = try rowIndex.recordLocation(
+                                            forRecord: row + firstRecord,
+                                            cancellation: { cancellation.isCancelled }
+                                        ) else {
+                                            row += 1
+                                            continue
+                                        }
+                                        try append(location: location)
+                                        row += 1
+                                    }
+                                }
+                                displayed = pageUpper
+                            }
+                        }
+                    } else if let displayedMap {
+                        var offset: Int64 = 0
+                        while offset < displayedMap.rowCount {
+                            if cancellation.isCancelled { throw CancellationError() }
+                            let records = try displayedMap.records(
+                                in: offset..<min(displayedMap.rowCount, offset + 4_096)
+                            )
+                            guard !records.isEmpty else { break }
+                            for record in records {
+                                guard let location = try rowIndex.recordLocation(
+                                    forRecord: record,
+                                    cancellation: { cancellation.isCancelled }
+                                ) else { continue }
+                                try append(location: location)
+                            }
+                            offset += Int64(records.count)
+                        }
+                    } else {
+                        var record = firstRecord
+                        while true {
+                            if cancellation.isCancelled { throw CancellationError() }
+                            let locations = try rowIndex.recordLocations(
+                                startingAt: record,
+                                limit: 1_024,
+                                cancellation: { cancellation.isCancelled }
+                            )
+                            guard !locations.isEmpty else { break }
+                            for location in locations { try append(location: location) }
+                            record = locations[locations.count - 1].record + 1
+                        }
+                    }
+                    if cancellation.isCancelled { throw CancellationError() }
+                    try sink.finish()
+                    reportProgress(force: true)
+                    result = .success(completed)
+                } catch {
+                    sink.cancel()
+                    throw error
+                }
+            } catch {
+                result = .failure(error)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.exportCancellation === cancellation else { return }
+                self.exportCancellation = nil
+                self.isTableOperationInFlight = false
+                switch result {
+                case .success(let rows):
+                    self.setBusy(false, text: "Exported \(rows.formatted()) rows")
+                case .failure(let error) where error is CancellationError:
+                    self.restoreTableStatus()
+                    self.onStatusChange?("Export cancelled", false)
+                case .failure(let error as CSVRowIndex.IndexError) where error == .cancelled:
+                    self.restoreTableStatus()
+                    self.onStatusChange?("Export cancelled", false)
+                case .failure(let error):
+                    self.report(error)
+                }
+                self.reloadVisibleEditableCells()
+            }
+        }
+    }
+
     private func report(_ error: Error) {
         setBusy(false, text: error.localizedDescription)
         editorDelegate?.editorDidFail(error)
@@ -2897,6 +3477,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     private func reportOnce(_ error: Error) {
         guard lastReportedError != error.localizedDescription else { return }
         lastReportedError = error.localizedDescription
+        if isQueryLoadingOverlayVisible {
+            editorDelegate?.editorDidFail(error)
+            return
+        }
         report(error)
     }
 
@@ -2942,6 +3526,292 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             value /= 26
         }
         return output
+    }
+}
+
+@MainActor
+private final class CSVQueryLoadingOverlayView: NSView {
+    var blocksInteraction = false
+
+    private let card = NSVisualEffectView()
+    private let indicator = CSVQueryLoadingIndicatorView()
+    private let titleLabel = NSTextField(labelWithString: "Filtering")
+    private let detailLabel = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        setAccessibilityElement(true)
+        setAccessibilityRole(.progressIndicator)
+        setAccessibilityLabel("Updating table results")
+
+        card.material = .popover
+        card.blendingMode = .withinWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 16
+        card.layer?.masksToBounds = true
+
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.font = .systemFont(ofSize: 12.5, weight: .regular)
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.maximumNumberOfLines = 2
+
+        addSubview(card)
+        [indicator, titleLabel, detailLabel].forEach { card.addSubview($0) }
+        [card, indicator, titleLabel, detailLabel].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+        }
+
+        let preferredWidth = card.widthAnchor.constraint(equalToConstant: 430)
+        preferredWidth.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            card.centerXAnchor.constraint(equalTo: centerXAnchor),
+            card.centerYAnchor.constraint(equalTo: centerYAnchor),
+            card.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 24),
+            card.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -24),
+            card.widthAnchor.constraint(greaterThanOrEqualToConstant: 340),
+            preferredWidth,
+            card.heightAnchor.constraint(equalToConstant: 112),
+
+            indicator.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 24),
+            indicator.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            indicator.widthAnchor.constraint(equalToConstant: 104),
+            indicator.heightAnchor.constraint(equalToConstant: 64),
+
+            titleLabel.leadingAnchor.constraint(equalTo: indicator.trailingAnchor, constant: 20),
+            titleLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -24),
+            titleLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 27),
+            detailLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            detailLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            detailLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 7),
+            detailLabel.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor, constant: -22),
+        ])
+        applyResolvedAppearance()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyResolvedAppearance()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        blocksInteraction ? super.hitTest(point) : nil
+    }
+
+    func update(title: String, detail: String, progress: Double?) {
+        titleLabel.stringValue = title
+        detailLabel.stringValue = detail
+        indicator.progress = progress
+        setAccessibilityLabel(title)
+        setAccessibilityHelp(detail)
+        setAccessibilityValue(progress.map { Int(min(1, max(0, $0)) * 100) })
+    }
+
+    func startAnimating() {
+        indicator.startAnimating()
+    }
+
+    func stopAnimating() {
+        indicator.stopAnimating()
+    }
+
+    private func applyResolvedAppearance() {
+        let appearance = effectiveAppearance
+        let background = LighTxtTheme.resolved(LighTxtTheme.editorBackground, for: appearance)
+        let primary = LighTxtTheme.resolved(LighTxtTheme.primaryText, for: appearance)
+        let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
+        let separator = LighTxtTheme.resolved(LighTxtTheme.separator, for: appearance)
+        layer?.backgroundColor = background.withAlphaComponent(0.46).cgColor
+        card.layer?.borderColor = separator.withAlphaComponent(0.48).cgColor
+        card.layer?.borderWidth = 1
+        titleLabel.textColor = primary
+        detailLabel.textColor = secondary
+        indicator.applyResolvedAppearance()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+/// Rows drift beneath a scanning beam; matching cells pulse as the projected
+/// row map is assembled. It is intentionally table-shaped rather than a
+/// generic spinner so the animation explains the work without extra copy.
+@MainActor
+private final class CSVQueryLoadingIndicatorView: NSView {
+    var progress: Double? {
+        didSet {
+            if let progress {
+                setAccessibilityValue(Int(min(1, max(0, progress)) * 100))
+            } else {
+                setAccessibilityValue(nil)
+            }
+            positionStaticScannerIfNeeded()
+        }
+    }
+
+    private let viewportLayer = CALayer()
+    private let outlineLayer = CAShapeLayer()
+    private let scannerLayer = CAGradientLayer()
+    private var cellLayers: [CALayer] = []
+    private let highlightedCells: Set<Int> = [2, 6, 13, 17]
+    private var isAnimating = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        setAccessibilityElement(false)
+
+        viewportLayer.masksToBounds = true
+        viewportLayer.cornerRadius = 8
+        layer?.addSublayer(viewportLayer)
+
+        outlineLayer.fillColor = NSColor.clear.cgColor
+        outlineLayer.lineWidth = 1
+        viewportLayer.addSublayer(outlineLayer)
+
+        for _ in 0..<20 {
+            let cell = CALayer()
+            cell.cornerRadius = 2.5
+            cellLayers.append(cell)
+            viewportLayer.addSublayer(cell)
+        }
+
+        scannerLayer.startPoint = CGPoint(x: 0, y: 0.5)
+        scannerLayer.endPoint = CGPoint(x: 1, y: 0.5)
+        scannerLayer.locations = [0, 0.48, 0.52, 1]
+        viewportLayer.addSublayer(scannerLayer)
+        progress = nil
+        applyResolvedAppearance()
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        viewportLayer.frame = bounds.insetBy(dx: 2, dy: 4)
+        outlineLayer.frame = viewportLayer.bounds
+        outlineLayer.path = CGPath(
+            roundedRect: viewportLayer.bounds.insetBy(dx: 0.5, dy: 0.5),
+            cornerWidth: 8,
+            cornerHeight: 8,
+            transform: nil
+        )
+
+        let horizontalInset: CGFloat = 8
+        let verticalInset: CGFloat = 7
+        let columnGap: CGFloat = 4
+        let rowGap: CGFloat = 6
+        let columns: CGFloat = 5
+        let rows: CGFloat = 4
+        let cellWidth = max(
+            4,
+            (viewportLayer.bounds.width - horizontalInset * 2 - columnGap * (columns - 1)) / columns
+        )
+        let cellHeight = max(
+            4,
+            (viewportLayer.bounds.height - verticalInset * 2 - rowGap * (rows - 1)) / rows
+        )
+        for (index, cell) in cellLayers.enumerated() {
+            let row = CGFloat(index / 5)
+            let column = CGFloat(index % 5)
+            cell.frame = CGRect(
+                x: horizontalInset + column * (cellWidth + columnGap),
+                y: verticalInset + row * (cellHeight + rowGap),
+                width: cellWidth,
+                height: cellHeight
+            )
+        }
+        scannerLayer.frame = CGRect(
+            x: -34,
+            y: 1,
+            width: 34,
+            height: max(0, viewportLayer.bounds.height - 2)
+        )
+        CATransaction.commit()
+        positionStaticScannerIfNeeded()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyResolvedAppearance()
+    }
+
+    func applyResolvedAppearance() {
+        let appearance = effectiveAppearance
+        let accent = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
+        let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
+        viewportLayer.backgroundColor = secondary.withAlphaComponent(0.055).cgColor
+        outlineLayer.strokeColor = secondary.withAlphaComponent(0.24).cgColor
+        for (index, cell) in cellLayers.enumerated() {
+            cell.backgroundColor = (highlightedCells.contains(index) ? accent : secondary)
+                .withAlphaComponent(highlightedCells.contains(index) ? 0.92 : 0.25)
+                .cgColor
+        }
+        scannerLayer.colors = [
+            accent.withAlphaComponent(0).cgColor,
+            accent.withAlphaComponent(0.08).cgColor,
+            accent.withAlphaComponent(0.72).cgColor,
+            accent.withAlphaComponent(0).cgColor,
+        ]
+    }
+
+    func startAnimating() {
+        guard !isAnimating else { return }
+        isAnimating = true
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            positionStaticScannerIfNeeded()
+            return
+        }
+        layoutSubtreeIfNeeded()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        scannerLayer.setAffineTransform(.identity)
+        CATransaction.commit()
+
+        let scan = CABasicAnimation(keyPath: "transform.translation.x")
+        scan.fromValue = 0
+        scan.toValue = viewportLayer.bounds.width + 68
+        scan.duration = 1.18
+        scan.repeatCount = .infinity
+        scan.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        scannerLayer.add(scan, forKey: "csv.queryScan")
+
+        for (order, index) in highlightedCells.sorted().enumerated() {
+            let pulse = CAKeyframeAnimation(keyPath: "opacity")
+            pulse.values = [0.42, 1, 0.42]
+            pulse.keyTimes = [0, 0.48, 1]
+            pulse.duration = 1.25
+            pulse.beginTime = CACurrentMediaTime() + Double(order) * 0.14
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            cellLayers[index].add(pulse, forKey: "csv.matchPulse")
+        }
+    }
+
+    func stopAnimating() {
+        isAnimating = false
+        scannerLayer.removeAllAnimations()
+        cellLayers.forEach { $0.removeAllAnimations() }
+    }
+
+    private func positionStaticScannerIfNeeded() {
+        guard NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        let fraction = CGFloat(min(1, max(0, progress ?? 0.5)))
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        scannerLayer.setAffineTransform(
+            CGAffineTransform(translationX: fraction * (viewportLayer.bounds.width + 34), y: 0)
+        )
+        CATransaction.commit()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 }
 

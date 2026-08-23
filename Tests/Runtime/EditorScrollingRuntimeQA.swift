@@ -59,17 +59,54 @@ struct EditorScrollingRuntimeQA {
                 "Expected one whole-document Edit scroller, found \(wholeDocumentScrollers.count)"
             )
         }
+        guard let wholeDocumentScroller = wholeDocumentScrollers.first as? LighTxtComfortScroller,
+              scrollView.horizontalScroller is LighTxtComfortScroller else {
+            throw QAError.failed("Edit did not install the production comfort scrollers")
+        }
+        try assertComfortScrollerMetrics()
+        let expectedWholeDocumentWidth = LighTxtComfortScroller.scrollerWidth(
+            for: .small,
+            scrollerStyle: .overlay
+        )
+        guard abs(wholeDocumentScroller.bounds.width - expectedWholeDocumentWidth) < 0.5 else {
+            throw QAError.failed(
+                "Whole-document scroller width was \(wholeDocumentScroller.bounds.width), "
+                    + "expected \(expectedWholeDocumentWidth)"
+            )
+        }
+        guard let horizontalScroller = scrollView.horizontalScroller else {
+            throw QAError.failed("Edit horizontal comfort scroller disappeared during layout")
+        }
+        let nativeHorizontalHeight = NSScroller.scrollerWidth(
+            for: horizontalScroller.controlSize,
+            scrollerStyle: horizontalScroller.scrollerStyle
+        )
+        let expectedHorizontalHeight = LighTxtComfortScroller.scrollerWidth(
+            for: horizontalScroller.controlSize,
+            scrollerStyle: horizontalScroller.scrollerStyle
+        )
+        guard abs(horizontalScroller.bounds.height - expectedHorizontalHeight) < 0.5,
+              horizontalScroller.bounds.height >= nativeHorizontalHeight + 1.5 else {
+            throw QAError.failed(
+                "Edit managed horizontal scroller was not physically widened: "
+                    + "actual \(horizontalScroller.bounds.height), native \(nativeHorizontalHeight), "
+                    + "expected \(expectedHorizontalHeight)"
+            )
+        }
+        guard scrollView.autohidesScrollers else {
+            throw QAError.failed("Edit comfort scroller forced the horizontal bar to remain visible")
+        }
 
         let clip = scrollView.contentView
-        // NSScrollView's ruler shifts the raw clip coordinate (currently -56
-        // pt); this is the visual x=0 leading edge. Assert deltas from that
-        // baseline so the QA catches clipped text instead of fighting AppKit's
-        // ruler coordinate space.
+        // AppKit has used both x=0 and a negative ruler-adjusted clip origin
+        // across supported macOS releases. Treat the laid-out origin as the
+        // visual leading edge and assert every subsequent delta from it.
         let leadingX = clip.bounds.minX
         let rulerWidth = scrollView.verticalRulerView?.ruleThickness ?? 0
-        guard rulerWidth > 0, abs(leadingX + rulerWidth) < 0.5 else {
+        guard rulerWidth > 0,
+              abs(leadingX) < 0.5 || abs(leadingX + rulerWidth) < 0.5 else {
             throw QAError.failed(
-                "Edit did not initialize at the ruler-adjusted leading edge: \(leadingX)"
+                "Edit initialized outside the supported ruler coordinate models: \(leadingX)"
             )
         }
         let maximumY = max(0, textView.frame.height - clip.bounds.height)
@@ -151,8 +188,31 @@ struct EditorScrollingRuntimeQA {
         print(
             "Edit scrolling QA passed: exact=57,531 bytes, one vertical scroller, "
                 + "top→bottom=\(String(format: "%.1f", maximumY)) pt, reload retained position, "
-                + "vertical x=0 / deliberate horizontal x retained; light/dark captures rendered"
+                + "vertical leading x=\(String(format: "%.1f", leadingX)) / deliberate "
+                + "horizontal x retained; native auto-hiding scrollers are +2 pt; "
+                + "light/dark captures rendered"
         )
+    }
+
+    private static func assertComfortScrollerMetrics() throws {
+        guard LighTxtComfortScroller.isCompatibleWithOverlayScrollers else {
+            throw QAError.failed("Comfort scroller disabled native overlay compatibility")
+        }
+        for style in [NSScroller.Style.overlay, .legacy] {
+            for size in [NSControl.ControlSize.small, .regular] {
+                let native = NSScroller.scrollerWidth(for: size, scrollerStyle: style)
+                let comfortable = LighTxtComfortScroller.scrollerWidth(
+                    for: size,
+                    scrollerStyle: style
+                )
+                guard abs((comfortable - native) - 2) < 0.01 else {
+                    throw QAError.failed(
+                        "Comfort scroller delta changed for \(style)/\(size): "
+                            + "native \(native), comfortable \(comfortable)"
+                    )
+                }
+            }
+        }
     }
 
     private static func captureView(_ view: NSView, to url: URL) throws {

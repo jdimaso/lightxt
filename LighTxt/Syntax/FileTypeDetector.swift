@@ -13,7 +13,7 @@ public enum SyntaxFileTypeDetector {
         case "md", "markdown": .markdown
         case "sql": .sql
         case "xml": .xml
-        case "csv": .csv
+        case "csv", "tsv", "psv": .csv
         case "yaml", "yml": .yaml
         case "parquet": .parquet
         default: nil
@@ -146,6 +146,14 @@ public enum SyntaxFileTypeDetector {
         if markdownScore >= 3, markdownScore > yamlScore { return .markdown }
         if commaRows >= 2 { return .csv }
         if yamlScore >= 2 { return .yaml }
+
+        // Keep this legacy byte-oriented detector aligned with the richer
+        // bounded dialect detector for extensionless TSV, semicolon, and PSV
+        // files. The BOM guards above deliberately keep UTF-16/32 out of this
+        // UTF-8-native API; opening-time conversion handles those encodings.
+        let bounded = Data(bytes.prefix(byteCount))
+        let sampled = SampledDocumentDetector.detect(sample: bounded)
+        if sampled.tableDialect != nil { return .csv }
         return nil
     }
 

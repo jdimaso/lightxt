@@ -109,6 +109,11 @@ struct ParquetTableRuntimeQA {
         }
 
         try settle(window, view)
+        guard let table = descendant(of: view, as: NSTableView.self),
+              let scrollView = table.enclosingScrollView else {
+            throw QAError.failed("Parquet table was not hosted by its production scroll view")
+        }
+        try assertComfortScrollers(scrollView)
         for column in 0..<6 {
             guard let geometry = view.qaHeaderRows(column: column),
                   geometry.header.contains(geometry.title),
@@ -206,6 +211,38 @@ struct ParquetTableRuntimeQA {
         view.qaCycleHeaderSort(column: 1)
         try wait(until: { view.qaIsReady }, failure: "Clearing sort failed")
         guard view.qaValue(row: 0, column: 0) == "1" else { throw QAError.failed("Third sort state did not restore source order") }
+
+        // Inactive-window purging closes DuckDB and releases decoded pages, but
+        // the user's filter projection and row selection must survive exactly.
+        view.qaClosePopover()
+        view.qaApplyContainsFilter(column: 1, value: "same")
+        try wait(until: { view.qaIsReady && view.qaRowCount == 6 }, failure: "Purge filter setup failed")
+        let purgeSelection = IndexSet([1, 3])
+        view.qaSelectRows(purgeSelection)
+        let valuesBeforePurge = [
+            view.qaValue(row: 1, column: 0),
+            view.qaValue(row: 3, column: 0),
+        ]
+        guard view.purgeRebuildableResidentMemory(),
+              !view.purgeRebuildableResidentMemory(),
+              view.qaIsResidentStatePurged,
+              view.qaCachedPageCount == 0,
+              view.qaRowCount == 6,
+              view.qaSelectedRows == purgeSelection else {
+            throw QAError.failed("Inactive Parquet purge lost state or was not idempotent")
+        }
+        view.reactivateAfterResidentPurge()
+        view.reactivateAfterResidentPurge()
+        try wait(until: {
+            view.qaIsReady && !view.qaIsResidentStatePurged && view.qaRowCount == 6
+        }, failure: "Purged Parquet service did not reopen")
+        guard view.qaSelectedRows == purgeSelection,
+              view.qaFilterChipCount == 1,
+              [view.qaValue(row: 1, column: 0), view.qaValue(row: 3, column: 0)] == valuesBeforePurge else {
+            throw QAError.failed("Parquet reactivation lost its filter, selection, or displayed rows")
+        }
+        view.qaClearFilters()
+        try wait(until: { view.qaIsReady && view.qaRowCount == 8 }, failure: "Post-purge filter clear failed")
 
         view.qaShowColumnSummary(column: 3)
         try wait(until: {
@@ -428,8 +465,63 @@ struct ParquetTableRuntimeQA {
                 + "deferred Contains, repeated chip/popover commits, OR/AND filters, three-state stable sort, "
                 + "typed summary, copy, bounded cache/requests, resize/reorder/scroll, malformed diagnostics, "
                 + "no-click header controls, bounded STRUCT/LIST/MAP expansion, stable source-row identity, "
-                + "light/dark rendering, keyboard/context-menu actions, and accessibility labels."
+                + "light/dark rendering, keyboard/context-menu actions, accessibility labels, and native "
+                + "auto-hiding +2 pt scrollers."
         )
+    }
+
+    private static func assertComfortScrollers(_ scrollView: NSScrollView) throws {
+        guard let verticalScroller = scrollView.verticalScroller as? LighTxtComfortScroller,
+              let horizontalScroller = scrollView.horizontalScroller as? LighTxtComfortScroller else {
+            throw QAError.failed("Parquet did not install both production comfort scrollers")
+        }
+        guard scrollView.autohidesScrollers else {
+            throw QAError.failed("Parquet comfort scrollers were forced to remain visible")
+        }
+        guard LighTxtComfortScroller.isCompatibleWithOverlayScrollers else {
+            throw QAError.failed("Parquet comfort scrollers disabled overlay compatibility")
+        }
+        for style in [NSScroller.Style.overlay, .legacy] {
+            let native = NSScroller.scrollerWidth(for: .regular, scrollerStyle: style)
+            let comfortable = LighTxtComfortScroller.scrollerWidth(
+                for: .regular,
+                scrollerStyle: style
+            )
+            guard abs((comfortable - native) - 2) < 0.01 else {
+                throw QAError.failed(
+                    "Parquet comfort delta changed for \(style): "
+                        + "native \(native), comfortable \(comfortable)"
+                )
+            }
+        }
+        let nativeVerticalWidth = NSScroller.scrollerWidth(
+            for: verticalScroller.controlSize,
+            scrollerStyle: verticalScroller.scrollerStyle
+        )
+        let expectedVerticalWidth = LighTxtComfortScroller.scrollerWidth(
+            for: verticalScroller.controlSize,
+            scrollerStyle: verticalScroller.scrollerStyle
+        )
+        let nativeHorizontalHeight = NSScroller.scrollerWidth(
+            for: horizontalScroller.controlSize,
+            scrollerStyle: horizontalScroller.scrollerStyle
+        )
+        let expectedHorizontalHeight = LighTxtComfortScroller.scrollerWidth(
+            for: horizontalScroller.controlSize,
+            scrollerStyle: horizontalScroller.scrollerStyle
+        )
+        guard abs(verticalScroller.bounds.width - expectedVerticalWidth) < 0.5,
+              verticalScroller.bounds.width >= nativeVerticalWidth + 1.5,
+              abs(horizontalScroller.bounds.height - expectedHorizontalHeight) < 0.5,
+              horizontalScroller.bounds.height >= nativeHorizontalHeight + 1.5 else {
+            throw QAError.failed(
+                "Parquet managed scrollers were not physically widened: "
+                    + "vertical actual/native/expected \(verticalScroller.bounds.width)/"
+                    + "\(nativeVerticalWidth)/\(expectedVerticalWidth), horizontal "
+                    + "\(horizontalScroller.bounds.height)/\(nativeHorizontalHeight)/"
+                    + "\(expectedHorizontalHeight)"
+            )
+        }
     }
 
     private static func structuredFixtureData(beside fixtureURL: URL) throws -> Data {
@@ -466,6 +558,14 @@ struct ParquetTableRuntimeQA {
         window.contentMinSize = NSSize(width: 700, height: 420)
         window.layoutIfNeeded()
         return window
+    }
+
+    private static func descendant<T: NSView>(of root: NSView, as type: T.Type) -> T? {
+        if let match = root as? T { return match }
+        for child in root.subviews {
+            if let match = descendant(of: child, as: type) { return match }
+        }
+        return nil
     }
 
     private static func wait(

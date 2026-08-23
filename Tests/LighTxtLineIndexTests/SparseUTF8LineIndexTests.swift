@@ -133,6 +133,52 @@ nonisolated final class SparseUTF8LineIndexTests: XCTestCase {
         XCTAssertEqual(indexedByteCounts.last, Int64(data.count))
     }
 
+    func testResidentPurgeRetainsSourceAndRebuildsCheckpointsLazily() throws {
+        let lineCount = 512
+        let data = Data(String(repeating: "value\n", count: lineCount).utf8)
+        let reader = RecordingDataReader(data)
+        let index = try SparseUTF8LineIndex(
+            byteCount: Int64(data.count),
+            sourceRevision: 41,
+            configuration: .init(
+                checkpointLineInterval: 1,
+                readChunkByteCount: 37
+            ),
+            reader: { try reader.read($0) }
+        )
+
+        _ = try index.scanToEnd()
+        let oldGeneration = index.generation
+        let oldPayload = index.progress.checkpointPayloadByteCount
+        XCTAssertGreaterThan(oldPayload, MemoryLayout<Int64>.stride)
+
+        XCTAssertEqual(
+            index.purgeRebuildableResidentMemory(),
+            oldPayload - MemoryLayout<Int64>.stride
+        )
+        let purged = index.progress
+        XCTAssertEqual(purged.generation.sourceRevision, 41)
+        XCTAssertNotEqual(purged.generation, oldGeneration)
+        XCTAssertEqual(purged.indexedByteCount, 0)
+        XCTAssertEqual(purged.checkpointCount, 1)
+        XCTAssertEqual(purged.checkpointPayloadByteCount, MemoryLayout<Int64>.stride)
+        XCTAssertFalse(purged.isComplete)
+        XCTAssertNil(purged.totalLineCount)
+
+        XCTAssertThrowsError(
+            try index.byteOffset(forLine: 1, generation: oldGeneration)
+        ) { error in
+            guard let indexError = error as? SparseUTF8LineIndex.IndexError,
+                  case .generationInvalidated = indexError else {
+                return XCTFail("Expected a generation invalidation, got \(error)")
+            }
+        }
+
+        XCTAssertEqual(try index.byteOffset(forLine: 123), Int64(123 * 6))
+        XCTAssertGreaterThan(index.progress.indexedByteCount, 0)
+        XCTAssertEqual(try index.scanToEnd().progress.totalLineCount, Int64(lineCount + 1))
+    }
+
     func testAllNewlineFormsAndTrailingEmptyLine() throws {
         let cases: [(text: String, starts: [Int64])] = [
             ("a", [0]),

@@ -104,6 +104,214 @@ final class CSVFilterV2Tests: XCTestCase {
         )
     }
 
+    func testCompletedIndexStreamingProjectionMatchesGrowingIndexAcrossRFCEdges() throws {
+        var source = Data([0xEF, 0xBB, 0xBF])
+        source.append(Data((
+            "id;note;group;extra\r\n"
+                + "1;\"hello;\"\"world\"\"\r\ncontinued\";East;\r\n"
+                + "2;;West\r\n"
+                + "3;plain;;tail\r"
+                + "4;\"last\nline\";East;tail"
+        ).utf8))
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(source, at: 0)
+        let snapshot = try engine.snapshot()
+        let indexConfiguration = CSVRowIndex.Configuration(
+            delimiter: 0x3B,
+            readChunkByteCount: 7,
+            initialCheckpointRecordInterval: 2,
+            maximumCheckpointCount: 32,
+            allowsAcceleratedScanner: false
+        )
+
+        func makeIndex(complete: Bool) throws -> CSVRowIndex {
+            let index = try CSVRowIndex(
+                snapshot: snapshot,
+                configuration: indexConfiguration
+            )
+            if complete { _ = try index.scanToEnd() }
+            return index
+        }
+
+        let query = CSVRowQuery(
+            firstRecord: 1,
+            filters: [
+                CSVColumnFilter(column: 2, containsText: "", selectedValues: ["East"]),
+            ],
+            sortDescriptors: [CSVSortDescriptor(column: 1)]
+        )
+        let growingMap = try CSVRowQueryEngine.execute(
+            snapshot: snapshot,
+            index: makeIndex(complete: false),
+            query: query,
+            configuration: .init(pageRecordCount: 2)
+        )
+        defer { growingMap.close() }
+        let completedMap = try CSVRowQueryEngine.execute(
+            snapshot: snapshot,
+            index: makeIndex(complete: true),
+            query: query,
+            configuration: .init(pageRecordCount: 2)
+        )
+        defer { completedMap.close() }
+        XCTAssertEqual(
+            try completedMap.records(in: 0..<completedMap.rowCount),
+            try growingMap.records(in: 0..<growingMap.rowCount)
+        )
+        XCTAssertEqual(try completedMap.records(in: 0..<completedMap.rowCount), [1, 4])
+
+        let baseFilters = [CSVColumnFilter(column: 1, predicate: .isNotEmpty)]
+        let growingUnique = try CSVUniqueValueProvider.collect(
+            snapshot: snapshot,
+            index: makeIndex(complete: false),
+            column: 2,
+            firstRecord: 1,
+            baseFilters: baseFilters,
+            configuration: .init(pageRecordCount: 2)
+        )
+        let completedUnique = try CSVUniqueValueProvider.collect(
+            snapshot: snapshot,
+            index: makeIndex(complete: true),
+            column: 2,
+            firstRecord: 1,
+            baseFilters: baseFilters,
+            configuration: .init(pageRecordCount: 2)
+        )
+        XCTAssertEqual(completedUnique, growingUnique)
+        XCTAssertEqual(completedUnique.values, ["", "East"])
+
+        let growingIncludingBOMHeader = try CSVUniqueValueProvider.collect(
+            snapshot: snapshot,
+            index: makeIndex(complete: false),
+            column: 0,
+            firstRecord: 0
+        )
+        let completedIncludingBOMHeader = try CSVUniqueValueProvider.collect(
+            snapshot: snapshot,
+            index: makeIndex(complete: true),
+            column: 0,
+            firstRecord: 0
+        )
+        XCTAssertEqual(completedIncludingBOMHeader, growingIncludingBOMHeader)
+        XCTAssertTrue(completedIncludingBOMHeader.values.contains("id"))
+    }
+
+    func testCompletedIndexStreamingProjectionMatchesScalarAcrossBackingSlices() throws {
+        let sliceBoundary = 1 << 20
+        let header = Data("id,note\r\n".utf8)
+        let rowPrefix = Data("1,\"".utf8)
+        var source = header
+        source.append(rowPrefix)
+
+        // Split an escaped quote pair across the first one-MiB backing slice.
+        source.append(Data(
+            repeating: 0x78,
+            count: sliceBoundary - 1 - source.count
+        ))
+        source.append(contentsOf: [0x22, 0x22])
+        XCTAssertEqual(source.count, sliceBoundary + 1)
+
+        // Split an embedded CRLF across the second boundary. It remains field
+        // data because the quoted record is still open.
+        source.append(Data(
+            repeating: 0x79,
+            count: (sliceBoundary * 2) - 1 - source.count
+        ))
+        source.append(contentsOf: [0x0D, 0x0A])
+        XCTAssertEqual(source.count, (sliceBoundary * 2) + 1)
+
+        // Split the actual record terminator across the third boundary.
+        source.append(Data(
+            repeating: 0x7A,
+            count: (sliceBoundary * 3) - 2 - source.count
+        ))
+        source.append(0x22)
+        source.append(contentsOf: [0x0D, 0x0A])
+        XCTAssertEqual(source.count, (sliceBoundary * 3) + 1)
+        source.append(Data("2,tail\r\n".utf8))
+
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(source, at: 0)
+        let snapshot = try engine.snapshot()
+        let completedIndex = try CSVRowIndex(snapshot: snapshot)
+        _ = try completedIndex.scanToEnd()
+
+        let query = CSVRowQuery(firstRecord: 1, filters: [
+            CSVColumnFilter(column: 0, predicate: .equals("2", caseSensitive: true)),
+        ])
+        let completedMap = try CSVRowQueryEngine.execute(
+            snapshot: snapshot,
+            index: completedIndex,
+            query: query
+        )
+        defer { completedMap.close() }
+        let scalarMap = try CSVRowQueryEngine.execute(
+            snapshot: snapshot,
+            index: try CSVRowIndex(snapshot: snapshot),
+            query: query
+        )
+        defer { scalarMap.close() }
+        XCTAssertEqual(
+            try completedMap.records(in: 0..<completedMap.rowCount),
+            try scalarMap.records(in: 0..<scalarMap.rowCount)
+        )
+        XCTAssertEqual(try completedMap.records(in: 0..<completedMap.rowCount), [2])
+
+        let completedUnique = try CSVUniqueValueProvider.collect(
+            snapshot: snapshot,
+            index: completedIndex,
+            column: 0,
+            firstRecord: 1
+        )
+        let scalarUnique = try CSVUniqueValueProvider.collect(
+            snapshot: snapshot,
+            index: try CSVRowIndex(snapshot: snapshot),
+            column: 0,
+            firstRecord: 1
+        )
+        XCTAssertEqual(completedUnique, scalarUnique)
+        XCTAssertEqual(completedUnique.values, ["1", "2"])
+    }
+
+    func testCompletedIndexStreamingProjectionCancelsInsideLargeQuotedRecord() throws {
+        var source = Data("id,note\n1,\"".utf8)
+        source.append(Data(repeating: 0x78, count: 512 << 10))
+        source.append(Data("\"\n2,tail\n".utf8))
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(source, at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(snapshot: snapshot)
+        _ = try index.scanToEnd()
+
+        let descriptorsBefore = try openFileDescriptorCount()
+        let queryCancellation = CSVFilterV2CancellationProbe(cancelAfterChecks: 10)
+        XCTAssertThrowsError(
+            try CSVRowQueryEngine.execute(
+                snapshot: snapshot,
+                index: index,
+                query: CSVRowQuery(filters: [
+                    CSVColumnFilter(column: 0, predicate: .isNotEmpty),
+                ]),
+                cancellation: { queryCancellation.shouldCancel() }
+            )
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertLessThanOrEqual(try openFileDescriptorCount(), descriptorsBefore)
+
+        let uniqueCancellation = CSVFilterV2CancellationProbe(cancelAfterChecks: 10)
+        XCTAssertThrowsError(
+            try CSVUniqueValueProvider.collect(
+                snapshot: snapshot,
+                index: index,
+                column: 0,
+                cancellation: { uniqueCancellation.shouldCancel() }
+            )
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+
     func testUniqueValuesAreExactStableAndExcludeUTF8BOMHeader() throws {
         var source = Data([0xEF, 0xBB, 0xBF])
         source.append(Data("value\r\n10\r\n2\r\nA\r\na\r\n\r\n\"é,clair\"\r\n2\r\n".utf8))
