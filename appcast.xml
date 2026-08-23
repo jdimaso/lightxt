@@ -9,6 +9,20 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Secure LighTxt application updates</description>
         <language>en</language>
         <item>
+            <title>1.5.1</title>
+            <pubDate>Sun, 23 Aug 2026 11:09:08 -0400</pubDate>
+            <link>https://github.com/jdimaso/lightxt</link>
+            <sparkle:version>11</sparkle:version>
+            <sparkle:shortVersionString>1.5.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[# LighTxt 1.5.1
+
+- Fixed Markdown tables so long cell content wraps within its column instead of shifting later columns out of alignment.
+- Improved Markdown table handling for escaped pipes, pipes inside inline code, and unmatched backticks.
+]]></description>
+            <enclosure url="https://github.com/jdimaso/lightxt/releases/download/v1.5.1/LighTxt-1.5.1-macOS-universal.zip" length="39697864" type="application/octet-stream" sparkle:edSignature="43ktJltXb7H5acaBcbar4rreRT9HskZWlxxRFFIKH9Fa5pbTnF0hqFjNnVh+LNtAiZmDHj8mg5oVm+zdotMDAw=="/>
+        </item>
+        <item>
             <title>1.5</title>
             <pubDate>Sat, 22 Aug 2026 20:57:19 -0400</pubDate>
             <link>https://github.com/jdimaso/lightxt</link>
@@ -121,6 +135,6 @@ This release also includes the large-file JSON, CSV, Markdown, navigation, and p
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: u7vYkkQUS/aK91FO2Stt75xPhBogPozIWK4hvlOzpLmudFNuiXMwojOeycM4dP/rpT2GyTAZChy7q5H9vbZWDQ==
-length: 9075
+edSignature: DOLAG8VWVQgkcHZTWkLiXlU74s5V7kvilF+6UwRgJ5QzSHwhLIqPIUBoYc4I8Xh/h0fEO5qSEx2KmpDEtylfBA==
+length: 10072
 -->
