@@ -9,6 +9,25 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Secure LighTxt application updates</description>
         <language>en</language>
         <item>
+            <title>1.6</title>
+            <pubDate>Sun, 23 Aug 2026 23:37:09 -0400</pubDate>
+            <link>https://github.com/jdimaso/lightxt</link>
+            <sparkle:version>12</sparkle:version>
+            <sparkle:shortVersionString>1.6</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[# LighTxt 1.6
+
+- Greatly accelerated Parquet filtering and unique-value discovery with more efficient DuckDB queries that avoid redundant scans.
+- Search and browse distinct values beyond the previous 500-value page, with smooth paging and a memory-bounded cache that makes repeat lookups effectively instant.
+- Added a polished loading state for Parquet filters and sorts: the existing table fades and becomes noninteractive until the new results are ready.
+- Fixed Parquet tables changing to “Loading…” when LighTxt moves into the background; loaded snapshots now remain stable while windows are inactive.
+- Added Reload beside Export for Parquet files. When a file changes on disk, LighTxt asks once whether to reload, respects “Don’t Reload,” and prompts again only for a newer revision.
+- Strengthened snapshot safety so long-running queries never silently mix data from different on-disk file revisions.
+- Expanded regression coverage for Parquet paging, caching, cancellation, loading, external changes, and reload workflows.
+]]></description>
+            <enclosure url="https://github.com/jdimaso/lightxt/releases/download/v1.6/LighTxt-1.6-macOS-universal.zip" length="39763947" type="application/octet-stream" sparkle:edSignature="sfWj6aWXMyga10tWmWV38EZbU9+2nfn+4LxRNqKjWxE4mSQfogAA5NuS3Ntl6sXVaRB7Opo6seGf0tM4KVaKBw=="/>
+        </item>
+        <item>
             <title>1.5.1</title>
             <pubDate>Sun, 23 Aug 2026 11:09:08 -0400</pubDate>
             <link>https://github.com/jdimaso/lightxt</link>
@@ -135,6 +154,6 @@ This release also includes the large-file JSON, CSV, Markdown, navigation, and p
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: DOLAG8VWVQgkcHZTWkLiXlU74s5V7kvilF+6UwRgJ5QzSHwhLIqPIUBoYc4I8Xh/h0fEO5qSEx2KmpDEtylfBA==
-length: 10072
+edSignature: YKC6E1bgu3JVl9RFveF3lk2wHBSf2L+fitSvMUoFFqLoJYn+0B89MzEMaoL1DOHGr9DjAYjeXN52/C9j+1yRAQ==
+length: 11863
 -->
