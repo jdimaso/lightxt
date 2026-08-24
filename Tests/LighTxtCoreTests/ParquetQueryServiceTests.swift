@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import LighTxt
@@ -130,6 +131,320 @@ final class ParquetQueryServiceTests: XCTestCase {
         } catch let error as ParquetQueryError {
             XCTAssertEqual(error, .closed)
         }
+    }
+
+    func testUniqueValuesSupportSearchPagingAndBoundedResultCaching() async throws {
+        let service = try ParquetQueryService(
+            url: Self.fixtureURL(),
+            limits: .init(maximumUniqueValues: 2),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        defer { Task { await service.close() } }
+        _ = try await service.open()
+
+        var offset: Int64 = 0
+        var allValues: [ParquetFilterValue] = []
+        var reportedTotal: Int64?
+        repeat {
+            let page = try await service.uniqueValues(
+                forColumn: 2,
+                offset: offset,
+                limit: 2
+            )
+            XCTAssertEqual(page.offset, offset)
+            XCTAssertLessThanOrEqual(page.values.count, 2)
+            if let reportedTotal {
+                XCTAssertEqual(page.totalValueCount, reportedTotal)
+            } else {
+                reportedTotal = page.totalValueCount
+            }
+            allValues.append(contentsOf: page.values.map(\.value))
+            guard let nextOffset = page.nextOffset else { break }
+            XCTAssertTrue(page.hasMore)
+            XCTAssertTrue(page.isTruncated)
+            offset = nextOffset
+        } while true
+        XCTAssertEqual(Int(reportedTotal ?? -1), allValues.count)
+        XCTAssertGreaterThan(allValues.count, 2, "The 2-row page limit must not cap the logical facet")
+        XCTAssertEqual(Set(allValues).count, allValues.count)
+
+        let beforeRepeat = await service.testingUniqueValuesCacheSnapshot()
+        let repeated = try await service.uniqueValues(forColumn: 2, offset: 0, limit: 2)
+        let afterRepeat = await service.testingUniqueValuesCacheSnapshot()
+        XCTAssertEqual(repeated.offset, 0)
+        XCTAssertEqual(afterRepeat.executedQueryCount, beforeRepeat.executedQueryCount)
+        XCTAssertEqual(afterRepeat.hitCount, beforeRepeat.hitCount + 1)
+
+        let searched = try await service.uniqueValues(
+            forColumn: 2,
+            searchText: "ZET",
+            offset: 0,
+            limit: 2
+        )
+        XCTAssertEqual(searched.values.map(\.value), [.text("zeta")])
+        XCTAssertEqual(searched.totalValueCount, 1)
+        XCTAssertFalse(searched.hasMore)
+        let caseSensitive = try await service.uniqueValues(
+            forColumn: 2,
+            searchText: "ZET",
+            searchIsCaseSensitive: true,
+            offset: 0,
+            limit: 2
+        )
+        XCTAssertTrue(caseSensitive.values.isEmpty)
+        XCTAssertEqual(caseSensitive.totalValueCount, 0)
+
+        // A target column's own draft remains excluded from its facet. Sort is
+        // also irrelevant, so both requests share the exact same cache key.
+        let targetFilteredAndSorted = ParquetTableQuery(
+            filters: [.init(column: 2, selectedValues: [.text("zeta")])],
+            sort: .init(column: 0, order: .descending)
+        )
+        let beforeEquivalentRequest = await service.testingUniqueValuesCacheSnapshot()
+        _ = try await service.uniqueValues(
+            forColumn: 2,
+            query: targetFilteredAndSorted,
+            offset: 0,
+            limit: 2
+        )
+        let afterEquivalentRequest = await service.testingUniqueValuesCacheSnapshot()
+        XCTAssertEqual(
+            afterEquivalentRequest.executedQueryCount,
+            beforeEquivalentRequest.executedQueryCount
+        )
+        XCTAssertEqual(afterEquivalentRequest.hitCount, beforeEquivalentRequest.hitCount + 1)
+
+        let boundedService = try ParquetQueryService(
+            url: Self.fixtureURL(),
+            limits: .init(maximumUniqueValues: 2, maximumUniqueValueCacheBytes: 700),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        defer { Task { await boundedService.close() } }
+        _ = try await boundedService.open()
+        _ = try await boundedService.uniqueValues(
+            forColumn: 2,
+            searchText: "zet",
+            limit: 2
+        )
+        let firstCached = await boundedService.testingUniqueValuesCacheSnapshot()
+        XCTAssertEqual(firstCached.entryCount, 1)
+        XCTAssertLessThanOrEqual(firstCached.retainedByteCost, firstCached.maximumByteCost)
+        _ = try await boundedService.uniqueValues(
+            forColumn: 2,
+            searchText: "not-present",
+            limit: 2
+        )
+        let afterEviction = await boundedService.testingUniqueValuesCacheSnapshot()
+        XCTAssertLessThanOrEqual(afterEviction.entryCount, 1)
+        XCTAssertLessThanOrEqual(afterEviction.retainedByteCost, afterEviction.maximumByteCost)
+    }
+
+    func testUniqueValueLengthLimitUsesUTF8Bytes() async throws {
+        #if DEBUG
+        let bootstrap = try ParquetQueryService(
+            url: Self.fixtureURL(),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        _ = try await bootstrap.open()
+        let fixtureURL = try await bootstrap.testingCreateFacetUTF8BoundaryFixture()
+        let service = try ParquetQueryService(
+            url: fixtureURL,
+            limits: .init(maximumUniqueValues: 10, maximumFilterValueCharacters: 64),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        defer {
+            Task {
+                await service.close()
+                await bootstrap.close()
+            }
+        }
+        _ = try await service.open()
+
+        let validMultibyte = String(repeating: "雪", count: 21) // 63 UTF-8 bytes
+        let oversizedMultibyte = String(repeating: "雪", count: 22) // 66 UTF-8 bytes
+        let values = try await service.uniqueValues(forColumn: 0, limit: 10)
+        XCTAssertEqual(values.totalValueCount, 2)
+        XCTAssertEqual(values.omittedOversizedValueCount, 2)
+        XCTAssertEqual(
+            Set(values.values.map(\.value)),
+            Set([.text(validMultibyte), .text(String(repeating: "a", count: 64))])
+        )
+        XCTAssertFalse(values.values.map(\.value).contains(.text(oversizedMultibyte)))
+
+        let selectable = try await service.page(
+            offset: 0,
+            limit: 10,
+            query: .init(filters: [
+                .init(column: 0, selectedValues: [.text(validMultibyte)]),
+            ])
+        )
+        XCTAssertEqual(selectable.totalRowCount, 1)
+        do {
+            _ = try await service.page(
+                offset: 0,
+                limit: 10,
+                query: .init(filters: [
+                    .init(column: 0, selectedValues: [.text(oversizedMultibyte)]),
+                ])
+            )
+            XCTFail("A facet must never return a value that selection validation rejects")
+        } catch let error as ParquetQueryError {
+            guard case .invalidFilter = error else {
+                return XCTFail("Expected invalidFilter, got \(error)")
+            }
+        }
+        #else
+        throw XCTSkip("The UTF-8 boundary fixture generator is available in Debug tests.")
+        #endif
+    }
+
+    func testFilteredFirstPageGetsExactCountInOneDuckDBQuery() async throws {
+        let service = try ParquetQueryService(
+            url: Self.fixtureURL(),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        defer { Task { await service.close() } }
+        _ = try await service.open()
+        let query = ParquetTableQuery(filters: [
+            .init(column: 1, selectedValues: [.text("same")]),
+        ])
+        let before = await service.testingUniqueValuesCacheSnapshot()
+        let first = try await service.page(offset: 0, limit: 2, query: query)
+        let afterFirst = await service.testingUniqueValuesCacheSnapshot()
+        XCTAssertEqual(first.totalRowCount, 6)
+        XCTAssertEqual(first.rows.count, 2)
+        XCTAssertEqual(afterFirst.executedQueryCount, before.executedQueryCount + 1)
+
+        let second = try await service.page(offset: 2, limit: 2, query: query)
+        let afterSecond = await service.testingUniqueValuesCacheSnapshot()
+        XCTAssertEqual(second.totalRowCount, 6)
+        XCTAssertEqual(second.rows.count, 2)
+        XCTAssertEqual(afterSecond.executedQueryCount, afterFirst.executedQueryCount + 1)
+
+        let emptyQuery = ParquetTableQuery(filters: [
+            .init(column: 1, containsText: "definitely-not-present"),
+        ])
+        let beforeEmpty = await service.testingUniqueValuesCacheSnapshot()
+        let empty = try await service.page(offset: 0, limit: 2, query: emptyQuery)
+        let afterEmpty = await service.testingUniqueValuesCacheSnapshot()
+        XCTAssertEqual(empty.totalRowCount, 0)
+        XCTAssertTrue(empty.rows.isEmpty)
+        XCTAssertEqual(afterEmpty.executedQueryCount, beforeEmpty.executedQueryCount + 1)
+    }
+
+    func testPinnedSourceSurvivesAtomicReplacementAndRejectsInPlaceMutation() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LighTxt pinned parquet \(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("source.parquet")
+        let replacementURL = directory.appendingPathComponent("replacement.parquet")
+        try Data(contentsOf: Self.fixtureURL()).write(to: sourceURL)
+        try Self.structuredFixtureData().write(to: replacementURL)
+        let service = try ParquetQueryService(
+            url: sourceURL,
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        let original = try await service.open()
+        XCTAssertEqual(original.rowCount, 8)
+        XCTAssertEqual(Darwin.rename(replacementURL.path, sourceURL.path), 0)
+
+        // These requests were not made before replacement. They must still
+        // query the original descriptor rather than reopening the pathname.
+        let originalPage = try await service.page(offset: 6, limit: 2)
+        XCTAssertEqual(originalPage.rows.compactMap { $0.first?.value }, ["7", "8"])
+        let originalFacet = try await service.uniqueValues(
+            forColumn: 2,
+            searchText: "O'Brien",
+            limit: 10
+        )
+        XCTAssertEqual(originalFacet.values.map(\.value), [.text("O'Brien")])
+        await service.close()
+
+        let replacementService = try ParquetQueryService(
+            url: sourceURL,
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        let replacement = try await replacementService.open()
+        XCTAssertEqual(replacement.rowCount, 18)
+        XCTAssertEqual(replacement.totalColumnCount, 5)
+        await replacementService.close()
+
+        // Truncate/rewrite keeps the same inode, so the pinned descriptor alone
+        // is insufficient. Its fstat revision guard must reject every new scan.
+        let mutableURL = directory.appendingPathComponent("mutable.parquet")
+        try Data(contentsOf: Self.fixtureURL()).write(to: mutableURL)
+        let mutableService = try ParquetQueryService(
+            url: mutableURL,
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        _ = try await mutableService.open()
+        let cachedFacet = try await mutableService.uniqueValues(
+            forColumn: 2,
+            searchText: "zet",
+            limit: 10
+        )
+        let writer = try FileHandle(forWritingTo: mutableURL)
+        try writer.truncate(atOffset: 0)
+        try writer.write(contentsOf: Self.structuredFixtureData())
+        try writer.close()
+
+        // Already-materialized UI data remains usable, while an uncached scan
+        // cannot mix a new byte stream into the old document generation.
+        let repeatedCachedFacet = try await mutableService.uniqueValues(
+            forColumn: 2,
+            searchText: "zet",
+            limit: 10
+        )
+        XCTAssertEqual(repeatedCachedFacet, cachedFacet)
+        do {
+            _ = try await mutableService.page(offset: 2, limit: 2)
+            XCTFail("An in-place rewrite must require explicit Reload")
+        } catch let error as ParquetQueryError {
+            XCTAssertEqual(error, .sourceChanged)
+        }
+        await mutableService.close()
+    }
+
+    func testOptInParquetDistinctBenchmark() async throws {
+        guard let path = ProcessInfo.processInfo.environment["LIGHTXT_PARQUET_BENCHMARK_PATH"],
+              !path.isEmpty else {
+            throw XCTSkip("Set LIGHTXT_PARQUET_BENCHMARK_PATH to run the large-file facet benchmark.")
+        }
+        let service = try ParquetQueryService(
+            url: URL(fileURLWithPath: path),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        defer { Task { await service.close() } }
+        let metadata = try await service.open()
+        let requestedName = ProcessInfo.processInfo.environment["LIGHTXT_PARQUET_BENCHMARK_COLUMN"] ?? "NPI"
+        guard let column = metadata.columns.firstIndex(where: {
+            $0.name.caseInsensitiveCompare(requestedName) == .orderedSame
+        }) else {
+            XCTFail("The benchmark column was not present in the visible schema.")
+            return
+        }
+
+        let before = await service.testingUniqueValuesCacheSnapshot()
+        let firstStart = ProcessInfo.processInfo.systemUptime
+        let first = try await service.uniqueValues(forColumn: column)
+        let firstSeconds = ProcessInfo.processInfo.systemUptime - firstStart
+        let afterFirst = await service.testingUniqueValuesCacheSnapshot()
+        let repeatStart = ProcessInfo.processInfo.systemUptime
+        let repeated = try await service.uniqueValues(forColumn: column)
+        let repeatSeconds = ProcessInfo.processInfo.systemUptime - repeatStart
+        let afterRepeat = await service.testingUniqueValuesCacheSnapshot()
+
+        XCTAssertEqual(repeated, first)
+        XCTAssertEqual(afterFirst.executedQueryCount, before.executedQueryCount + 1)
+        XCTAssertEqual(afterRepeat.executedQueryCount, afterFirst.executedQueryCount)
+        XCTAssertLessThan(firstSeconds, 8.0, "The first DuckDB facet exceeded the interactive budget")
+        XCTAssertLessThan(repeatSeconds, min(0.05, max(0.005, firstSeconds * 0.1)))
+        print(
+            "LighTxt Parquet facet benchmark: first=\(firstSeconds)s, cached=\(repeatSeconds)s, "
+                + "rows=\(metadata.rowCount), values=\(first.values.count), total=\(first.totalValueCount)"
+        )
     }
 
     func testStructuredDetailsCoverStructListMapSpecialTextAndBounds() async throws {

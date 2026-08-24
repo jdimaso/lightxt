@@ -202,6 +202,11 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         inactiveResidentPurgeWorkItem?.cancel()
         inactiveResidentPurgeWorkItem = nil
         guard let document = document as? LighTxtDocument else { return }
+        // A Parquet document owns a live DuckDB snapshot and a small bounded
+        // page cache. Keep both resident while its window is merely inactive;
+        // reopening the path on focus could observe a newer disk revision
+        // before the user has chosen the explicit Reload action.
+        guard document.session.syntaxFileType != .parquet else { return }
         let documentByteCount = document.session.byteCount
 #if LIGHTXT_RUNTIME_QA
         let shouldSchedule = runtimeQAInactivePurgeMinimumByteCount.map {
@@ -421,6 +426,9 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         editorViewController.documentErrorHandler = { [weak self] error in
             self?.handleDocumentError(error) ?? false
         }
+        editorViewController.reloadFromDiskRequested = { [weak self] in
+            self?.requestReloadFromDisk()
+        }
     }
 
     private func configureExternalFileMonitoring() {
@@ -485,7 +493,13 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         // OK-only warning without permitting an unsafe overwrite.
         acknowledgeNSDocumentMetadata(for: change.current)
 
-        if change.current != nil,
+        // Parquet View is an explicitly refreshed snapshot. Even when the
+        // document is clean and automatic reload is enabled globally, retain
+        // the current table and let the user choose Reload or Don’t Reload for
+        // this exact disk revision.
+        let retainsExplicitParquetSnapshot = document.session.syntaxFileType == .parquet
+        if !retainsExplicitParquetSnapshot,
+           change.current != nil,
            change.documentWasClean,
            documentIsCurrentlyClean,
            (automaticallyReloadsCleanFiles || (followsEndOfFile && change.followEOFRange != nil)) {
@@ -625,7 +639,18 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
                 ?? "public.plain-text"
             try document.replaceContentsForNavigation(with: url, ofType: type)
             installFreshEditor(for: document)
-            _ = try? externalFileMonitor?.acknowledgeCurrentFileState()
+            if document.session.syntaxFileType == .parquet {
+                if let pinnedState = editorViewController.pinnedParquetSourceFileState {
+                    _ = try? externalFileMonitor?.acknowledgeCurrentFileState(
+                        matching: pinnedState
+                    )
+                }
+                // If the reader did not pin successfully, or the path already
+                // moved on to another revision, retain the monitor baseline so
+                // its scheduled sample presents that revision for consent.
+            } else {
+                _ = try? externalFileMonitor?.acknowledgeCurrentFileState()
+            }
             externalFileMonitor?.setDocumentIsClean(true)
             if let change = change ?? latestExternalFileChange {
                 externalChangeDecisions.accept(change)
@@ -698,6 +723,18 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
 
     func qaActivateExportControl() {
         editorViewController.qaActivateExportControl()
+    }
+
+    var qaIsReloadControlReady: Bool {
+        editorViewController.qaIsReloadControlReady
+    }
+
+    var qaIsParquetTableReady: Bool {
+        editorViewController.qaIsParquetTableReady
+    }
+
+    func qaActivateReloadControl() {
+        editorViewController.qaActivateReloadControl()
     }
 
     var qaExternalChangeBannerIsVisible: Bool {
@@ -779,6 +816,13 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             self.statusBar.setState(text, busy: busy)
             self.refreshExportAvailability()
         }
+        table.onSourceChanged = { [weak self] in
+            guard let self, let url = self.document?.fileURL else { return }
+            _ = self.documentErrorHandler?(
+                LighTxtCoreError.fileChangedExternally(path: url.path)
+            )
+            self.refreshExportAvailability()
+        }
         return table
     }()
     private lazy var prettifiedViewportView = PrettifiedViewportView()
@@ -831,6 +875,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     /// Markdown, or CSV parser.
     var presentationModeDidChange: ((DocumentPresentationMode) -> Void)?
     var documentDirtyStateDidChange: ((Bool) -> Void)?
+    var reloadFromDiskRequested: (() -> Void)?
     /// Return true when the owning window consumed an error through a richer
     /// document workflow and generic AppKit presentation must be skipped.
     var documentErrorHandler: ((Error) -> Bool)?
@@ -921,6 +966,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         header.onFind = { [weak self] in self?.showFindPanel(nil) }
         header.onStructure = { [weak self] in self?.toggleStructure(nil) }
         header.onExport = { [weak self] in self?.exportCurrentView() }
+        header.onReload = { [weak self] in self?.reloadFromDiskRequested?() }
         header.onOpenFolder = { [weak self] url in
             let workspace = NSWorkspace.shared
             guard !workspace.open(url) else { return }
@@ -2731,6 +2777,18 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         header.qaActivateExport()
     }
 
+    var qaIsReloadControlReady: Bool {
+        header.qaReloadIsVisible && header.qaReloadIsEnabled
+    }
+
+    var qaIsParquetTableReady: Bool {
+        (installedPrimaryContentView as? ParquetTableView)?.runtimeQAIsReady == true
+    }
+
+    func qaActivateReloadControl() {
+        header.qaActivateReload()
+    }
+
     var qaExternalChangeBannerIsVisible: Bool {
         !externalChangeBanner.isHidden && externalBannerHeightConstraint.constant > 0
     }
@@ -3028,6 +3086,10 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         return false
     }
 
+    var pinnedParquetSourceFileState: ExternalFileState? {
+        (installedPrimaryContentView as? ParquetTableView)?.pinnedSourceFileState
+    }
+
     var isExportingCurrentView: Bool {
         if let table = installedPrimaryContentView as? CSVTableView {
             return table.isExporting
@@ -3041,6 +3103,8 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private func refreshExportAvailability() {
         let tableVisible = presentationMode == .view
             && (session.syntaxFileType == .csv || session.syntaxFileType == .parquet)
+        let parquetVisible = presentationMode == .view
+            && session.syntaxFileType == .parquet
         let unavailableReason: String?
         if let notice = session.readOnlyNotice {
             unavailableReason = notice
@@ -3053,6 +3117,13 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             tableVisible && canExportCurrentView,
             visible: tableVisible,
             unavailableReason: unavailableReason
+        )
+        header.setReloadAvailable(
+            parquetVisible && document?.fileURL != nil && !isExportingCurrentView,
+            visible: parquetVisible,
+            unavailableReason: isExportingCurrentView
+                ? "Finish the current export before reloading"
+                : "Reload needs a Parquet file on disk"
         )
     }
 

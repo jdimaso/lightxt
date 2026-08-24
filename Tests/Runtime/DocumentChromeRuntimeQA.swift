@@ -36,6 +36,7 @@ struct DocumentChromeRuntimeQA {
         content.layoutSubtreeIfNeeded()
 
         expect(!header.qaExportIsVisible, "Export is hidden outside table View mode")
+        expect(!header.qaReloadIsVisible, "Reload is hidden outside Parquet View mode")
 
         header.setExportAvailable(
             false,
@@ -74,8 +75,46 @@ struct DocumentChromeRuntimeQA {
         header.qaActivateExport()
         expect(activations == 1, "Export invokes its callback exactly once")
 
+        header.setReloadAvailable(
+            false,
+            visible: true,
+            unavailableReason: "Export in progress"
+        )
+        content.layoutSubtreeIfNeeded()
+        expect(header.qaReloadIsVisible, "Reload appears for a Parquet table")
+        expect(!header.qaReloadIsEnabled, "Unavailable Parquet reload stays disabled")
+        expect(
+            header.qaReloadAccessibilityLabel == "Reload file",
+            "Reload retains its accessibility label"
+        )
+        expect(
+            header.qaReloadAccessibilityHelp == "Export in progress",
+            "The Reload unavailable reason reaches accessibility help"
+        )
+        expect(
+            abs(header.qaReloadFrame.width - 32) < 0.01
+                && abs(header.qaReloadFrame.height - 32) < 0.01,
+            "Reload keeps its 32 by 32 point hit target"
+        )
+
+        var reloadControlActivations = 0
+        header.onReload = { reloadControlActivations += 1 }
+        header.qaActivateReload()
+        expect(reloadControlActivations == 0, "Disabled Reload cannot activate")
+
+        header.setReloadAvailable(true, visible: true)
+        content.layoutSubtreeIfNeeded()
+        expect(header.qaReloadIsEnabled, "Reload enables when the Parquet file is ready")
+        expect(
+            header.qaReloadAccessibilityHelp == "Reload this Parquet file from disk",
+            "Enabled Reload explains that it refreshes from disk"
+        )
+        header.qaActivateReload()
+        expect(reloadControlActivations == 1, "Reload invokes its callback exactly once")
+
         let controls = allSubviews(of: header).compactMap { $0 as? HeaderIconButton }
         let export = controls.first { $0.accessibilityLabel() == "Export table" }
+        let reload = controls.first { $0.accessibilityLabel() == "Reload file" }
         let structure = controls.first {
             $0.accessibilityLabel() == "Toggle structure sidebar"
         }
@@ -84,6 +123,34 @@ struct DocumentChromeRuntimeQA {
            let exportSuperview = export.superview {
             let exportFrame = header.convert(export.frame, from: exportSuperview)
             expect(header.bounds.contains(exportFrame), "Export remains inside the header")
+            if let reload,
+               let reloadSuperview = reload.superview {
+                let reloadFrame = header.convert(reload.frame, from: reloadSuperview)
+                expect(header.bounds.contains(reloadFrame), "Reload remains inside the header")
+                expect(
+                    exportFrame.maxX <= reloadFrame.minX,
+                    "Reload is placed directly after Export"
+                )
+                if let structure,
+                   let structureSuperview = structure.superview {
+                    let structureFrame = header.convert(structure.frame, from: structureSuperview)
+                    expect(
+                        reloadFrame.maxX <= structureFrame.minX,
+                        "Reload does not overlap Structure"
+                    )
+                } else {
+                    fail("Structure control is missing")
+                }
+                if let find,
+                   let findSuperview = find.superview {
+                    let findFrame = header.convert(find.frame, from: findSuperview)
+                    expect(reloadFrame.maxX <= findFrame.minX, "Reload does not overlap Find")
+                } else {
+                    fail("Find control is missing")
+                }
+            } else {
+                fail("Reload control is missing")
+            }
             if let structure,
                let structureSuperview = structure.superview {
                 let structureFrame = header.convert(structure.frame, from: structureSuperview)
@@ -106,9 +173,12 @@ struct DocumentChromeRuntimeQA {
         }
 
         header.setExportAvailable(false, visible: false)
+        header.setReloadAvailable(false, visible: false)
         content.layoutSubtreeIfNeeded()
         expect(!header.qaExportIsVisible, "Export hides when leaving table View mode")
         expect(!header.qaExportIsEnabled, "Hidden Export is disabled")
+        expect(!header.qaReloadIsVisible, "Reload hides when leaving Parquet View mode")
+        expect(!header.qaReloadIsEnabled, "Hidden Reload is disabled")
 
         let diskState = ExternalFileState(
             identity: .init(device: 1, inode: 2),
@@ -143,7 +213,7 @@ struct DocumentChromeRuntimeQA {
         expect(keepActivations == 1, "Don’t Reload invokes its callback exactly once")
 
         if failures.isEmpty {
-            print("Document chrome QA passed: 21 assertions")
+            print("Document chrome QA passed: 38 assertions")
             Darwin.exit(EXIT_SUCCESS)
         }
         failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }

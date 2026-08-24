@@ -571,6 +571,7 @@ qa_parquet_table() {
         -DLIGHTXT_STANDALONE_CSV_QA \
         -DLIGHTXT_STANDALONE_PARQUET_QA \
         LighTxt/Core/LighTxtCoreError.swift \
+        LighTxt/Core/ExternalFileMonitor.swift \
         LighTxt/Core/MemoryMappedFile.swift \
         LighTxt/Core/TabularExport.swift \
         LighTxt/Core/ParquetQueryService.swift \

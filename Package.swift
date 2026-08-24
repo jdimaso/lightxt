@@ -50,6 +50,12 @@ let package = Package(
                 "Syntax",
                 "Model/SparseUTF8LineIndex.swift",
                 "Model/JSONStructureController.swift",
+            ],
+            swiftSettings: [
+                // Keep test-only probes available when the regression runner
+                // compiles this package in Release. The Xcode app target does
+                // not define this flag, so shipping builds contain no probes.
+                .define("LIGHTXT_PACKAGE_TESTING"),
             ]
         ),
         .testTarget(

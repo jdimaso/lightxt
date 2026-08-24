@@ -98,7 +98,7 @@ final class LighTxtWorkflowRuntimeQA {
             throw QAError.failed("the production application delegate is not installed")
         }
         applicationDelegate.application(NSApp, open: requestedURLs)
-        try await waitUntil("three documents and windows to open") {
+        try await waitUntil("all documents and windows to open") {
             self.documentController.documents.count == requestedURLs.count
                 && self.documentController.documents.allSatisfy {
                     $0.windowControllers.first is LighTxtWindowController
@@ -272,6 +272,92 @@ final class LighTxtWorkflowRuntimeQA {
             "the real external-change Reload action left duplicate decision UI"
         )
         textWindowController.automaticallyReloadsCleanFiles = true
+
+        // Parquet deliberately differs from ordinary clean text here: its
+        // current table is an explicitly refreshed snapshot, so a disk change
+        // must remain visible behind one Reload / Don’t Reload decision even
+        // while automatic clean-file reload is enabled globally. Exercise both
+        // coalescing paths, decline the exact revision, then route the header's
+        // real Reload icon and prove it installs a fresh document session.
+        guard let parquetWindowController = firstDocuments[3].windowControllers.first
+            as? LighTxtWindowController else {
+            throw QAError.failed("the Parquet document has no production window controller")
+        }
+        try await waitUntil("the sandboxed Parquet table and Reload control to become ready") {
+            parquetWindowController.qaIsParquetTableReady
+                && parquetWindowController.qaIsReloadControlReady
+        }
+        parquetWindowController.qaConfigureInactiveResidentPurge(
+            minimumDocumentByteCount: 0,
+            delay: 0.05
+        )
+        try deliverWindowDidResignKey(firstWindows[3])
+        try await Task.sleep(nanoseconds: 180_000_000)
+        try expect(
+            parquetWindowController.runtimeQAInactivePurgeAttemptCount == 0
+                && !parquetWindowController.qaIsResidentPresentationPurged,
+            "an inactive Parquet window discarded its loaded snapshot"
+        )
+        try deliverWindowDidBecomeKey(firstWindows[3])
+        parquetWindowController.automaticallyReloadsCleanFiles = true
+        let parquetSessionBeforeDiskChange = firstDocuments[3].session
+        let parquetRevision = try Data(contentsOf: requestedURLs[3])
+        try parquetRevision.write(to: requestedURLs[3], options: .atomic)
+        parquetWindowController.qaDeliverDocumentError(
+            LighTxtCoreError.fileChangedExternally(path: requestedURLs[3].path)
+        )
+        try await waitUntil("one Parquet external-change decision") {
+            parquetWindowController.qaExternalChangeBannerIsVisible
+                && parquetWindowController.qaExternalChangePresentationCount == 1
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        try expect(
+            firstDocuments[3].session === parquetSessionBeforeDiskChange,
+            "a clean Parquet disk change silently replaced the loaded session"
+        )
+        try expect(
+            firstWindows[3].attachedSheet == nil,
+            "the Parquet disk change also presented a generic modal sheet"
+        )
+        parquetWindowController.qaActivateDontReload()
+        try await waitUntil("Parquet Don’t Reload to dismiss the decision") {
+            !parquetWindowController.qaExternalChangeBannerIsVisible
+        }
+        parquetWindowController.qaDeliverDocumentError(
+            LighTxtCoreError.fileChangedExternally(path: requestedURLs[3].path)
+        )
+        try await Task.sleep(nanoseconds: 200_000_000)
+        try expect(
+            !parquetWindowController.qaExternalChangeBannerIsVisible
+                && parquetWindowController.qaExternalChangePresentationCount == 1,
+            "the declined Parquet disk revision prompted again"
+        )
+        try parquetRevision.write(to: requestedURLs[3], options: .atomic)
+        parquetWindowController.qaDeliverDocumentError(
+            LighTxtCoreError.fileChangedExternally(path: requestedURLs[3].path)
+        )
+        try await waitUntil("a later Parquet disk revision to prompt again") {
+            parquetWindowController.qaExternalChangeBannerIsVisible
+                && parquetWindowController.qaExternalChangePresentationCount == 2
+        }
+        try expect(
+            firstDocuments[3].session === parquetSessionBeforeDiskChange,
+            "a later Parquet disk revision replaced the snapshot before consent"
+        )
+        parquetWindowController.qaActivateDontReload()
+        try await waitUntil("the later Parquet decision to be declined") {
+            !parquetWindowController.qaExternalChangeBannerIsVisible
+        }
+        parquetWindowController.qaActivateReloadControl()
+        try await waitUntil("the Parquet header Reload to install a fresh session") {
+            firstDocuments[3].session !== parquetSessionBeforeDiskChange
+                && parquetWindowController.qaIsReloadControlReady
+        }
+        try expect(
+            !parquetWindowController.qaExternalChangeBannerIsVisible
+                && firstWindows[3].attachedSheet == nil,
+            "the Parquet header Reload left duplicate decision UI"
+        )
 
         // Cross the real CSV header callback and editor export dispatch. The
         // QA-only probe sits immediately before the save-panel entry point so
@@ -459,11 +545,21 @@ final class LighTxtWorkflowRuntimeQA {
             ("workflow-beta.csv", "name,value\nbeta,2\n"),
             ("workflow-gamma.json", "{\"name\":\"gamma\",\"value\":3}\n"),
         ]
-        return try fixtures.map { name, contents in
+        var urls = try fixtures.map { name, contents in
             let url = directory.appendingPathComponent(name)
             try Data(contents.utf8).write(to: url, options: .atomic)
             return url.standardizedFileURL
         }
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let parquetFixture = repositoryRoot
+            .appendingPathComponent("Tests/Fixtures/Parquet/query-service.parquet")
+        let parquetURL = directory.appendingPathComponent("workflow-delta.parquet")
+        try Data(contentsOf: parquetFixture).write(to: parquetURL, options: .atomic)
+        urls.append(parquetURL.standardizedFileURL)
+        return urls
     }
 
     private func documentsByURL(_ requestedURLs: [URL]) throws -> [LighTxtDocument] {

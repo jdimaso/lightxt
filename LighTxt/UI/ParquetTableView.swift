@@ -17,6 +17,7 @@ private nonisolated enum ParquetTableExportError: Error, LocalizedError, Sendabl
 @MainActor
 final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSPopoverDelegate {
     var onStatusChange: ((String, Bool) -> Void)?
+    var onSourceChanged: (() -> Void)?
 
     private static let pageSize = 64
     private static let maximumCachedPages = 4
@@ -38,6 +39,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private let progress = NSProgressIndicator()
     private let scrollView = NSScrollView()
     private let tableView = ParquetReadOnlyTableView()
+    private let queryLoadingOverlay = ParquetQueryLoadingOverlayView()
 
     private var sourceURL: URL?
     private var service: ParquetQueryService?
@@ -45,6 +47,11 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private var totalRowCount: Int64 = 0
     private var activeFilters: [Int: CSVFilterDraft] = [:]
     private var activeSort: (column: Int, ascending: Bool)?
+    /// The query represented by `cachedPages`. Draft chrome is allowed to move
+    /// ahead while DuckDB works, but a failed replacement must roll back to
+    /// this projection before the retained rows become interactive again.
+    private var publishedFilters: [Int: CSVFilterDraft] = [:]
+    private var publishedSort: (column: Int, ascending: Bool)?
     private var cachedPages: [Int64: ParquetPage] = [:]
     private var cacheOrder: [Int64] = []
     private struct PageRequest {
@@ -69,6 +76,13 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         let task: Task<Void, Never>
     }
 
+    private struct UniqueValuesRequestKey: Equatable {
+        let column: Int
+        let filters: [ParquetColumnFilter]
+        let searchText: String
+        let offset: Int64
+    }
+
     private var pageTasks: [Int64: PageRequest] = [:]
     private var expandedCells = Set<StructuredCellKey>()
     private var expandedCellOrder: [StructuredCellKey] = []
@@ -86,7 +100,17 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private var presentedPopover: NSPopover?
     private weak var presentedFilterController: CSVFilterPopoverViewController?
     private var presentedFilterColumn: Int?
+    private var presentedUniqueValuesSearchText = ""
+    private var presentedUniqueValuesNextOffset: Int64?
+    private var uniqueValuesRequestID: UUID?
+    private var uniqueValuesRequestKey: UniqueValuesRequestKey?
+    private var loadedUniqueValuesSearchText = ""
+    private var loadedUniqueValuesFacetFilters: [ParquetColumnFilter] = []
+    private var hasLoadedUniqueValuesPage = false
     private var isSettingSortDescriptors = false
+    private var isProjectionQueryInFlight = false
+    private var isQueryLoadingOverlayVisible = false
+    private var requiresExplicitReload = false
     private var isResidentStatePurged = false
     private var residentPurgeAnchorRow: Int64 = 0
 
@@ -128,6 +152,10 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         generation &+= 1
         let currentGeneration = generation
         sourceURL = url.standardizedFileURL
+        showQueryLoadingOverlay(
+            title: "Loading Parquet data",
+            detail: "Reading the schema and preparing the first rows…"
+        )
         setBusy(true, text: "Reading Parquet schema…")
         do {
             let service = try ParquetQueryService(url: url)
@@ -139,16 +167,18 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                         await service.close()
                         return
                     }
+                    self.openTask = nil
                     self.metadata = metadata
                     self.totalRowCount = metadata.rowCount
                     self.configureColumns(metadata.columns)
                     self.updateFilterStrip()
                     self.tableView.reloadData()
                     self.materializeHeaderFilterControls()
-                    self.updateStatus()
-                    self.requestPage(containing: 0)
+                    self.setBusy(true, text: "Loading first Parquet rows…")
+                    self.requestPage(containing: 0, replacingCurrentProjection: true)
                 } catch {
                     guard let self, self.generation == currentGeneration else { return }
+                    self.openTask = nil
                     self.report(error)
                 }
             }
@@ -165,10 +195,31 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     var canExportCurrentView: Bool {
-        metadata != nil && service != nil && exportTask == nil && !isResidentStatePurged
+        metadata != nil
+            && service != nil
+            && cachedPages[0] != nil
+            && exportTask == nil
+            && !isResidentStatePurged
+            && !isProjectionQueryInFlight
+            && !isQueryLoadingOverlayVisible
+            && !requiresExplicitReload
     }
 
     var isExporting: Bool { exportTask != nil }
+    var pinnedSourceFileState: ExternalFileState? { service?.sourceFileState }
+
+#if LIGHTXT_RUNTIME_QA
+    /// Hosted-app probe: unlike the standalone harness, this crosses the real
+    /// sandbox entitlement and proves DuckDB can scan the pinned `/dev/fd/N`.
+    var runtimeQAIsReady: Bool {
+        metadata != nil
+            && cachedPages[0] != nil
+            && pageTasks.isEmpty
+            && openTask == nil
+            && !isProjectionQueryInFlight
+            && !isQueryLoadingOverlayVisible
+    }
+#endif
 
     func exportCurrentView() {
         guard canExportCurrentView, let metadata else {
@@ -212,102 +263,43 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         setBusy(true, text: "Cancelling export…")
     }
 
-    /// Closes the per-document DuckDB connection and drops decoded table/detail
-    /// pages while retaining schema chrome, filters, sort, expanded-cell intent,
-    /// and row selection. Parquet is read-only, so there is no dirty edit state
-    /// to flush. Active exports and popovers are conservatively left resident.
+    /// Marks the already bounded, file-backed Parquet presentation inactive
+    /// without invalidating its stable rows. Unlike a mutable text snapshot,
+    /// the DuckDB connection and four-page cache are themselves the lightweight
+    /// index; closing and reopening them on every focus change both flashes
+    /// placeholders and can silently observe a newer file before the user has
+    /// accepted an external-change reload.
     var hasPurgedRebuildableResidentMemory: Bool { isResidentStatePurged }
 
     @discardableResult
     func purgeRebuildableResidentMemory() -> Bool {
         guard !isResidentStatePurged else { return false }
-        guard exportTask == nil, presentedPopover == nil else { return false }
+        guard exportTask == nil,
+              presentedPopover == nil,
+              openTask == nil,
+              !isProjectionQueryInFlight,
+              pageTasks.isEmpty,
+              structuredDetailTasks.isEmpty else { return false }
 
         isResidentStatePurged = true
         residentPurgeAnchorRow = preferredResidentReactivationRow()
-        generation &+= 1
-        openTask?.cancel()
-        uniqueValuesTask?.cancel()
-        summaryTask?.cancel()
-        openTask = nil
-        uniqueValuesTask = nil
-        summaryTask = nil
-        cancelPageTasks()
-        structuredDetailTasks.values.forEach { $0.task.cancel() }
-        structuredDetailTasks.removeAll(keepingCapacity: false)
-        structuredDetailTaskOrder.removeAll(keepingCapacity: false)
-        structuredDetails.removeAll(keepingCapacity: false)
-        structuredPresentations.removeAll(keepingCapacity: false)
-        structuredDetailErrors.removeAll(keepingCapacity: false)
-        cachedPages.removeAll(keepingCapacity: false)
-        cacheOrder.removeAll(keepingCapacity: false)
-
-        let closingService = service
-        closingService?.cancelCurrentQuery()
-        service = nil
-        if let closingService { Task { await closingService.close() } }
-        reloadTablePreservingSelection()
-        setBusy(false, text: "Parquet table paused while inactive")
         return true
     }
 
-    /// Reopens DuckDB and lazily restores only the page near the prior viewport.
-    /// Repeated calls are no-ops; a reopen failure remains retryable.
+    /// Re-enables lazy page/detail requests. The last complete visible result is
+    /// deliberately left untouched, so ordinary app/window activation is a
+    /// zero-query operation.
     func reactivateAfterResidentPurge() {
-        guard isResidentStatePurged, openTask == nil, let sourceURL else { return }
-        generation &+= 1
-        let currentGeneration = generation
-        let previousColumns = metadata?.columns
-        setBusy(true, text: "Restoring Parquet table…")
-
-        do {
-            let service = try ParquetQueryService(url: sourceURL)
-            self.service = service
-            openTask = Task { [weak self] in
-                do {
-                    let reopenedMetadata = try await service.open()
-                    guard !Task.isCancelled,
-                          let self,
-                          self.generation == currentGeneration,
-                          self.service === service else {
-                        await service.close()
-                        return
-                    }
-                    self.openTask = nil
-                    self.isResidentStatePurged = false
-                    self.metadata = reopenedMetadata
-                    if self.activeFilters.isEmpty {
-                        self.totalRowCount = reopenedMetadata.rowCount
-                    }
-                    if previousColumns != reopenedMetadata.columns {
-                        self.configureColumns(reopenedMetadata.columns)
-                    }
-                    self.updateFilterStrip()
-                    self.reloadTablePreservingSelection()
-                    self.materializeHeaderFilterControls()
-                    self.updateStatus()
-                    let maximumRow = max(0, self.totalRowCount - 1)
-                    self.requestPage(containing: min(self.residentPurgeAnchorRow, maximumRow))
-                    self.startWaitingStructuredDetails()
-                } catch {
-                    guard let self,
-                          self.generation == currentGeneration,
-                          self.service === service else { return }
-                    self.openTask = nil
-                    self.service = nil
-                    self.isResidentStatePurged = true
-                    await service.close()
-                    self.report(error)
-                }
-            }
-        } catch {
-            isResidentStatePurged = true
-            report(error)
-        }
+        guard isResidentStatePurged else { return }
+        isResidentStatePurged = false
+        let maximumRow = max(0, totalRowCount - 1)
+        requestPage(containing: min(residentPurgeAnchorRow, maximumRow))
+        startWaitingStructuredDetails()
     }
 
     private func deactivate(showPausedStatus: Bool) {
         isResidentStatePurged = false
+        requiresExplicitReload = false
         generation &+= 1
         openTask?.cancel()
         uniqueValuesTask?.cancel()
@@ -318,10 +310,20 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         summaryTask = nil
         exportTask = nil
         exportID = nil
+        isProjectionQueryInFlight = false
         cancelPageTasks()
         clearStructuredExpansionState(reload: false)
         presentedPopover?.close()
         presentedPopover = nil
+        presentedFilterController = nil
+        presentedFilterColumn = nil
+        uniqueValuesRequestID = nil
+        uniqueValuesRequestKey = nil
+        presentedUniqueValuesSearchText = ""
+        presentedUniqueValuesNextOffset = nil
+        loadedUniqueValuesSearchText = ""
+        loadedUniqueValuesFacetFilters = []
+        hasLoadedUniqueValuesPage = false
         let closingService = service
         closingService?.cancelCurrentQuery()
         service = nil
@@ -331,6 +333,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         totalRowCount = 0
         activeFilters.removeAll(keepingCapacity: false)
         activeSort = nil
+        publishedFilters.removeAll(keepingCapacity: false)
+        publishedSort = nil
         cachedPages.removeAll(keepingCapacity: false)
         cacheOrder.removeAll(keepingCapacity: false)
         removeDataColumns()
@@ -338,6 +342,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         tableView.sortDescriptors = []
         isSettingSortDescriptors = false
         tableView.reloadData()
+        hideQueryLoadingOverlay()
         updateFilterStrip()
         if showPausedStatus { setBusy(false, text: "Parquet table paused") }
     }
@@ -418,7 +423,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     private func configureLayout() {
-        [controls, filterStrip, filterContainer, statusLabel, progress, scrollView].forEach {
+        [controls, filterStrip, filterContainer, statusLabel, progress, scrollView, queryLoadingOverlay].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
         }
         addSubview(controls)
@@ -426,6 +431,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         controls.addSubview(statusLabel)
         controls.addSubview(progress)
         addSubview(scrollView)
+        addSubview(queryLoadingOverlay)
+        queryLoadingOverlay.isHidden = true
         NSLayoutConstraint.activate([
             controls.leadingAnchor.constraint(equalTo: leadingAnchor),
             controls.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -444,6 +451,10 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: controls.bottomAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            queryLoadingOverlay.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            queryLoadingOverlay.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+            queryLoadingOverlay.topAnchor.constraint(equalTo: scrollView.topAnchor),
+            queryLoadingOverlay.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
         ])
         let width = filterStrip.widthAnchor.constraint(equalToConstant: 0)
         width.priority = .defaultHigh
@@ -699,10 +710,18 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         tableView.selectRowIndexes(validSelection, byExtendingSelection: false)
     }
 
-    private func requestPage(containing row: Int64) {
-        guard !isResidentStatePurged, row >= 0, let service else { return }
+    private func requestPage(
+        containing row: Int64,
+        replacingCurrentProjection: Bool = false
+    ) {
+        guard !isResidentStatePurged,
+              !requiresExplicitReload,
+              row >= 0,
+              let service else { return }
         let offset = row / Int64(Self.pageSize) * Int64(Self.pageSize)
-        guard cachedPages[offset] == nil, pageTasks[offset] == nil else { return }
+        guard (replacingCurrentProjection || cachedPages[offset] == nil),
+              pageTasks[offset] == nil else { return }
+        if replacingCurrentProjection { isProjectionQueryInFlight = true }
         if pageTasks.count >= 2,
            let farthest = pageTasks.keys.max(by: {
                abs($0 - offset) < abs($1 - offset)
@@ -717,20 +736,61 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                 let page = try await service.page(offset: offset, limit: Self.pageSize, query: query)
                 guard !Task.isCancelled, let self, self.generation == currentGeneration else { return }
                 guard self.finishPageRequest(offset: offset, id: requestID) else { return }
+                if replacingCurrentProjection {
+                    self.cachedPages.removeAll(keepingCapacity: true)
+                    self.cacheOrder.removeAll(keepingCapacity: true)
+                }
                 let rowCountChanged = self.totalRowCount != page.totalRowCount
                 self.totalRowCount = page.totalRowCount
                 self.cache(page)
-                if rowCountChanged { self.tableView.noteNumberOfRowsChanged() }
-                self.tableView.reloadData(forRowIndexes: IndexSet(integersIn: Int(offset)..<Int(offset) + page.rows.count), columnIndexes: IndexSet(integersIn: 0..<self.tableView.tableColumns.count))
+                if replacingCurrentProjection {
+                    self.isProjectionQueryInFlight = false
+                    self.publishedFilters = self.activeFilters
+                    self.publishedSort = self.activeSort
+                    self.tableView.deselectAll(nil)
+                    self.tableView.reloadData()
+                    self.hideQueryLoadingOverlay()
+                } else {
+                    if rowCountChanged { self.tableView.noteNumberOfRowsChanged() }
+                    self.tableView.reloadData(
+                        forRowIndexes: IndexSet(
+                            integersIn: Int(offset)..<Int(offset) + page.rows.count
+                        ),
+                        columnIndexes: IndexSet(
+                            integersIn: 0..<self.tableView.tableColumns.count
+                        )
+                    )
+                }
                 self.invalidateStructuredRows(for: self.expandedCellOrder)
                 self.updateStatus()
             } catch is CancellationError {
-                self?.finishPageRequest(offset: offset, id: requestID)
+                guard let self,
+                      self.generation == currentGeneration,
+                      self.finishPageRequest(offset: offset, id: requestID) else { return }
+                if replacingCurrentProjection {
+                    self.isProjectionQueryInFlight = false
+                    self.restorePublishedProjection()
+                    self.hideQueryLoadingOverlay()
+                    self.setBusy(false, text: "Parquet query cancelled")
+                }
             } catch let error as ParquetQueryError where error == .cancelled {
-                self?.finishPageRequest(offset: offset, id: requestID)
+                guard let self,
+                      self.generation == currentGeneration,
+                      self.finishPageRequest(offset: offset, id: requestID) else { return }
+                if replacingCurrentProjection {
+                    self.isProjectionQueryInFlight = false
+                    self.restorePublishedProjection()
+                    self.hideQueryLoadingOverlay()
+                    self.setBusy(false, text: "Parquet query cancelled")
+                }
             } catch {
                 guard let self, self.generation == currentGeneration else { return }
                 guard self.finishPageRequest(offset: offset, id: requestID) else { return }
+                if replacingCurrentProjection {
+                    self.isProjectionQueryInFlight = false
+                    self.restorePublishedProjection()
+                    self.hideQueryLoadingOverlay()
+                }
                 self.report(error)
             }
         }
@@ -814,6 +874,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             }
             expandedCells.insert(key)
             expandedCellOrder.append(key)
+            if requiresExplicitReload {
+                structuredDetailErrors[key] = ParquetQueryError.sourceChanged.localizedDescription
+            }
         }
         startWaitingStructuredDetails()
         invalidateStructuredRows(for: affectedKeys)
@@ -831,7 +894,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     private func requestStructuredDetail(for key: StructuredCellKey) {
-        guard expandedCells.contains(key),
+        guard !requiresExplicitReload,
+              expandedCells.contains(key),
               structuredDetails[key] == nil,
               structuredDetailErrors[key] == nil,
               structuredDetailTasks[key] == nil,
@@ -879,6 +943,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                       self.generation == currentGeneration,
                       self.expandedCells.contains(key),
                       self.finishStructuredDetailRequest(key: key, id: requestID) else { return }
+                self.latchSourceChangeIfNeeded(error)
                 self.structuredDetailErrors[key] = error.localizedDescription
                 self.invalidateStructuredRows(for: [key])
                 self.startWaitingStructuredDetails()
@@ -1070,19 +1135,27 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
 
     private func resetQuery() {
         guard !isResidentStatePurged else { return }
+        guard !requiresExplicitReload else {
+            restorePublishedProjection()
+            return
+        }
         generation &+= 1
         cancelPageTasks()
         clearStructuredExpansionState(reload: false)
+        let facetWasLoading = uniqueValuesTask != nil
         uniqueValuesTask?.cancel()
+        uniqueValuesTask = nil
+        uniqueValuesRequestKey = nil
         summaryTask?.cancel()
-        cachedPages.removeAll(keepingCapacity: true)
-        cacheOrder.removeAll(keepingCapacity: true)
-        totalRowCount = 0
         refreshHeaderFilters()
         updateFilterStrip()
-        tableView.reloadData()
-        setBusy(true, text: "Applying Parquet query…")
-        requestPage(containing: 0)
+        let title = projectionVerb
+        showQueryLoadingOverlay(
+            title: title,
+            detail: "Running the query in DuckDB and preparing the new rows…"
+        )
+        setBusy(true, text: "\(title)…")
+        requestPage(containing: 0, replacingCurrentProjection: true)
         if let column = presentedFilterColumn,
            let controller = presentedFilterController,
            let popover = presentedPopover,
@@ -1091,9 +1164,44 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                 column: column,
                 controller: controller,
                 popover: popover,
-                service: service
+                service: service,
+                searchText: controller.uniqueValueSearchText,
+                offset: 0,
+                replacing: true,
+                forceRestart: facetWasLoading
             )
         }
+    }
+
+    private var projectionVerb: String {
+        switch (activeFilters.isEmpty, activeSort == nil) {
+        case (false, false): "Filtering and sorting"
+        case (false, true): "Filtering"
+        case (true, false): "Sorting"
+        case (true, true): "Restoring all rows"
+        }
+    }
+
+    private func restorePublishedProjection() {
+        // The popover owns a mutable draft for the failed projection. Closing
+        // it prevents that draft from continuing to advertise values that the
+        // restored rows/export query do not represent.
+        if presentedPopover != nil { replacePresentedPopover() }
+        activeFilters = publishedFilters
+        activeSort = publishedSort
+        isSettingSortDescriptors = true
+        if let publishedSort,
+           let column = tableColumn(dataColumn: publishedSort.column) {
+            tableView.sortDescriptors = [NSSortDescriptor(
+                key: column.identifier.rawValue,
+                ascending: publishedSort.ascending
+            )]
+        } else {
+            tableView.sortDescriptors = []
+        }
+        isSettingSortDescriptors = false
+        refreshHeaderFilters()
+        updateFilterStrip()
     }
 
     private func serviceQuery() -> ParquetTableQuery {
@@ -1142,20 +1250,54 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             self?.activeFilters.removeValue(forKey: column)
             self?.resetQuery()
         }
-        controller.showUniqueValuesLoading()
         let popover = NSPopover()
         popover.behavior = .transient
         popover.contentViewController = controller
         popover.delegate = self
+        controller.configureRemoteUniqueValues(
+            onSearch: { [weak self, weak controller, weak popover] searchText in
+                guard let self, let controller, let popover, let service = self.service else { return }
+                self.loadUniqueValues(
+                    column: column,
+                    controller: controller,
+                    popover: popover,
+                    service: service,
+                    searchText: searchText,
+                    offset: 0,
+                    replacing: true
+                )
+            },
+            onRequestNextPage: { [weak self, weak controller, weak popover] in
+                guard let self,
+                      let controller,
+                      let popover,
+                      let service = self.service,
+                      let offset = self.presentedUniqueValuesNextOffset else { return }
+                self.loadUniqueValues(
+                    column: column,
+                    controller: controller,
+                    popover: popover,
+                    service: service,
+                    searchText: self.presentedUniqueValuesSearchText,
+                    offset: offset,
+                    replacing: false
+                )
+            }
+        )
         presentedPopover = popover
         presentedFilterController = controller
         presentedFilterColumn = column
+        presentedUniqueValuesSearchText = ""
+        presentedUniqueValuesNextOffset = nil
         show(popover: popover, column: column, anchor: anchor, anchorRect: anchorRect)
         loadUniqueValues(
             column: column,
             controller: controller,
             popover: popover,
-            service: service
+            service: service,
+            searchText: "",
+            offset: 0,
+            replacing: true
         )
     }
 
@@ -1163,12 +1305,49 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         column: Int,
         controller: CSVFilterPopoverViewController,
         popover: NSPopover,
-        service: ParquetQueryService
+        service: ParquetQueryService,
+        searchText: String,
+        offset: Int64,
+        replacing: Bool,
+        forceRestart: Bool = false
     ) {
-        uniqueValuesTask?.cancel()
-        controller.showUniqueValuesLoading()
-        let leadingPageTask = pageTasks[0]?.task
+        guard presentedPopover === popover,
+              presentedFilterController === controller,
+              presentedFilterColumn == column else { return }
+        guard !requiresExplicitReload else {
+            controller.showUniqueValues(error: ParquetQueryError.sourceChanged)
+            return
+        }
         let query = serviceQuery()
+        let facetFilters = query.filters.filter { $0.column != column }
+        let requestKey = UniqueValuesRequestKey(
+            column: column,
+            filters: facetFilters,
+            searchText: searchText,
+            offset: offset
+        )
+        if !forceRestart,
+           uniqueValuesTask != nil,
+           uniqueValuesRequestKey == requestKey {
+            return
+        }
+        if !forceRestart,
+           replacing,
+           offset == 0,
+           uniqueValuesTask == nil,
+           hasLoadedUniqueValuesPage,
+           loadedUniqueValuesSearchText == searchText,
+           loadedUniqueValuesFacetFilters == facetFilters {
+            return
+        }
+        uniqueValuesTask?.cancel()
+        let requestID = UUID()
+        uniqueValuesRequestID = requestID
+        uniqueValuesRequestKey = requestKey
+        presentedUniqueValuesSearchText = searchText
+        if replacing { presentedUniqueValuesNextOffset = nil }
+        controller.showRemoteUniqueValuesLoading(replacing: replacing)
+        let leadingPageTask = replacing ? pageTasks[0]?.task : nil
         uniqueValuesTask = Task { [weak self, weak controller] in
             do {
                 // resetQuery installs the bounded page first. Let it complete
@@ -1176,42 +1355,56 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                 // serial DuckDB connection.
                 await leadingPageTask?.value
                 try Task.checkCancellation()
-                let result = try await service.uniqueValues(forColumn: column, query: query)
+                let result = try await service.uniqueValues(
+                    forColumn: column,
+                    query: query,
+                    searchText: searchText,
+                    offset: offset,
+                    limit: ParquetQueryService.Limits.default.maximumUniqueValues
+                )
                 guard !Task.isCancelled,
                       let self,
                       let controller,
+                      self.uniqueValuesRequestID == requestID,
                       self.presentedPopover === popover,
                       self.presentedFilterController === controller,
                       self.presentedFilterColumn == column else { return }
                 let values = result.values.map { Self.encodePickerValue($0.value) }
-                let truncation: CSVUniqueValuesTruncationReason? = result.omittedOversizedValueCount > 0
-                    ? .valueByteLimit
-                    : (result.isTruncated ? .uniqueValueCountLimit : nil)
-                controller.showUniqueValues(CSVUniqueValuesResult(
-                    column: column,
-                    values: values,
-                    // DuckDB performs this facet as one pushed-down aggregate;
-                    // there is no truthful CSV-style incremental scan count,
-                    // especially because the target column's own filter is
-                    // intentionally excluded from the facet population.
-                    scannedRecordCount: 0,
-                    eligibleRecordCount: 0,
-                    totalRecordCount: nil,
-                    isCompleteDataset: truncation == nil,
-                    truncationReason: truncation,
-                    maximumUniqueValueCount: ParquetQueryService.Limits.default.maximumUniqueValues,
-                    maximumRetainedValueBytes: ParquetQueryService.Limits.maximumAggregateFacetUTF8Bytes
-                ))
+                self.uniqueValuesTask = nil
+                self.uniqueValuesRequestKey = nil
+                self.presentedUniqueValuesNextOffset = result.nextOffset
+                self.hasLoadedUniqueValuesPage = true
+                self.loadedUniqueValuesSearchText = searchText
+                self.loadedUniqueValuesFacetFilters = facetFilters
+                controller.showRemoteUniqueValues(
+                    values,
+                    totalValueCount: result.totalValueCount,
+                    hasMore: result.hasMore,
+                    replacing: replacing,
+                    omittedOversizedValueCount: result.omittedOversizedValueCount
+                )
             } catch is CancellationError {
+                if self?.uniqueValuesRequestID == requestID {
+                    self?.uniqueValuesTask = nil
+                    self?.uniqueValuesRequestKey = nil
+                }
                 return
             } catch let error as ParquetQueryError where error == .cancelled {
+                if self?.uniqueValuesRequestID == requestID {
+                    self?.uniqueValuesTask = nil
+                    self?.uniqueValuesRequestKey = nil
+                }
                 return
             } catch {
                 guard let self,
                       let controller,
+                      self.uniqueValuesRequestID == requestID,
                       self.presentedPopover === popover,
                       self.presentedFilterController === controller,
                       self.presentedFilterColumn == column else { return }
+                self.uniqueValuesTask = nil
+                self.uniqueValuesRequestKey = nil
+                self.latchSourceChangeIfNeeded(error)
                 controller.showUniqueValues(error: error)
             }
         }
@@ -1236,6 +1429,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
 
     private func showSummary(column: Int, anchor: NSView? = nil) {
         guard let metadata, metadata.columns.indices.contains(column), let service else { return }
+        guard !requiresExplicitReload else { return }
         replacePresentedPopover()
         let controller = CSVColumnSummaryPopoverViewController(columnTitle: metadata.columns[column].name)
         let popover = NSPopover()
@@ -1266,6 +1460,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                 ))
             } catch {
                 guard let self, let controller, self.generation == currentGeneration else { return }
+                self.latchSourceChangeIfNeeded(error)
                 controller.show(error: error)
             }
         }
@@ -1722,10 +1917,92 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         onStatusChange?(text, busy)
     }
 
+    /// Parquet queries publish atomically: the last complete page remains
+    /// visible underneath this cover until DuckDB returns the replacement.
+    /// This avoids presenting stale rows as if they matched newly committed
+    /// filters while also avoiding a table full of placeholder strings.
+    private func showQueryLoadingOverlay(title: String, detail: String) {
+        queryLoadingOverlay.update(title: title, detail: detail)
+        queryLoadingOverlay.blocksInteraction = true
+        tableView.isEnabled = false
+        scrollView.setAccessibilityHidden(true)
+        queryLoadingOverlay.startAnimating()
+
+        guard !isQueryLoadingOverlayVisible else { return }
+        isQueryLoadingOverlayVisible = true
+        queryLoadingOverlay.isHidden = false
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            scrollView.alphaValue = 0.30
+            queryLoadingOverlay.alphaValue = 1
+            return
+        }
+        queryLoadingOverlay.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            scrollView.animator().alphaValue = 0.30
+            queryLoadingOverlay.animator().alphaValue = 1
+        }
+    }
+
+    private func hideQueryLoadingOverlay() {
+        queryLoadingOverlay.blocksInteraction = false
+        tableView.isEnabled = true
+        scrollView.setAccessibilityHidden(false)
+        queryLoadingOverlay.stopAnimating()
+        guard isQueryLoadingOverlayVisible || !queryLoadingOverlay.isHidden else {
+            scrollView.alphaValue = 1
+            return
+        }
+        isQueryLoadingOverlayVisible = false
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            scrollView.alphaValue = 1
+            queryLoadingOverlay.alphaValue = 0
+            queryLoadingOverlay.isHidden = true
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.14
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            scrollView.animator().alphaValue = 1
+            queryLoadingOverlay.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isQueryLoadingOverlayVisible else { return }
+                self.queryLoadingOverlay.isHidden = true
+            }
+        }
+    }
+
     private func report(_ error: Error) {
+        latchSourceChangeIfNeeded(error)
+        isProjectionQueryInFlight = false
+        hideQueryLoadingOverlay()
         setBusy(false, text: error.localizedDescription)
         statusLabel.textColor = .systemRed
         statusLabel.toolTip = error.localizedDescription
+    }
+
+    private func latchSourceChangeIfNeeded(_ error: Error) {
+        guard let parquetError = error as? ParquetQueryError,
+              parquetError == .sourceChanged else { return }
+        let shouldNotify = !requiresExplicitReload
+        requiresExplicitReload = true
+        cancelPageTasks()
+        structuredDetailTasks.values.forEach { $0.task.cancel() }
+        structuredDetailTasks.removeAll(keepingCapacity: false)
+        structuredDetailTaskOrder.removeAll(keepingCapacity: false)
+        let reloadRequiredMessage = ParquetQueryError.sourceChanged.localizedDescription
+        for key in expandedCellOrder where structuredPresentations[key] == nil {
+            structuredDetailErrors[key] = reloadRequiredMessage
+        }
+        invalidateStructuredRows(for: expandedCellOrder)
+        uniqueValuesTask?.cancel()
+        uniqueValuesTask = nil
+        uniqueValuesRequestKey = nil
+        summaryTask?.cancel()
+        summaryTask = nil
+        if shouldNotify { onSourceChanged?() }
     }
 
     func popoverDidClose(_ notification: Notification) {
@@ -1733,6 +2010,13 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         presentedPopover = nil
         presentedFilterController = nil
         presentedFilterColumn = nil
+        uniqueValuesRequestID = nil
+        uniqueValuesRequestKey = nil
+        presentedUniqueValuesSearchText = ""
+        presentedUniqueValuesNextOffset = nil
+        loadedUniqueValuesSearchText = ""
+        loadedUniqueValuesFacetFilters = []
+        hasLoadedUniqueValuesPage = false
         uniqueValuesTask?.cancel()
         summaryTask?.cancel()
         uniqueValuesTask = nil
@@ -1748,6 +2032,13 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         presentedPopover = nil
         presentedFilterController = nil
         presentedFilterColumn = nil
+        uniqueValuesRequestID = nil
+        uniqueValuesRequestKey = nil
+        presentedUniqueValuesSearchText = ""
+        presentedUniqueValuesNextOffset = nil
+        loadedUniqueValuesSearchText = ""
+        loadedUniqueValuesFacetFilters = []
+        hasLoadedUniqueValuesPage = false
         old?.delegate = nil
         old?.close()
     }
@@ -1757,7 +2048,12 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     /// the production query/popover/header paths without exposing mutable
     /// table operations in the shipping application.
     var qaIsReady: Bool {
-        metadata != nil && cachedPages[0] != nil && pageTasks.isEmpty && openTask?.isCancelled != true
+        metadata != nil
+            && cachedPages[0] != nil
+            && pageTasks.isEmpty
+            && openTask == nil
+            && !isProjectionQueryInFlight
+            && !isQueryLoadingOverlayVisible
     }
     var qaRowCount: Int { tableView.numberOfRows }
     var qaColumnNames: [String] { metadata?.columns.map(\.name) ?? [] }
@@ -1765,12 +2061,47 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     var qaPendingPageCount: Int { pageTasks.count }
     var qaCacheAndRequestLimits: (cache: Int, requests: Int) { (Self.maximumCachedPages, 2) }
     var qaStatus: String { statusLabel.stringValue }
+    var qaIsQueryLoadingOverlayVisible: Bool {
+        isQueryLoadingOverlayVisible && !queryLoadingOverlay.isHidden
+    }
+    var qaQueryOverlayBlocksTable: Bool {
+        qaIsQueryLoadingOverlayVisible
+            && queryLoadingOverlay.blocksInteraction
+            && !tableView.isEnabled
+            && scrollView.isAccessibilityHidden()
+    }
+    var qaQueryOverlayHasFadedTable: Bool {
+        qaQueryOverlayBlocksTable && scrollView.alphaValue < 0.5
+    }
+    func qaBeginQueryOverlayAnimationProbe() {
+        showQueryLoadingOverlay(
+            title: "Filtering",
+            detail: "Runtime animation probe"
+        )
+    }
+    func qaEndQueryOverlayAnimationProbe() { hideQueryLoadingOverlay() }
+    var qaTablePresentationIsInteractive: Bool {
+        !isQueryLoadingOverlayVisible
+            && tableView.isEnabled
+            && scrollView.alphaValue > 0.99
+            && !scrollView.isAccessibilityHidden()
+    }
     var qaTableAccessibilityLabel: String? { tableView.accessibilityLabel() }
     var qaExpansionAndDetailLimits: (expansions: Int, requests: Int) {
         (Self.maximumExpandedCells, Self.maximumStructuredDetailRequests)
     }
     var qaExpandedCellCount: Int { expandedCells.count }
     var qaPendingStructuredDetailCount: Int { structuredDetailTasks.count }
+    var qaStructuredDetailTaskOrderCount: Int { structuredDetailTaskOrder.count }
+    func qaLatchSourceChanged() {
+        latchSourceChangeIfNeeded(ParquetQueryError.sourceChanged)
+    }
+    func qaStructuredDetailError(row: Int, column: Int) -> String? {
+        guard let ordinal = cachedSourceRowOrdinal(row: row) else { return nil }
+        return structuredDetailErrors[
+            StructuredCellKey(sourceRowOrdinal: ordinal, column: column)
+        ]
+    }
     func qaPrettyFormattedJSON(_ json: String, sourceWasTruncated: Bool = false) -> (String, Int) {
         let presentation = Self.prettyStructuredJSON(json, sourceWasTruncated: sourceWasTruncated)
         return (presentation.text, presentation.lineCount)
@@ -2051,6 +2382,272 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         return output
     }
 #endif
+}
+
+@MainActor
+private final class ParquetQueryLoadingOverlayView: NSView {
+    var blocksInteraction = false
+
+    private let card = NSVisualEffectView()
+    private let indicator = ParquetQueryLoadingIndicatorView()
+    private let titleLabel = NSTextField(labelWithString: "Loading Parquet data")
+    private let detailLabel = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        setAccessibilityElement(true)
+        setAccessibilityRole(.progressIndicator)
+        setAccessibilityLabel("Updating Parquet table results")
+
+        card.material = .popover
+        card.blendingMode = .withinWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 16
+        card.layer?.masksToBounds = true
+
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.font = .systemFont(ofSize: 12.5, weight: .regular)
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.maximumNumberOfLines = 2
+
+        addSubview(card)
+        [indicator, titleLabel, detailLabel].forEach { card.addSubview($0) }
+        [card, indicator, titleLabel, detailLabel].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+        }
+
+        let preferredWidth = card.widthAnchor.constraint(equalToConstant: 450)
+        preferredWidth.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            card.centerXAnchor.constraint(equalTo: centerXAnchor),
+            card.centerYAnchor.constraint(equalTo: centerYAnchor),
+            card.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 24),
+            card.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -24),
+            card.widthAnchor.constraint(greaterThanOrEqualToConstant: 340),
+            preferredWidth,
+            card.heightAnchor.constraint(equalToConstant: 112),
+
+            indicator.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 24),
+            indicator.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            indicator.widthAnchor.constraint(equalToConstant: 104),
+            indicator.heightAnchor.constraint(equalToConstant: 64),
+
+            titleLabel.leadingAnchor.constraint(equalTo: indicator.trailingAnchor, constant: 20),
+            titleLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -24),
+            titleLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 27),
+            detailLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            detailLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            detailLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 7),
+            detailLabel.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor, constant: -22),
+        ])
+        applyResolvedAppearance()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyResolvedAppearance()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        blocksInteraction ? super.hitTest(point) : nil
+    }
+
+    func update(title: String, detail: String) {
+        titleLabel.stringValue = title
+        detailLabel.stringValue = detail
+        setAccessibilityLabel(title)
+        setAccessibilityHelp(detail)
+    }
+
+    func startAnimating() { indicator.startAnimating() }
+    func stopAnimating() { indicator.stopAnimating() }
+
+    private func applyResolvedAppearance() {
+        let appearance = effectiveAppearance
+        let background = LighTxtTheme.resolved(LighTxtTheme.editorBackground, for: appearance)
+        let primary = LighTxtTheme.resolved(LighTxtTheme.primaryText, for: appearance)
+        let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
+        let separator = LighTxtTheme.resolved(LighTxtTheme.separator, for: appearance)
+        layer?.backgroundColor = background.withAlphaComponent(0.46).cgColor
+        card.layer?.borderColor = separator.withAlphaComponent(0.48).cgColor
+        card.layer?.borderWidth = 1
+        titleLabel.textColor = primary
+        detailLabel.textColor = secondary
+        indicator.applyResolvedAppearance()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+/// A small table grid with a moving scanner makes the asynchronous DuckDB
+/// operation legible without implying that the complete file is resident.
+@MainActor
+private final class ParquetQueryLoadingIndicatorView: NSView {
+    private let viewportLayer = CALayer()
+    private let outlineLayer = CAShapeLayer()
+    private let scannerLayer = CAGradientLayer()
+    private var cellLayers: [CALayer] = []
+    private let highlightedCells: Set<Int> = [2, 6, 13, 17]
+    private var isAnimating = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        setAccessibilityElement(false)
+
+        viewportLayer.masksToBounds = true
+        viewportLayer.cornerRadius = 8
+        layer?.addSublayer(viewportLayer)
+
+        outlineLayer.fillColor = NSColor.clear.cgColor
+        outlineLayer.lineWidth = 1
+        viewportLayer.addSublayer(outlineLayer)
+
+        for _ in 0..<20 {
+            let cell = CALayer()
+            cell.cornerRadius = 2.5
+            cellLayers.append(cell)
+            viewportLayer.addSublayer(cell)
+        }
+
+        scannerLayer.startPoint = CGPoint(x: 0, y: 0.5)
+        scannerLayer.endPoint = CGPoint(x: 1, y: 0.5)
+        scannerLayer.locations = [0, 0.48, 0.52, 1]
+        viewportLayer.addSublayer(scannerLayer)
+        applyResolvedAppearance()
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        viewportLayer.frame = bounds.insetBy(dx: 2, dy: 4)
+        outlineLayer.frame = viewportLayer.bounds
+        outlineLayer.path = CGPath(
+            roundedRect: viewportLayer.bounds.insetBy(dx: 0.5, dy: 0.5),
+            cornerWidth: 8,
+            cornerHeight: 8,
+            transform: nil
+        )
+
+        let horizontalInset: CGFloat = 8
+        let verticalInset: CGFloat = 7
+        let columnGap: CGFloat = 4
+        let rowGap: CGFloat = 6
+        let columns: CGFloat = 5
+        let rows: CGFloat = 4
+        let cellWidth = max(
+            4,
+            (viewportLayer.bounds.width - horizontalInset * 2 - columnGap * (columns - 1)) / columns
+        )
+        let cellHeight = max(
+            4,
+            (viewportLayer.bounds.height - verticalInset * 2 - rowGap * (rows - 1)) / rows
+        )
+        for (index, cell) in cellLayers.enumerated() {
+            let row = CGFloat(index / 5)
+            let column = CGFloat(index % 5)
+            cell.frame = CGRect(
+                x: horizontalInset + column * (cellWidth + columnGap),
+                y: verticalInset + row * (cellHeight + rowGap),
+                width: cellWidth,
+                height: cellHeight
+            )
+        }
+        scannerLayer.frame = CGRect(
+            x: -34,
+            y: 1,
+            width: 34,
+            height: max(0, viewportLayer.bounds.height - 2)
+        )
+        CATransaction.commit()
+        if isAnimating, NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            positionStaticScanner()
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyResolvedAppearance()
+    }
+
+    func applyResolvedAppearance() {
+        let appearance = effectiveAppearance
+        let accent = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
+        let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
+        viewportLayer.backgroundColor = secondary.withAlphaComponent(0.055).cgColor
+        outlineLayer.strokeColor = secondary.withAlphaComponent(0.24).cgColor
+        for (index, cell) in cellLayers.enumerated() {
+            cell.backgroundColor = (highlightedCells.contains(index) ? accent : secondary)
+                .withAlphaComponent(highlightedCells.contains(index) ? 0.92 : 0.25)
+                .cgColor
+        }
+        scannerLayer.colors = [
+            accent.withAlphaComponent(0).cgColor,
+            accent.withAlphaComponent(0.08).cgColor,
+            accent.withAlphaComponent(0.72).cgColor,
+            accent.withAlphaComponent(0).cgColor,
+        ]
+    }
+
+    func startAnimating() {
+        guard !isAnimating else { return }
+        isAnimating = true
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            positionStaticScanner()
+            return
+        }
+        layoutSubtreeIfNeeded()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        scannerLayer.setAffineTransform(.identity)
+        CATransaction.commit()
+
+        let scan = CABasicAnimation(keyPath: "transform.translation.x")
+        scan.fromValue = 0
+        scan.toValue = viewportLayer.bounds.width + 68
+        scan.duration = 1.18
+        scan.repeatCount = .infinity
+        scan.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        scannerLayer.add(scan, forKey: "parquet.queryScan")
+
+        for (order, index) in highlightedCells.sorted().enumerated() {
+            let pulse = CAKeyframeAnimation(keyPath: "opacity")
+            pulse.values = [0.42, 1, 0.42]
+            pulse.keyTimes = [0, 0.48, 1]
+            pulse.duration = 1.25
+            pulse.beginTime = CACurrentMediaTime() + Double(order) * 0.14
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            cellLayers[index].add(pulse, forKey: "parquet.matchPulse")
+        }
+    }
+
+    func stopAnimating() {
+        isAnimating = false
+        scannerLayer.removeAllAnimations()
+        cellLayers.forEach { $0.removeAllAnimations() }
+    }
+
+    private func positionStaticScanner() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        scannerLayer.setAffineTransform(
+            CGAffineTransform(translationX: viewportLayer.bounds.width * 0.5 + 17, y: 0)
+        )
+        CATransaction.commit()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 }
 
 @MainActor

@@ -9,6 +9,7 @@ public nonisolated enum ParquetQueryError: Error, LocalizedError, Equatable {
     case invalidColumn(Int)
     case invalidPage(offset: Int64, limit: Int)
     case invalidFilter(String)
+    case sourceChanged
     case queryFailed(String)
     case cancelled
     case closed
@@ -27,6 +28,8 @@ public nonisolated enum ParquetQueryError: Error, LocalizedError, Equatable {
             return "The Parquet page request is invalid (offset \(offset), limit \(limit))."
         case let .invalidFilter(reason):
             return "The Parquet filter is too large. \(reason)"
+        case .sourceChanged:
+            return "The Parquet file changed on disk. Reload it to read the updated file."
         case let .queryFailed(reason):
             return "The Parquet query failed. \(reason)"
         case .cancelled:
@@ -209,15 +212,33 @@ public nonisolated struct ParquetUniqueValue: Sendable, Equatable {
 
 public nonisolated struct ParquetUniqueValues: Sendable, Equatable {
     public let values: [ParquetUniqueValue]
+    /// Zero-based offset in the complete set matching `searchText`.
+    public let offset: Int64
+    /// Exact number of distinct values matching the request. A bounded page is
+    /// returned to Swift, but the logical value set is never capped at the UI's
+    /// 500-row page size.
+    public let totalValueCount: Int64
     public let isTruncated: Bool
     public let omittedOversizedValueCount: Int64
 
+    public var hasMore: Bool {
+        offset + Int64(values.count) < totalValueCount
+    }
+
+    public var nextOffset: Int64? {
+        hasMore ? offset + Int64(values.count) : nil
+    }
+
     public init(
         values: [ParquetUniqueValue],
+        offset: Int64 = 0,
+        totalValueCount: Int64? = nil,
         isTruncated: Bool,
         omittedOversizedValueCount: Int64
     ) {
         self.values = values
+        self.offset = offset
+        self.totalValueCount = totalValueCount ?? Int64(values.count + (isTruncated ? 1 : 0))
         self.isTruncated = isTruncated
         self.omittedOversizedValueCount = omittedOversizedValueCount
     }
@@ -283,6 +304,7 @@ public actor ParquetQueryService {
         public let maximumUniqueValues: Int
         public let maximumSelectedValuesPerColumn: Int
         public let maximumFilterValueCharacters: Int
+        public let maximumUniqueValueCacheBytes: Int
         public let memoryLimit: String
         public let maximumTemporaryStorage: String
         public let workerThreads: Int
@@ -295,6 +317,7 @@ public actor ParquetQueryService {
             maximumUniqueValues: Int = 500,
             maximumSelectedValuesPerColumn: Int = 500,
             maximumFilterValueCharacters: Int = 16_384,
+            maximumUniqueValueCacheBytes: Int = 16 << 20,
             workerThreads: Int = min(4, max(1, ProcessInfo.processInfo.activeProcessorCount))
         ) {
             self.maximumPresentedColumns = min(1_024, max(1, maximumPresentedColumns))
@@ -325,6 +348,10 @@ public actor ParquetQueryService {
                 max(1, maximumUniqueValues),
                 maximumFacetValuesForValueSize
             )
+            self.maximumUniqueValueCacheBytes = min(
+                64 << 20,
+                max(1, maximumUniqueValueCacheBytes)
+            )
             self.memoryLimit = "512MB"
             self.maximumTemporaryStorage = "1GB"
             self.workerThreads = min(4, max(1, workerThreads))
@@ -335,7 +362,43 @@ public actor ParquetQueryService {
 
     public static let requiredDuckDBVersion = "v1.4.5"
 
-    private let sourceURL: URL
+    /// Exact path revision pinned synchronously by `init`. Reload coordination
+    /// uses this nonisolated value so the external-file monitor can never
+    /// acknowledge a newer pathname than DuckDB is actually presenting.
+    public nonisolated let sourceFileState: ExternalFileState
+
+    private struct UniqueValuesCacheKey: Hashable {
+        let sourceRevision: PinnedParquetSource.Revision
+        let column: Int
+        let filters: [ParquetColumnFilter]
+        let searchText: String
+        let searchIsCaseSensitive: Bool
+        let offset: Int64
+        let limit: Int
+
+        var retainedByteCost: Int {
+            var cost = 192 + searchText.utf8.count
+            for filter in filters {
+                cost += 96 + filter.containsText.utf8.count
+                for value in filter.selectedValues {
+                    cost += 32
+                    if case let .text(text) = value { cost += text.utf8.count }
+                }
+            }
+            return cost
+        }
+    }
+
+    private struct UniqueValuesCacheEntry {
+        let result: ParquetUniqueValues
+        let retainedByteCost: Int
+        var lastAccess: UInt64
+    }
+
+    /// A stable descriptor prevents later queries from silently crossing to a
+    /// replacement inode at the document's pathname. `/dev/fd/N` gives DuckDB
+    /// seekable access to the original file without copying a multi-GB source.
+    private let pinnedSource: PinnedParquetSource
     private let limits: Limits
     private let runtime: DuckDBDynamicAPI
     private let interruptHandle: ParquetInterruptHandle
@@ -346,6 +409,15 @@ public actor ParquetQueryService {
     private var allColumnsStorage: [ParquetColumn] = []
     private var metadataStorage: ParquetMetadata?
     private var countCache: [ParquetTableQuery: Int64] = [:]
+    private var uniqueValuesCache: [UniqueValuesCacheKey: UniqueValuesCacheEntry] = [:]
+    private var uniqueValuesCacheByteCost = 0
+    private var uniqueValuesCacheAccess: UInt64 = 0
+    private var uniqueValuesCacheGeneration: UInt64 = 0
+    #if DEBUG || LIGHTXT_PACKAGE_TESTING
+    private var executedQueryCount = 0
+    private var uniqueValuesCacheHitCount = 0
+    private var uniqueValuesCacheMissCount = 0
+    #endif
     private var isClosed = false
 
     public init(
@@ -354,30 +426,36 @@ public actor ParquetQueryService {
         libraryURL: URL? = nil
     ) throws {
         let standardized = url.standardizedFileURL
-        self.sourceURL = standardized
         self.limits = limits
         let securityScope = SecurityScopedAccess(url: standardized)
         self.securityScope = securityScope
+        var openedSource: PinnedParquetSource?
         do {
+            let pinnedSource = try PinnedParquetSource(url: standardized)
+            openedSource = pinnedSource
             let runtime = try DuckDBDynamicAPI(libraryURL: libraryURL)
+            self.pinnedSource = pinnedSource
+            self.sourceFileState = pinnedSource.externalFileState
             self.runtime = runtime
             self.interruptHandle = ParquetInterruptHandle(runtime: runtime)
             self.connectionStorage = DuckDBConnectionStorage(runtime: runtime)
             self.temporaryDirectory = try Self.makeTemporaryDirectory()
         } catch {
+            openedSource?.close()
             securityScope.stop()
             throw error
         }
     }
 
     deinit {
+        pinnedSource.close()
         try? FileManager.default.removeItem(at: temporaryDirectory)
     }
 
     public func open() async throws -> ParquetMetadata {
         if let metadataStorage { return metadataStorage }
         try ensureOpen()
-        try Self.validateParquetEnvelope(at: sourceURL)
+        try pinnedSource.validateParquetEnvelope()
         try initializeDatabase()
 
         let schema = try await describeColumns()
@@ -392,13 +470,11 @@ public actor ParquetQueryService {
         allColumnsStorage = schema
         let visibleColumns = Array(schema.prefix(limits.maximumPresentedColumns))
         let rowCount = try await countRows(query: ParquetTableQuery())
-        let attributes = try FileManager.default.attributesOfItem(atPath: sourceURL.path)
-        let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
         let metadata = ParquetMetadata(
             columns: visibleColumns,
             totalColumnCount: schema.count,
             rowCount: rowCount,
-            fileSize: fileSize,
+            fileSize: pinnedSource.revision.fileSize,
             engineVersion: runtime.version
         )
         metadataStorage = metadata
@@ -416,19 +492,16 @@ public actor ParquetQueryService {
             throw ParquetQueryError.invalidPage(offset: offset, limit: limit)
         }
         try validate(query: query, columns: metadata.columns)
-        let total: Int64
-        if let cached = countCache[query] {
-            total = cached
-        } else {
-            let count = try await countRows(query: query)
-            if countCache.count >= 8 { countCache.removeAll(keepingCapacity: true) }
-            countCache[query] = count
-            total = count
-        }
-        guard offset < total else {
+        // Sort never changes the count, so all sort variants share the same
+        // filter-count entry. When it is missing, the page query below returns
+        // COUNT(*) OVER() beside the bounded rows instead of serially scanning
+        // the Parquet source once for count and again for data.
+        let countKey = ParquetTableQuery(filters: query.filters)
+        let cachedTotal = countCache[countKey]
+        if let cachedTotal, offset >= cachedTotal {
             return ParquetPage(
                 offset: offset,
-                totalRowCount: total,
+                totalRowCount: cachedTotal,
                 sourceRowOrdinals: [],
                 rows: []
             )
@@ -445,8 +518,12 @@ public actor ParquetQueryService {
             displayProjection(column: column, characterLimit: cellCharacterLimit)
         }.joined(separator: ", ")
         let rowIdentifier = Self.quoteIdentifier(Self.rowOrdinalAlias)
-        let projection = "\(rowIdentifier)::BIGINT AS \(Self.quoteIdentifier("__lightxt_result_row")), \(valueProjection)"
-        var bindings: [DuckDBBinding] = [.text(sourceURL.path)]
+        let discoversTotal = cachedTotal == nil
+        let totalProjection = discoversTotal
+            ? ", COUNT(*) OVER ()::BIGINT AS \(Self.quoteIdentifier("__lightxt_total_rows"))"
+            : ""
+        let projection = "\(rowIdentifier)::BIGINT AS \(Self.quoteIdentifier("__lightxt_result_row"))\(totalProjection), \(valueProjection)"
+        var bindings: [DuckDBBinding] = [.text(pinnedSource.queryPath)]
         let whereClause = buildWhereClause(
             query.filters,
             columns: columns,
@@ -476,6 +553,29 @@ public actor ParquetQueryService {
                 """
         }
         let result = try await execute(sql: sql, bindings: bindings)
+        let total: Int64
+        if let cachedTotal {
+            total = cachedTotal
+        } else if result.rowCount > 0 {
+            total = result.int64(column: 1, row: 0) ?? 0
+            storeCount(total, for: countKey)
+        } else if offset == 0 {
+            total = 0
+            storeCount(0, for: countKey)
+        } else {
+            // An out-of-range offset has no row on which the window aggregate
+            // can ride. This uncommon direct-API case alone needs a fallback.
+            total = try await countRows(query: query)
+            storeCount(total, for: countKey)
+        }
+        guard offset < total else {
+            return ParquetPage(
+                offset: offset,
+                totalRowCount: total,
+                sourceRowOrdinals: [],
+                rows: []
+            )
+        }
         var rows: [[ParquetCell]] = []
         var sourceRowOrdinals: [Int64] = []
         rows.reserveCapacity(result.rowCount)
@@ -488,7 +588,7 @@ public actor ParquetQueryService {
             var values: [ParquetCell] = []
             values.reserveCapacity(columns.count)
             for column in 0..<columns.count {
-                let valueColumn = 1 + column * 2
+                let valueColumn = (discoversTotal ? 2 : 1) + column * 2
                 let truncationColumn = valueColumn + 1
                 guard let value = result.hexDecodedString(column: valueColumn, row: row) else {
                     values.append(ParquetCell(value: nil, isTruncated: false))
@@ -548,7 +648,7 @@ public actor ParquetQueryService {
             """
         let result = try await execute(
             sql: sql,
-            bindings: [.text(sourceURL.path), .int64(sourceRowOrdinal)]
+            bindings: [.text(pinnedSource.queryPath), .int64(sourceRowOrdinal)]
         )
         guard result.rowCount == 1 else {
             throw ParquetQueryError.queryFailed("The Parquet source row is no longer available.")
@@ -563,78 +663,171 @@ public actor ParquetQueryService {
 
     public func uniqueValues(
         forColumn columnIndex: Int,
-        query: ParquetTableQuery = ParquetTableQuery()
+        query: ParquetTableQuery = ParquetTableQuery(),
+        searchText: String = "",
+        searchIsCaseSensitive: Bool = false,
+        offset: Int64 = 0,
+        limit requestedLimit: Int? = nil
     ) async throws -> ParquetUniqueValues {
         let metadata = try await open()
         guard metadata.columns.indices.contains(columnIndex) else {
             throw ParquetQueryError.invalidColumn(columnIndex)
+        }
+        let limit = requestedLimit ?? limits.maximumUniqueValues
+        guard offset >= 0, limit > 0, limit <= limits.maximumUniqueValues else {
+            throw ParquetQueryError.invalidPage(offset: offset, limit: limit)
+        }
+        guard searchText.utf8.count <= limits.maximumFilterValueCharacters else {
+            throw ParquetQueryError.invalidFilter("Unique-value search text exceeds the supported length.")
         }
         // Match the CSV facet model: a column's value choices are calculated
         // under every other active filter, never narrowed by their own current
         // checkbox/contains state.
         let remainingFilters = query.filters.filter { $0.column != columnIndex }
         try validate(query: ParquetTableQuery(filters: remainingFilters), columns: metadata.columns)
-        return try await queryUniqueValues(
+        let key = UniqueValuesCacheKey(
+            sourceRevision: pinnedSource.revision,
+            column: columnIndex,
+            filters: remainingFilters,
+            searchText: searchText,
+            searchIsCaseSensitive: searchIsCaseSensitive,
+            offset: offset,
+            limit: limit
+        )
+        if let cached = cachedUniqueValues(for: key) {
+            #if DEBUG || LIGHTXT_PACKAGE_TESTING
+            uniqueValuesCacheHitCount += 1
+            #endif
+            return cached
+        }
+        #if DEBUG || LIGHTXT_PACKAGE_TESTING
+        uniqueValuesCacheMissCount += 1
+        #endif
+        let cacheGeneration = uniqueValuesCacheGeneration
+        let result = try await queryUniqueValues(
             forColumn: columnIndex,
             filters: remainingFilters,
-            columns: metadata.columns
+            columns: metadata.columns,
+            searchText: searchText,
+            searchIsCaseSensitive: searchIsCaseSensitive,
+            offset: offset,
+            limit: limit
         )
+        try ensureOpen()
+        guard cacheGeneration == uniqueValuesCacheGeneration else { return result }
+        cache(result, for: key)
+        return result
     }
 
     private func queryUniqueValues(
         forColumn columnIndex: Int,
         filters: [ParquetColumnFilter],
-        columns: [ParquetColumn]
+        columns: [ParquetColumn],
+        searchText: String = "",
+        searchIsCaseSensitive: Bool = false,
+        offset: Int64 = 0,
+        limit: Int
     ) async throws -> ParquetUniqueValues {
         let identifier = internalIdentifier(for: columnIndex)
         let text = "TRY_CAST(\(identifier) AS VARCHAR)"
-        var bindings: [DuckDBBinding] = [.text(sourceURL.path)]
+        var bindings: [DuckDBBinding] = [.text(pinnedSource.queryPath)]
         let whereClause = buildWhereClause(
             filters,
             columns: columns,
-            bindings: &bindings,
-            additionalPredicate: "(\(identifier) IS NULL OR length(\(text)) <= \(limits.maximumFilterValueCharacters))"
+            bindings: &bindings
         )
-        bindings.append(.int64(Int64(limits.maximumUniqueValues + 1)))
+        let nullKind = searchText.isEmpty ? "0" : "3"
+        let searchPredicate: String
+        if searchText.isEmpty {
+            searchPredicate = "TRUE"
+        } else if searchIsCaseSensitive {
+            searchPredicate = "contains(value_text, ?)"
+            bindings.append(.text(searchText))
+        } else {
+            searchPredicate = "contains(lower(value_text), lower(?))"
+            bindings.append(.text(searchText))
+        }
+        bindings.append(.int64(Int64(limit)))
+        bindings.append(.int64(offset))
+
+        // Classify before grouping so every nonmatching or oversized value is
+        // collapsed into one aggregate row. Search therefore remains fast for
+        // high-cardinality columns and only a bounded page crosses the C API.
+        // The stats row makes an empty or out-of-range page self-describing,
+        // avoiding a second COUNT scan.
         let sql = """
-            SELECT CASE WHEN \(identifier) IS NULL THEN NULL ELSE hex(encode(\(text))) END AS value,
-                   COUNT(*)::BIGINT AS frequency
-            \(sourceClause())
-            \(whereClause)
-            GROUP BY 1
-            ORDER BY frequency DESC, value ASC NULLS FIRST
-            LIMIT ?
+            WITH projected AS (
+                SELECT \(identifier) IS NULL AS value_is_null,
+                       \(text) AS value_text
+                \(sourceClause())
+                \(whereClause)
+            ), classified_kind AS (
+                SELECT value_text,
+                       CASE WHEN value_is_null THEN \(nullKind)::BIGINT
+                            WHEN octet_length(encode(value_text)) > \(limits.maximumFilterValueCharacters)
+                            THEN 2::BIGINT
+                            WHEN \(searchPredicate) THEN 1::BIGINT
+                            ELSE 3::BIGINT
+                       END AS value_kind
+                FROM projected
+            ), grouped AS (
+                SELECT value_kind,
+                       CASE WHEN value_kind = 1 THEN value_text ELSE NULL END AS value_text,
+                       COUNT(*)::BIGINT AS frequency
+                FROM classified_kind
+                GROUP BY 1, 2
+            ), stats AS (
+                SELECT COALESCE(SUM(CASE WHEN value_kind IN (0, 1) THEN 1 ELSE 0 END), 0)::BIGINT
+                           AS total_value_count,
+                       COALESCE(SUM(CASE WHEN value_kind = 2 THEN frequency ELSE 0 END), 0)::BIGINT
+                           AS oversized_row_count
+                FROM grouped
+            ), paged AS (
+                SELECT CASE WHEN value_kind = 0 THEN NULL ELSE hex(encode(value_text)) END AS value,
+                       frequency
+                FROM grouped
+                WHERE value_kind IN (0, 1)
+                ORDER BY frequency DESC, value ASC NULLS FIRST
+                LIMIT ? OFFSET ?
+            )
+            SELECT 0::BIGINT AS result_kind,
+                   paged.value,
+                   paged.frequency,
+                   stats.total_value_count,
+                   stats.oversized_row_count
+            FROM paged CROSS JOIN stats
+            UNION ALL
+            SELECT 1::BIGINT AS result_kind,
+                   NULL::VARCHAR AS value,
+                   0::BIGINT AS frequency,
+                   stats.total_value_count,
+                   stats.oversized_row_count
+            FROM stats
+            ORDER BY result_kind ASC, frequency DESC, value ASC NULLS FIRST
             """
         let result = try await execute(sql: sql, bindings: bindings)
-        let isTruncated = result.rowCount > limits.maximumUniqueValues
-        let retainedCount = min(result.rowCount, limits.maximumUniqueValues)
         var values: [ParquetUniqueValue] = []
-        values.reserveCapacity(retainedCount)
-        for row in 0..<retainedCount {
-            let value: ParquetFilterValue = result.isNull(column: 0, row: row)
+        values.reserveCapacity(min(limit, result.rowCount))
+        var totalValueCount: Int64 = 0
+        var oversized: Int64 = 0
+        for row in 0..<result.rowCount {
+            totalValueCount = result.int64(column: 3, row: row) ?? totalValueCount
+            oversized = result.int64(column: 4, row: row) ?? oversized
+            guard result.int64(column: 0, row: row) == 0 else { continue }
+            let value: ParquetFilterValue = result.isNull(column: 1, row: row)
                 ? .null
-                : .text(result.hexDecodedString(column: 0, row: row) ?? "")
+                : .text(result.hexDecodedString(column: 1, row: row) ?? "")
             values.append(ParquetUniqueValue(
                 value: value,
-                count: result.int64(column: 1, row: row) ?? 0
+                count: result.int64(column: 2, row: row) ?? 0
             ))
         }
-
-        var oversizedBindings: [DuckDBBinding] = [.text(sourceURL.path)]
-        let oversizedWhere = buildWhereClause(
-            filters,
-            columns: columns,
-            bindings: &oversizedBindings,
-            additionalPredicate: "(\(identifier) IS NOT NULL AND length(\(text)) > \(limits.maximumFilterValueCharacters))"
-        )
-        let oversizedSQL = "SELECT COUNT(*)::BIGINT \(sourceClause()) \(oversizedWhere)"
-        let oversized = try await execute(
-            sql: oversizedSQL,
-            bindings: oversizedBindings
-        ).int64(column: 0, row: 0) ?? 0
+        let hasMore = offset + Int64(values.count) < totalValueCount
         return ParquetUniqueValues(
             values: values,
-            isTruncated: isTruncated,
+            offset: offset,
+            totalValueCount: totalValueCount,
+            isTruncated: hasMore,
             omittedOversizedValueCount: oversized
         )
     }
@@ -660,7 +853,7 @@ public actor ParquetQueryService {
         } else {
             extrema = "NULL::VARCHAR AS minimum, NULL::VARCHAR AS maximum"
         }
-        var bindings: [DuckDBBinding] = [.text(sourceURL.path)]
+        var bindings: [DuckDBBinding] = [.text(pinnedSource.queryPath)]
         let whereClause = buildWhereClause(
             query.filters,
             columns: metadata.columns,
@@ -678,7 +871,8 @@ public actor ParquetQueryService {
         let unique = try await queryUniqueValues(
             forColumn: columnIndex,
             filters: query.filters,
-            columns: metadata.columns
+            columns: metadata.columns,
+            limit: min(5, limits.maximumUniqueValues)
         )
         return ParquetColumnSummary(
             column: column,
@@ -691,6 +885,17 @@ public actor ParquetQueryService {
                 ParquetFrequentValue(value: $0.value, count: $0.count)
             }
         )
+    }
+
+    /// Drops all derived query results while keeping the pinned source and
+    /// DuckDB connection open. Reload normally replaces the whole service, but
+    /// this hook also makes explicit invalidation safe for future workflows.
+    public func invalidateQueryCaches() {
+        countCache.removeAll(keepingCapacity: true)
+        if let metadataStorage {
+            countCache[ParquetTableQuery()] = metadataStorage.rowCount
+        }
+        clearUniqueValuesCache(keepingCapacity: true)
     }
 
     public func close() async {
@@ -707,6 +912,8 @@ public actor ParquetQueryService {
         metadataStorage = nil
         allColumnsStorage.removeAll(keepingCapacity: false)
         countCache.removeAll(keepingCapacity: false)
+        clearUniqueValuesCache(keepingCapacity: false)
+        pinnedSource.close()
         securityScope.stop()
         try? FileManager.default.removeItem(at: temporaryDirectory)
     }
@@ -715,7 +922,27 @@ public actor ParquetQueryService {
         interruptHandle.interrupt()
     }
 
-    #if DEBUG
+    #if DEBUG || LIGHTXT_PACKAGE_TESTING
+    struct TestingUniqueValuesCacheSnapshot: Sendable, Equatable {
+        let entryCount: Int
+        let retainedByteCost: Int
+        let maximumByteCost: Int
+        let hitCount: Int
+        let missCount: Int
+        let executedQueryCount: Int
+    }
+
+    func testingUniqueValuesCacheSnapshot() -> TestingUniqueValuesCacheSnapshot {
+        TestingUniqueValuesCacheSnapshot(
+            entryCount: uniqueValuesCache.count,
+            retainedByteCost: uniqueValuesCacheByteCost,
+            maximumByteCost: limits.maximumUniqueValueCacheBytes,
+            hitCount: uniqueValuesCacheHitCount,
+            missCount: uniqueValuesCacheMissCount,
+            executedQueryCount: executedQueryCount
+        )
+    }
+
     /// Test-only probe for the per-document external-access allowlist.
     func testingCanReadParquet(at url: URL) async -> Bool {
         do {
@@ -745,11 +972,71 @@ public actor ParquetQueryService {
         return await testingCanExecuteSecurityProbe(sql)
     }
 
+    func testingCreateFacetUTF8BoundaryFixture() async throws -> URL {
+        let url = temporaryDirectory.appendingPathComponent("facet-utf8-boundary.parquet")
+        let sql = """
+            COPY (
+                SELECT repeat('雪', 21) AS value
+                UNION ALL SELECT repeat('雪', 22)
+                UNION ALL SELECT repeat('a', 64)
+                UNION ALL SELECT repeat('a', 65)
+            ) TO \(Self.duckDBStringLiteral(url.path)) (FORMAT PARQUET)
+            """
+        _ = try await execute(sql: sql, bindings: [])
+        return url
+    }
+
     func testingCancellationOwnershipIsAtomic() -> Bool {
         interruptHandle.testingQueuedCancellationNeverBegins()
             && interruptHandle.testingLateCancellationPreservesNewOwner()
     }
     #endif
+
+    private func cachedUniqueValues(for key: UniqueValuesCacheKey) -> ParquetUniqueValues? {
+        guard var entry = uniqueValuesCache[key] else { return nil }
+        uniqueValuesCacheAccess &+= 1
+        entry.lastAccess = uniqueValuesCacheAccess
+        uniqueValuesCache[key] = entry
+        return entry.result
+    }
+
+    private func cache(_ result: ParquetUniqueValues, for key: UniqueValuesCacheKey) {
+        var byteCost = key.retainedByteCost + 128 + result.values.count * 48
+        for item in result.values {
+            if case let .text(text) = item.value {
+                byteCost = Self.saturatedAdd(byteCost, text.utf8.count)
+            }
+        }
+        guard byteCost <= limits.maximumUniqueValueCacheBytes else { return }
+        if let existing = uniqueValuesCache.removeValue(forKey: key) {
+            uniqueValuesCacheByteCost -= existing.retainedByteCost
+        }
+        while uniqueValuesCacheByteCost > limits.maximumUniqueValueCacheBytes - byteCost,
+              let leastRecent = uniqueValuesCache.min(by: {
+                  $0.value.lastAccess < $1.value.lastAccess
+              })?.key,
+              let removed = uniqueValuesCache.removeValue(forKey: leastRecent) {
+            uniqueValuesCacheByteCost -= removed.retainedByteCost
+        }
+        uniqueValuesCacheAccess &+= 1
+        uniqueValuesCache[key] = UniqueValuesCacheEntry(
+            result: result,
+            retainedByteCost: byteCost,
+            lastAccess: uniqueValuesCacheAccess
+        )
+        uniqueValuesCacheByteCost += byteCost
+    }
+
+    private func clearUniqueValuesCache(keepingCapacity: Bool) {
+        uniqueValuesCacheGeneration &+= 1
+        uniqueValuesCache.removeAll(keepingCapacity: keepingCapacity)
+        uniqueValuesCacheByteCost = 0
+    }
+
+    private static func saturatedAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? .max : sum
+    }
 
     private func initializeDatabase() throws {
         guard connectionStorage.connection == nil else { return }
@@ -774,7 +1061,7 @@ public actor ParquetQueryService {
             // before any selected-file query is prepared.
             _ = try runtime.execute(
                 connection: handles.connection,
-                sql: "SET allowed_paths = \(Self.duckDBListLiteral([sourceURL.path]))",
+                sql: "SET allowed_paths = \(Self.duckDBListLiteral([pinnedSource.queryPath]))",
                 bindings: []
             )
             _ = try runtime.execute(
@@ -813,7 +1100,7 @@ public actor ParquetQueryService {
             """
         let lengths = try await execute(
             sql: lengthsSQL,
-            bindings: [.text(sourceURL.path)]
+            bindings: [.text(pinnedSource.queryPath)]
         )
         guard lengths.rowCount <= Limits.maximumPhysicalColumns else {
             throw ParquetQueryError.malformedFile(
@@ -866,7 +1153,7 @@ public actor ParquetQueryService {
             """
         let result = try await execute(
             sql: sql,
-            bindings: [.text(sourceURL.path)]
+            bindings: [.text(pinnedSource.queryPath)]
         )
         guard result.rowCount == lengths.rowCount else {
             throw ParquetQueryError.malformedFile(
@@ -892,7 +1179,7 @@ public actor ParquetQueryService {
     private func countRows(query: ParquetTableQuery) async throws -> Int64 {
         let columns = metadataStorage?.columns ?? Array(allColumnsStorage.prefix(limits.maximumPresentedColumns))
         try validate(query: query, columns: columns)
-        var bindings: [DuckDBBinding] = [.text(sourceURL.path)]
+        var bindings: [DuckDBBinding] = [.text(pinnedSource.queryPath)]
         let whereClause = buildWhereClause(query.filters, columns: columns, bindings: &bindings)
         let sql = "SELECT COUNT(*)::BIGINT \(sourceClause()) \(whereClause)"
         let result = try await execute(
@@ -900,6 +1187,16 @@ public actor ParquetQueryService {
             bindings: bindings
         )
         return result.int64(column: 0, row: 0) ?? 0
+    }
+
+    private func storeCount(_ count: Int64, for query: ParquetTableQuery) {
+        if countCache.count >= 8, countCache[query] == nil {
+            countCache.removeAll(keepingCapacity: true)
+            if let metadataStorage {
+                countCache[ParquetTableQuery()] = metadataStorage.rowCount
+            }
+        }
+        countCache[query] = count
     }
 
     private func validate(query: ParquetTableQuery, columns: [ParquetColumn]) throws {
@@ -1046,11 +1343,15 @@ public actor ParquetQueryService {
 
     private func execute(sql: String, bindings: [DuckDBBinding]) async throws -> DuckDBResult {
         try ensureOpen()
+        #if DEBUG || LIGHTXT_PACKAGE_TESTING
+        executedQueryCount += 1
+        #endif
         _ = try requiredConnection()
         let runtime = runtime
         let executor = queryExecutor
         let connectionStorage = connectionStorage
         let interruptHandle = interruptHandle
+        let pinnedSource = pinnedSource
         let requestID = interruptHandle.registerRequest()
         return try await withTaskCancellationHandler {
             let value = try await executor.run {
@@ -1061,40 +1362,19 @@ public actor ParquetQueryService {
                 guard let connection = connectionStorage.connection else {
                     throw ParquetQueryError.closed
                 }
-                return try runtime.execute(connection: connection, sql: sql, bindings: bindings)
+                guard pinnedSource.matchesOriginalRevision() else {
+                    throw ParquetQueryError.sourceChanged
+                }
+                let result = try runtime.execute(connection: connection, sql: sql, bindings: bindings)
+                guard pinnedSource.matchesOriginalRevision() else {
+                    throw ParquetQueryError.sourceChanged
+                }
+                return result
             }
             if Task.isCancelled { throw ParquetQueryError.cancelled }
             return value
         } onCancel: {
             interruptHandle.cancelRequest(requestID)
-        }
-    }
-
-    private static func validateParquetEnvelope(at url: URL) throws {
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: url)
-        } catch {
-            throw ParquetQueryError.malformedFile(error.localizedDescription)
-        }
-        defer { try? handle.close() }
-        do {
-            let length = try handle.seekToEnd()
-            guard length >= 12 else {
-                throw ParquetQueryError.malformedFile("The file is too short to contain a Parquet footer.")
-            }
-            try handle.seek(toOffset: 0)
-            let first = try handle.read(upToCount: 4) ?? Data()
-            try handle.seek(toOffset: length - 4)
-            let last = try handle.read(upToCount: 4) ?? Data()
-            let magic = Data("PAR1".utf8)
-            guard first == magic, last == magic else {
-                throw ParquetQueryError.malformedFile("Its PAR1 header or footer marker is missing.")
-            }
-        } catch let error as ParquetQueryError {
-            throw error
-        } catch {
-            throw ParquetQueryError.malformedFile(error.localizedDescription)
         }
     }
 
@@ -1152,6 +1432,116 @@ public actor ParquetQueryService {
 
     private static let rowOrdinalAlias = "__lightxt_parquet_file_row"
 
+}
+
+/// Owns the exact inode selected by the user for the service lifetime. Path
+/// replacement is common for atomic writers; retaining this descriptor keeps
+/// every lazy page and facet internally consistent until explicit Reload.
+private nonisolated final class PinnedParquetSource: @unchecked Sendable {
+    struct Revision: Sendable, Hashable {
+        let device: UInt64
+        let inode: UInt64
+        let fileSize: Int64
+        let modifiedSeconds: Int64
+        let modifiedNanoseconds: Int64
+    }
+
+    let queryPath: String
+    let revision: Revision
+    var externalFileState: ExternalFileState {
+        ExternalFileState(
+            identity: ExternalFileIdentity(device: revision.device, inode: revision.inode),
+            byteCount: revision.fileSize,
+            modificationTime: ExternalFileModificationTime(
+                seconds: revision.modifiedSeconds,
+                nanoseconds: revision.modifiedNanoseconds
+            )
+        )
+    }
+
+    private let descriptor: Int32
+    private let lock = NSLock()
+    private var isClosed = false
+
+    init(url: URL) throws {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw ParquetQueryError.malformedFile(Self.systemError("The file could not be opened"))
+        }
+        var information = stat()
+        guard Darwin.fstat(descriptor, &information) == 0 else {
+            let reason = Self.systemError("The file metadata could not be read")
+            Darwin.close(descriptor)
+            throw ParquetQueryError.malformedFile(reason)
+        }
+        self.descriptor = descriptor
+        self.queryPath = "/dev/fd/\(descriptor)"
+        self.revision = Revision(
+            device: UInt64(bitPattern: Int64(information.st_dev)),
+            inode: UInt64(information.st_ino),
+            fileSize: Int64(information.st_size),
+            modifiedSeconds: Int64(information.st_mtimespec.tv_sec),
+            modifiedNanoseconds: Int64(information.st_mtimespec.tv_nsec)
+        )
+    }
+
+    deinit { close() }
+
+    func validateParquetEnvelope() throws {
+        guard revision.fileSize >= 12 else {
+            throw ParquetQueryError.malformedFile("The file is too short to contain a Parquet footer.")
+        }
+        let descriptor: Int32? = lock.withLock { isClosed ? nil : self.descriptor }
+        guard let descriptor else { throw ParquetQueryError.closed }
+        let first = try read(count: 4, offset: 0, descriptor: descriptor)
+        let last = try read(
+            count: 4,
+            offset: off_t(revision.fileSize - 4),
+            descriptor: descriptor
+        )
+        let magic = Data("PAR1".utf8)
+        guard first == magic, last == magic else {
+            throw ParquetQueryError.malformedFile("Its PAR1 header or footer marker is missing.")
+        }
+    }
+
+    func close() {
+        let shouldClose = lock.withLock { () -> Bool in
+            guard !isClosed else { return false }
+            isClosed = true
+            return true
+        }
+        if shouldClose { Darwin.close(descriptor) }
+    }
+
+    func matchesOriginalRevision() -> Bool {
+        let descriptor: Int32? = lock.withLock { isClosed ? nil : self.descriptor }
+        guard let descriptor else { return false }
+        var information = stat()
+        guard Darwin.fstat(descriptor, &information) == 0 else { return false }
+        return revision == Revision(
+            device: UInt64(bitPattern: Int64(information.st_dev)),
+            inode: UInt64(information.st_ino),
+            fileSize: Int64(information.st_size),
+            modifiedSeconds: Int64(information.st_mtimespec.tv_sec),
+            modifiedNanoseconds: Int64(information.st_mtimespec.tv_nsec)
+        )
+    }
+
+    private func read(count: Int, offset: off_t, descriptor: Int32) throws -> Data {
+        var bytes = [UInt8](repeating: 0, count: count)
+        let readCount = bytes.withUnsafeMutableBytes { buffer in
+            Darwin.pread(descriptor, buffer.baseAddress, count, offset)
+        }
+        guard readCount == count else {
+            throw ParquetQueryError.malformedFile(Self.systemError("The Parquet envelope could not be read"))
+        }
+        return Data(bytes)
+    }
+
+    private static func systemError(_ prefix: String) -> String {
+        "\(prefix). \(String(cString: strerror(errno)))"
+    }
 }
 
 private nonisolated enum DuckDBBinding: Sendable {
@@ -1249,7 +1639,7 @@ private nonisolated final class ParquetInterruptHandle: @unchecked Sendable {
     private var connection: OpaquePointer?
     private var requestStates: [UUID: RequestState] = [:]
     private var activeRequestID: UUID?
-    #if DEBUG
+    #if DEBUG || LIGHTXT_PACKAGE_TESTING
     private var testingInterruptCount = 0
     #endif
 
@@ -1301,7 +1691,7 @@ private nonisolated final class ParquetInterruptHandle: @unchecked Sendable {
             case .active:
                 requestStates[id] = .cancelled
                 if activeRequestID == id, let connection {
-                    #if DEBUG
+                    #if DEBUG || LIGHTXT_PACKAGE_TESTING
                     testingInterruptCount += 1
                     #endif
                     runtime.interrupt(connection)
@@ -1318,7 +1708,7 @@ private nonisolated final class ParquetInterruptHandle: @unchecked Sendable {
                 requestStates[activeRequestID] = .cancelled
             }
             if let connection {
-                #if DEBUG
+                #if DEBUG || LIGHTXT_PACKAGE_TESTING
                 testingInterruptCount += 1
                 #endif
                 runtime.interrupt(connection)
@@ -1326,7 +1716,7 @@ private nonisolated final class ParquetInterruptHandle: @unchecked Sendable {
         }
     }
 
-    #if DEBUG
+    #if DEBUG || LIGHTXT_PACKAGE_TESTING
     /// Deterministically exercises the old late-cancellation race: request A
     /// finishes, request B becomes active, then A's cancellation arrives.
     /// Atomic ownership must ensure A cannot interrupt B.

@@ -3924,6 +3924,14 @@ final class CSVFilterPopoverViewController: NSViewController,
     private lazy var clearButton = NSButton(title: "Clear", target: self, action: #selector(clear(_:)))
     private var allUniqueValues: [String] = []
     private var visibleUniqueValues: [String] = []
+    private var remoteUniqueValueSearch: ((String) -> Void)?
+    private var remoteUniqueValuePageRequest: (() -> Void)?
+    private var pendingRemoteSearch: DispatchWorkItem?
+    private var valuesBoundsObserver: NSObjectProtocol?
+    private var remoteUniqueValueCount: Int64?
+    private var remoteUniqueValuesHaveMore = false
+    private var isRequestingRemoteValues = false
+    private var remoteMatchingUniqueValues: [String] = []
 
     init(
         columnTitle: String,
@@ -3943,6 +3951,13 @@ final class CSVFilterPopoverViewController: NSViewController,
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit {
+        pendingRemoteSearch?.cancel()
+        if let valuesBoundsObserver {
+            NotificationCenter.default.removeObserver(valuesBoundsObserver)
+        }
+    }
 
     override func loadView() {
         let root = NSView()
@@ -3985,6 +4000,14 @@ final class CSVFilterPopoverViewController: NSViewController,
         valuesScroll.hasVerticalScroller = true
         valuesScroll.autohidesScrollers = true
         valuesScroll.borderType = .bezelBorder
+        valuesScroll.contentView.postsBoundsChangedNotifications = true
+        valuesBoundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: valuesScroll.contentView,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.requestMoreRemoteValuesIfNeeded() }
+        }
 
         clearButton.bezelStyle = .rounded
         clearButton.isEnabled = !committedFilter.isEmpty
@@ -4025,8 +4048,80 @@ final class CSVFilterPopoverViewController: NSViewController,
     }
 
     func showUniqueValuesLoading() {
+        valuesTable.isEnabled = false
         valuesStatus.stringValue = "Loading unique values…"
         valuesStatus.setAccessibilityValue(valuesStatus.stringValue)
+    }
+
+    /// Enables a bounded, server-backed value browser. CSV continues to use
+    /// its existing in-memory picker; Parquet supplies searched/paged DuckDB
+    /// results so the 500 visible rows are a page size rather than a logical
+    /// limit on which exact values can be selected.
+    func configureRemoteUniqueValues(
+        onSearch: @escaping (String) -> Void,
+        onRequestNextPage: @escaping () -> Void
+    ) {
+        remoteUniqueValueSearch = onSearch
+        remoteUniqueValuePageRequest = onRequestNextPage
+    }
+
+    var uniqueValueSearchText: String {
+        loadViewIfNeeded()
+        return valueField.stringValue
+    }
+
+    func showRemoteUniqueValuesLoading(replacing: Bool) {
+        isRequestingRemoteValues = true
+        valuesTable.isEnabled = false
+        valuesStatus.toolTip = nil
+        if replacing {
+            remoteUniqueValueCount = nil
+            remoteUniqueValuesHaveMore = false
+            remoteMatchingUniqueValues.removeAll(keepingCapacity: true)
+        }
+        valuesStatus.stringValue = replacing
+            ? "Searching unique values…"
+            : "Loading more unique values…"
+        valuesStatus.setAccessibilityValue(valuesStatus.stringValue)
+    }
+
+    func showRemoteUniqueValues(
+        _ values: [String],
+        totalValueCount: Int64,
+        hasMore: Bool,
+        replacing: Bool,
+        omittedOversizedValueCount: Int64 = 0
+    ) {
+        isRequestingRemoteValues = false
+        valuesTable.isEnabled = true
+        valuesStatus.toolTip = nil
+        remoteUniqueValueCount = max(0, totalValueCount)
+        remoteUniqueValuesHaveMore = hasMore
+        remoteMatchingUniqueValues = Self.stablyAppendingUniqueValues(
+            replacing ? [] : remoteMatchingUniqueValues,
+            values
+        )
+        // Preserve DuckDB's stable frequency/value page order. Checked values
+        // outside the active search follow the matches so they remain
+        // available for deselection without inflating the matching count.
+        let retainedSelections = committedFilter.selectedValues
+            .subtracting(remoteMatchingUniqueValues)
+            .sorted(by: CSVFilterDraft.localizedValueOrder)
+        allUniqueValues = remoteMatchingUniqueValues + retainedSelections
+        let shown = remoteMatchingUniqueValues.count
+        let pageStatus = hasMore
+            ? "Showing \(shown.formatted()) of \(totalValueCount.formatted()) values"
+            : "\(totalValueCount.formatted()) matching value\(totalValueCount == 1 ? "" : "s")"
+        let selectionStatus = retainedSelections.isEmpty
+            ? ""
+            : " · \(retainedSelections.count.formatted()) selected outside search"
+        valuesStatus.stringValue = omittedOversizedValueCount > 0
+            ? "\(pageStatus) · \(omittedOversizedValueCount.formatted()) oversized rows omitted"
+                + selectionStatus
+            : pageStatus + selectionStatus
+        valuesStatus.setAccessibilityValue(valuesStatus.stringValue)
+        updateVisibleUniqueValues()
+        requestMoreRemoteValuesIfNeeded()
     }
 
     func showUniqueValues(progress: CSVUniqueValuesProgress) {
@@ -4036,6 +4131,8 @@ final class CSVFilterPopoverViewController: NSViewController,
     }
 
     func showUniqueValues(_ result: CSVUniqueValuesResult) {
+        isRequestingRemoteValues = false
+        valuesTable.isEnabled = true
         // Keep checked values visible even when a bounded scan reached its
         // cap before rediscovering one of them.
         allUniqueValues = Array(Set(result.values).union(committedFilter.selectedValues))
@@ -4048,6 +4145,8 @@ final class CSVFilterPopoverViewController: NSViewController,
     }
 
     func showUniqueValues(error: Error) {
+        isRequestingRemoteValues = false
+        valuesTable.isEnabled = true
         valuesStatus.stringValue = "Couldn’t load values"
         valuesStatus.toolTip = error.localizedDescription
         valuesStatus.setAccessibilityValue(error.localizedDescription)
@@ -4059,6 +4158,7 @@ final class CSVFilterPopoverViewController: NSViewController,
         // Live typing narrows only the local picker. It never mutates the CSV
         // query, reloads the table, or dismisses this popover.
         updateVisibleUniqueValues()
+        scheduleRemoteUniqueValueSearch()
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
@@ -4138,8 +4238,45 @@ final class CSVFilterPopoverViewController: NSViewController,
         let needle = valueField.stringValue
         visibleUniqueValues = needle.isEmpty
             ? allUniqueValues
-            : allUniqueValues.filter { $0.localizedCaseInsensitiveContains(needle) }
+            : allUniqueValues.filter {
+                committedFilter.selectedValues.contains($0)
+                    || valueDisplayProvider($0).localizedCaseInsensitiveContains(needle)
+            }
         valuesTable.reloadData()
+    }
+
+    private static func stablyAppendingUniqueValues(
+        _ existing: [String],
+        _ additions: [String]
+    ) -> [String] {
+        var seen = Set(existing)
+        var result = existing
+        result.reserveCapacity(existing.count + additions.count)
+        for value in additions where seen.insert(value).inserted {
+            result.append(value)
+        }
+        return result
+    }
+
+    private func scheduleRemoteUniqueValueSearch() {
+        guard let remoteUniqueValueSearch else { return }
+        pendingRemoteSearch?.cancel()
+        let searchText = valueField.stringValue
+        let work = DispatchWorkItem { remoteUniqueValueSearch(searchText) }
+        pendingRemoteSearch = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: work)
+    }
+
+    private func requestMoreRemoteValuesIfNeeded() {
+        guard remoteUniqueValuesHaveMore,
+              !isRequestingRemoteValues,
+              let remoteUniqueValuePageRequest else { return }
+        let visibleBottom = valuesScroll.contentView.bounds.maxY
+        let contentBottom = valuesTable.bounds.maxY
+        let preloadDistance = max(54, valuesTable.rowHeight * 8)
+        guard contentBottom - visibleBottom <= preloadDistance else { return }
+        isRequestingRemoteValues = true
+        remoteUniqueValuePageRequest()
     }
 
 
@@ -4159,6 +4296,9 @@ final class CSVFilterPopoverViewController: NSViewController,
     }
     var qaHasFocus: Bool { valueField.currentEditor() != nil }
     var qaUniqueValues: [String] { allUniqueValues }
+    var qaUniqueValuesStatus: String { valuesStatus.stringValue }
+    var qaUniqueValuesToolTip: String? { valuesStatus.toolTip }
+    var qaRemoteUniqueValueCount: Int64? { remoteUniqueValueCount }
 
     func qaPrepareCaptureBackground() {
         view.wantsLayer = true

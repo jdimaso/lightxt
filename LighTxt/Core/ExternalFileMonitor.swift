@@ -356,6 +356,32 @@ public nonisolated final class ExternalFileMonitor: @unchecked Sendable {
         return state
     }
 
+    /// Advances the monitor only when the pathname still represents the exact
+    /// revision a reload actually opened. This closes the interval between
+    /// pinning a lazy file-backed reader and acknowledging its path: if an
+    /// atomic writer replaces the path in that interval, the newer revision is
+    /// sampled and reported instead of being silently accepted.
+    @discardableResult
+    public func acknowledgeCurrentFileState(
+        matching expectedState: ExternalFileState?
+    ) throws -> Bool {
+        let currentState = try ExternalFileState.inspect(at: url)
+        guard currentState == expectedState else {
+            withStateQueue { scheduleSample() }
+            return false
+        }
+        withStateQueue {
+            pendingSample?.cancel()
+            pendingSample = nil
+            lastObservedState = expectedState
+            lastReportedFailure = nil
+            if isStarted {
+                installFileSystemSource(for: expectedState)
+            }
+        }
+        return true
+    }
+
     private func installPollingTimer() {
         let timer = DispatchSource.makeTimerSource(queue: stateQueue)
         let leewayMilliseconds = max(

@@ -17,6 +17,7 @@ final class DocumentHeaderView: NSView {
     var onFind: (() -> Void)?
     var onStructure: (() -> Void)?
     var onExport: (() -> Void)?
+    var onReload: (() -> Void)?
     var onPrettifyChanged: ((Bool) -> Void)?
     var onOpenFolder: ((URL) -> Void)?
     var onPresentationModeChanged: ((DocumentPresentationMode) -> Void)?
@@ -43,6 +44,10 @@ final class DocumentHeaderView: NSView {
         symbolName: "square.and.arrow.up",
         accessibilityLabel: "Export table"
     )
+    private let reloadButton = HeaderIconButton(
+        symbolName: "arrow.clockwise",
+        accessibilityLabel: "Reload file"
+    )
     private let findButton = HeaderIconButton(
         symbolName: "magnifyingglass",
         accessibilityLabel: "Find"
@@ -51,6 +56,7 @@ final class DocumentHeaderView: NSView {
     private var trailingWidthConstraint: NSLayoutConstraint?
     private var isPrettifyAvailable = false
     private var isExportVisible = false
+    private var isReloadVisible = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -155,6 +161,25 @@ final class DocumentHeaderView: NSView {
             ? "Export the current table view"
             : (unavailableReason ?? "Export is temporarily unavailable")
         exportButton.setAccessibilityHelp(exportButton.toolTip)
+        updateTrailingWidth()
+    }
+
+    /// Parquet is presented as a stable, read-only snapshot. Keep its explicit
+    /// disk refresh beside Export so observing a newer revision never implies
+    /// that the currently displayed rows have silently changed underneath the
+    /// user.
+    func setReloadAvailable(
+        _ available: Bool,
+        visible: Bool,
+        unavailableReason: String? = nil
+    ) {
+        isReloadVisible = visible
+        reloadButton.isHidden = !visible
+        reloadButton.isEnabled = visible && available
+        reloadButton.toolTip = available
+            ? "Reload this Parquet file from disk"
+            : (unavailableReason ?? "Reload is temporarily unavailable")
+        reloadButton.setAccessibilityHelp(reloadButton.toolTip)
         updateTrailingWidth()
     }
 
@@ -268,13 +293,23 @@ final class DocumentHeaderView: NSView {
         exportButton.toolTip = "Export the current table view"
         exportButton.isHidden = true
         exportButton.onActivate = { [weak self] in self?.onExport?() }
+        reloadButton.toolTip = "Reload this Parquet file from disk"
+        reloadButton.isHidden = true
+        reloadButton.onActivate = { [weak self] in self?.onReload?() }
         findButton.toolTip = "Find in document (Command-F)"
         findButton.keyEquivalent = "f"
         findButton.keyEquivalentModifierMask = [.command]
         findButton.onActivate = { [weak self] in self?.onFind?() }
 
         let trailing = NSStackView(
-            views: [modeControl, prettifyButton, exportButton, structureButton, findButton]
+            views: [
+                modeControl,
+                prettifyButton,
+                exportButton,
+                reloadButton,
+                structureButton,
+                findButton,
+            ]
         )
         trailing.orientation = .horizontal
         trailing.alignment = .centerY
@@ -319,6 +354,7 @@ final class DocumentHeaderView: NSView {
         // 32pt hit target plus the stack's 8pt spacing; Prettify adds 84pt.
         trailingWidthConstraint?.constant = CGFloat(197)
             + (isExportVisible ? CGFloat(40) : 0)
+            + (isReloadVisible ? CGFloat(40) : 0)
             + (isPrettifyAvailable ? CGFloat(84) : 0)
     }
 
@@ -363,6 +399,12 @@ final class DocumentHeaderView: NSView {
     var qaExportAccessibilityHelp: String? { exportButton.accessibilityHelp() }
     var qaExportFrame: NSRect { exportButton.frame }
     func qaActivateExport() { _ = exportButton.accessibilityPerformPress() }
+    var qaReloadIsVisible: Bool { !reloadButton.isHidden }
+    var qaReloadIsEnabled: Bool { reloadButton.isEnabled }
+    var qaReloadAccessibilityLabel: String? { reloadButton.accessibilityLabel() }
+    var qaReloadAccessibilityHelp: String? { reloadButton.accessibilityHelp() }
+    var qaReloadFrame: NSRect { reloadButton.frame }
+    func qaActivateReload() { _ = reloadButton.accessibilityPerformPress() }
 #endif
 
     private func activatePathItem(_ url: URL) {

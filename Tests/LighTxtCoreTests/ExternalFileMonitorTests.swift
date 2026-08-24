@@ -323,6 +323,39 @@ final class ExternalFileMonitorTests: XCTestCase {
         XCTAssertEqual(monitor.baselineState, acknowledged)
     }
 
+    func testConditionalAcknowledgeReportsRevisionThatArrivedAfterReaderPinned() throws {
+        let source = try makeFile(named: "conditional-acknowledge.txt", contents: Data("old".utf8))
+        let readerPinnedState = try XCTUnwrap(ExternalFileState.inspect(at: source))
+        let received = expectation(description: "newer revision remains observable")
+        let recorder = ChangeRecorder()
+        let monitor = try ExternalFileMonitor(
+            url: source,
+            configuration: .init(
+                coalescingInterval: 0.02,
+                pollingInterval: 5,
+                observationMode: .pollingOnly
+            )
+        ) { change in
+            recorder.append(change)
+            received.fulfill()
+        }
+        monitor.start()
+
+        try Data("new revision".utf8).write(to: source, options: .atomic)
+        XCTAssertFalse(
+            try monitor.acknowledgeCurrentFileState(matching: readerPinnedState),
+            "A reload must not acknowledge bytes newer than its pinned reader"
+        )
+        wait(for: [received], timeout: 1.5)
+        monitor.stop()
+
+        let current = try XCTUnwrap(ExternalFileState.inspect(at: source))
+        XCTAssertEqual(recorder.values.count, 1)
+        XCTAssertEqual(recorder.values[0].current, current)
+        XCTAssertEqual(recorder.values[0].kind, .replaced)
+        XCTAssertEqual(monitor.baselineState, current)
+    }
+
     private func makeFile(named name: String, contents: Data) throws -> URL {
         let url = temporaryDirectory.appendingPathComponent(name)
         try contents.write(to: url)

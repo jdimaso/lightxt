@@ -77,7 +77,39 @@ struct ParquetTableRuntimeQA {
             window.close()
         }
 
+        let pickerRecoveryProbe = CSVFilterPopoverViewController(
+            columnTitle: "Picker recovery probe",
+            filter: nil
+        )
+        pickerRecoveryProbe.loadView()
+        pickerRecoveryProbe.showUniqueValues(
+            error: NSError(domain: "LighTxtRuntimeQA", code: 1)
+        )
+        guard pickerRecoveryProbe.qaUniqueValuesToolTip != nil else {
+            throw QAError.failed("Unique-value errors did not expose diagnostic help")
+        }
+        pickerRecoveryProbe.showRemoteUniqueValuesLoading(replacing: true)
+        guard pickerRecoveryProbe.qaUniqueValuesToolTip == nil else {
+            throw QAError.failed("Remote unique-value loading retained a stale error tooltip")
+        }
+        pickerRecoveryProbe.showUniqueValues(
+            error: NSError(domain: "LighTxtRuntimeQA", code: 2)
+        )
+        pickerRecoveryProbe.showRemoteUniqueValues(
+            ["recovered"],
+            totalValueCount: 1,
+            hasMore: false,
+            replacing: true
+        )
+        guard pickerRecoveryProbe.qaUniqueValuesToolTip == nil else {
+            throw QAError.failed("Recovered remote unique values retained a stale error tooltip")
+        }
+
         view.load(url: fixtureURL)
+        guard view.qaIsQueryLoadingOverlayVisible,
+              view.qaQueryOverlayBlocksTable else {
+            throw QAError.failed("Initial Parquet load did not use the blocking animated table overlay")
+        }
         try wait(until: { view.qaIsReady }, failure: "Parquet schema/first page did not load")
         guard view.qaRowCount == 8,
               view.qaColumnNames == ["id", "group_key", "value", "amount", "file_row_number", "nested"],
@@ -88,6 +120,16 @@ struct ParquetTableRuntimeQA {
               view.qaTableAccessibilityLabel == "Read-only Parquet table",
               view.qaVisibleDataCellsAreReadOnly else {
             throw QAError.failed("Initial schema, NULL/empty/literal values, or read-only accessibility is incorrect")
+        }
+        view.qaBeginQueryOverlayAnimationProbe()
+        runLoop(0.24)
+        guard view.qaQueryOverlayHasFadedTable else {
+            throw QAError.failed("Parquet query cover did not fade the stale table beneath it")
+        }
+        view.qaEndQueryOverlayAnimationProbe()
+        runLoop(0.20)
+        guard view.qaTablePresentationIsInteractive else {
+            throw QAError.failed("Parquet query cover did not restore table interaction after completion")
         }
         // Do not call any QA synchronization helper before this assertion.
         // The async Parquet schema install itself must materialize both the
@@ -135,15 +177,25 @@ struct ParquetTableRuntimeQA {
             throw QAError.failed("Inline Parquet Contains applied while typing or lost focus")
         }
         view.qaCommitInlineContainsFilter()
+        guard view.qaIsQueryLoadingOverlayVisible,
+              view.qaQueryOverlayBlocksTable,
+              view.qaRowCount == 8,
+              view.qaValue(row: 0, column: 0) == "1" else {
+            throw QAError.failed(
+                "Parquet filtering did not fade/block the last complete rows transactionally"
+            )
+        }
         try wait(until: { view.qaIsReady && view.qaRowCount == 1 }, failure: "Inline Contains did not apply")
-        guard view.qaValue(row: 0, column: 0) == "6" else {
+        guard view.qaValue(row: 0, column: 0) == "6",
+              view.qaTablePresentationIsInteractive else {
             throw QAError.failed("Contains filter did not reveal the expected row")
         }
         view.qaClearFilters()
         try wait(until: { view.qaIsReady && view.qaRowCount == 8 }, failure: "Clearing Contains did not restore rows")
 
         // Commit before facet discovery can finish. resetQuery must prioritize
-        // the page and restart the still-open exclusion-of-self facet.
+        // the page and restart the still-open exclusion-of-self facet using
+        // the popover text as its server-side value search.
         view.qaShowFilterPopover(column: 2)
         try wait(until: {
             view.qaHasPresentedPopover && view.qaPopoverFilterHasFocus
@@ -152,7 +204,10 @@ struct ParquetTableRuntimeQA {
         view.qaCommitPopoverContains()
         try wait(until: {
             view.qaIsReady && view.qaRowCount == 1
-                && view.qaPopoverUniqueValueLabels.contains("NULL")
+                && view.qaPopoverUniqueValueLabels.contains("“zeta”")
+                && applicationTextValues().contains { value in
+                    value.contains("matching value") && !value.contains("…")
+                }
         }, failure: "Early popover commit stranded facet discovery")
         guard view.qaHasPresentedPopover, view.qaPopoverFilterHasFocus else {
             throw QAError.failed("Popover closed or lost focus after a committed query")
@@ -160,7 +215,14 @@ struct ParquetTableRuntimeQA {
 
         view.qaTypePopoverContains("")
         view.qaCommitPopoverContains()
-        try wait(until: { view.qaIsReady && view.qaRowCount == 8 }, failure: "Clearing popover text failed")
+        try wait(until: {
+            let labels = Set(view.qaPopoverUniqueValueLabels)
+            return view.qaIsReady
+                && view.qaRowCount == 8
+                && labels.contains("NULL")
+                && labels.contains("Empty string")
+                && labels.contains("“NULL”")
+        }, failure: "Clearing popover text or refreshing its remote facet failed")
         let facetLabels = Set(view.qaPopoverUniqueValueLabels)
         guard facetLabels.contains("NULL"),
               facetLabels.contains("Empty string"),
@@ -212,8 +274,9 @@ struct ParquetTableRuntimeQA {
         try wait(until: { view.qaIsReady }, failure: "Clearing sort failed")
         guard view.qaValue(row: 0, column: 0) == "1" else { throw QAError.failed("Third sort state did not restore source order") }
 
-        // Inactive-window purging closes DuckDB and releases decoded pages, but
-        // the user's filter projection and row selection must survive exactly.
+        // Parquet is already file-backed and bounded. Losing focus must not
+        // tear down its stable page or replace visible values with Loading…;
+        // reactivation must therefore require no reopen/query cycle.
         view.qaClosePopover()
         view.qaApplyContainsFilter(column: 1, value: "same")
         try wait(until: { view.qaIsReady && view.qaRowCount == 6 }, failure: "Purge filter setup failed")
@@ -226,20 +289,22 @@ struct ParquetTableRuntimeQA {
         guard view.purgeRebuildableResidentMemory(),
               !view.purgeRebuildableResidentMemory(),
               view.qaIsResidentStatePurged,
-              view.qaCachedPageCount == 0,
+              view.qaCachedPageCount > 0,
               view.qaRowCount == 6,
-              view.qaSelectedRows == purgeSelection else {
-            throw QAError.failed("Inactive Parquet purge lost state or was not idempotent")
+              view.qaSelectedRows == purgeSelection,
+              [view.qaValue(row: 1, column: 0), view.qaValue(row: 3, column: 0)] == valuesBeforePurge,
+              view.qaTablePresentationIsInteractive else {
+            throw QAError.failed("Inactive Parquet state replaced stable visible rows or lost selection")
         }
         view.reactivateAfterResidentPurge()
         view.reactivateAfterResidentPurge()
-        try wait(until: {
-            view.qaIsReady && !view.qaIsResidentStatePurged && view.qaRowCount == 6
-        }, failure: "Purged Parquet service did not reopen")
-        guard view.qaSelectedRows == purgeSelection,
+        guard view.qaIsReady,
+              !view.qaIsResidentStatePurged,
+              view.qaRowCount == 6,
+              view.qaSelectedRows == purgeSelection,
               view.qaFilterChipCount == 1,
               [view.qaValue(row: 1, column: 0), view.qaValue(row: 3, column: 0)] == valuesBeforePurge else {
-            throw QAError.failed("Parquet reactivation lost its filter, selection, or displayed rows")
+            throw QAError.failed("Parquet reactivation queried again or lost its stable presentation")
         }
         view.qaClearFilters()
         try wait(until: { view.qaIsReady && view.qaRowCount == 8 }, failure: "Post-purge filter clear failed")
@@ -254,8 +319,13 @@ struct ParquetTableRuntimeQA {
         }
 
         view.qaCopyCell(row: 2, column: 2)
-        guard NSPasteboard.general.string(forType: .string) == "NULL" else {
-            throw QAError.failed("Copy Cell did not copy the displayed value")
+        let copiedCell = NSPasteboard.general.string(forType: .string)
+        guard copiedCell == "NULL" else {
+            throw QAError.failed(
+                "Copy Cell did not copy the displayed value; source="
+                    + "\(String(describing: view.qaValue(row: 2, column: 2))), "
+                    + "pasteboard=\(String(describing: copiedCell))"
+            )
         }
         view.qaCopyRow(0)
         guard NSPasteboard.general.string(forType: .string)?.split(separator: "\t", omittingEmptySubsequences: false).count == 6 else {
@@ -291,6 +361,39 @@ struct ParquetTableRuntimeQA {
         // values containing JSON punctuation, quotes, newlines, and Unicode.
         let structuredURL = outputDirectory.appendingPathComponent("structured-values.parquet")
         try structuredFixtureData(beside: fixtureURL).write(to: structuredURL)
+        do {
+            let latchView = ParquetTableView(
+                frame: NSRect(x: 0, y: 0, width: 1_000, height: 620)
+            )
+            let latchWindow = host(latchView, appearance: .aqua)
+            defer {
+                latchView.deactivate()
+                latchWindow.close()
+            }
+            latchView.load(url: structuredURL)
+            try wait(until: { latchView.qaIsReady }, failure: "Source-latch fixture did not load")
+
+            // A source revision failure must terminate both active and queued
+            // structured detail placeholders. Expansions attempted afterward
+            // also explain that Reload is required instead of spinning forever.
+            for row in [2, 3, 4] {
+                latchView.qaToggleStructuredCell(row: row, column: 1)
+            }
+            latchView.qaLatchSourceChanged()
+            guard latchView.qaPendingStructuredDetailCount == 0,
+                  latchView.qaStructuredDetailTaskOrderCount == 0,
+                  [2, 3, 4].allSatisfy({
+                      latchView.qaStructuredDetailError(row: $0, column: 1)?
+                          .contains("Reload") == true
+                  }) else {
+                throw QAError.failed("Source-change latch left a structured detail visibly loading")
+            }
+            latchView.qaToggleStructuredCell(row: 5, column: 1)
+            guard latchView.qaStructuredDetailError(row: 5, column: 1)?
+                .contains("Reload") == true else {
+                throw QAError.failed("Post-latch structured expansion did not require Reload")
+            }
+        }
         let structuredView = ParquetTableView(frame: NSRect(x: 0, y: 0, width: 1_300, height: 760))
         let structuredWindow = host(structuredView, appearance: .aqua)
         structuredWindow.title = "Structured Parquet Runtime QA"
@@ -566,6 +669,15 @@ struct ParquetTableRuntimeQA {
             if let match = descendant(of: child, as: type) { return match }
         }
         return nil
+    }
+
+    private static func applicationTextValues() -> [String] {
+        func collect(from view: NSView) -> [String] {
+            var values = (view as? NSTextField).map { [$0.stringValue] } ?? []
+            for child in view.subviews { values.append(contentsOf: collect(from: child)) }
+            return values
+        }
+        return NSApp.windows.compactMap(\.contentView).flatMap(collect)
     }
 
     private static func wait(
