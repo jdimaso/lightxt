@@ -68,6 +68,15 @@ SIGN_UPDATE="$SPARKLE_BIN/sign_update"
 "$GENERATE_KEYS" --account "$KEYCHAIN_ACCOUNT" -p >/dev/null
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+SIGNED_ENTITLEMENTS="$(codesign -d --entitlements - "$APP_PATH" 2>&1)"
+SIGNED_PRINTING_ENTITLEMENT="$(
+    print -r -- "$SIGNED_ENTITLEMENTS" |
+        grep -A2 -F '[Key] com.apple.security.print' || true
+)"
+[[ "$SIGNED_PRINTING_ENTITLEMENT" == *"[Bool] true"* ]] || {
+    print -u2 "The signed release is missing the App Sandbox printing entitlement."
+    exit 65
+}
 CODESIGN_DETAILS="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1)"
 [[ "$CODESIGN_DETAILS" == *"Authority=Developer ID Application:"* ]] || {
     print -u2 "The app is not signed with a Developer ID Application certificate."

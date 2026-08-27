@@ -174,10 +174,20 @@ preflight() {
 
     require_file Package.swift
     require_file LighTxt.xcodeproj/xcshareddata/xcschemes/LighTxt.xcscheme
+    require_file LighTxt/LighTxt.entitlements
     require_file ThirdParty/DuckDB/libduckdb-osx-universal-v1.4.5.zip
     require_file Tests/Fixtures/RuntimeQA.csv
     require_file Tests/Fixtures/RuntimeQA.md
     require_file Tests/Fixtures/Parquet/query-service.parquet
+
+    local printing_entitlement
+    printing_entitlement="$(/usr/libexec/PlistBuddy \
+        -c 'Print :com.apple.security.print' \
+        LighTxt/LighTxt.entitlements 2>/dev/null || true)"
+    [[ "$printing_entitlement" == true ]] || {
+        print -u2 "The sandboxed app must include com.apple.security.print to support File > Print."
+        return 65
+    }
 
     # New standalone harnesses and drivers must be deliberately registered below. This is
     # intentionally a hard failure: a checked-in regression test must never be
