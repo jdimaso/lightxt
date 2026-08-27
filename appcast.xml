@@ -9,6 +9,23 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Secure LighTxt application updates</description>
         <language>en</language>
         <item>
+            <title>1.7</title>
+            <pubDate>Thu, 27 Aug 2026 11:01:51 -0400</pubDate>
+            <link>https://github.com/jdimaso/lightxt</link>
+            <sparkle:version>13</sparkle:version>
+            <sparkle:shortVersionString>1.7</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[# LighTxt 1.7
+
+- Added paginated PDF export for rendered Markdown in View mode through **File > Export as PDF…**.
+- Added native **Print…** support (`Command-P`) for rendered Markdown and plain-text documents in View mode.
+- PDF export and printing now include the complete document and unsaved edits, even when content extends beyond the bounded on-screen viewport.
+- Added printable light-page styling, document headers and page numbers, clickable links, atomic export publishing, and private temporary-file cleanup for print jobs.
+- Expanded regression coverage for multi-page Markdown, large Markdown and text files, empty documents, menu routing, mode eligibility, and PDF semantics.
+]]></description>
+            <enclosure url="https://github.com/jdimaso/lightxt/releases/download/v1.7/LighTxt-1.7-macOS-universal.zip" length="39866046" type="application/octet-stream" sparkle:edSignature="vTMvRFKWr8kpQ5tcoZ9m5Bc8PO0wo0y57WRODydV2FnK1EJjuZzuIlmwzDijylkr6qi1+m9ZhHGLJ4QFdmtADQ=="/>
+        </item>
+        <item>
             <title>1.6</title>
             <pubDate>Sun, 23 Aug 2026 23:37:09 -0400</pubDate>
             <link>https://github.com/jdimaso/lightxt</link>
@@ -154,6 +171,6 @@ This release also includes the large-file JSON, CSV, Markdown, navigation, and p
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: YKC6E1bgu3JVl9RFveF3lk2wHBSf2L+fitSvMUoFFqLoJYn+0B89MzEMaoL1DOHGr9DjAYjeXN52/C9j+1yRAQ==
-length: 11863
+edSignature: UyjkS7yzsJ9TZ3TwYatE5Ng4r8Ssb7UrmCuja2MKkqWl7DP2q/DyAh12jb64gcHY15A9UXRQsb7Us6hUUOLGCw==
+length: 13302
 -->
