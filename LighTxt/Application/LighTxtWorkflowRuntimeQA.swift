@@ -382,6 +382,82 @@ final class LighTxtWorkflowRuntimeQA {
         try await Task.sleep(nanoseconds: 80_000_000)
         try expect(exportInvocationCount == 1, "one Export activation routed more than once")
 
+        // Route document output through the real View-mode capability checks.
+        // QA probes stop immediately before production presents a save or print
+        // panel, keeping this hosted run nonmodal while still crossing the
+        // document/window-controller boundary.
+        guard let markdownWindowController = firstDocuments[4].windowControllers.first
+            as? LighTxtWindowController else {
+            throw QAError.failed("the Markdown document has no production window controller")
+        }
+        var markdownPDFInvocationCount = 0
+        var markdownPrintInvocationCount = 0
+        markdownWindowController.qaPrepareDocumentOutputProbes(
+            exportPDF: { markdownPDFInvocationCount += 1 },
+            print: { markdownPrintInvocationCount += 1 }
+        )
+        try await waitUntil("Markdown View document output to become available") {
+            markdownWindowController.qaCanExportCurrentDocumentAsPDF
+                && markdownWindowController.qaCanPrintCurrentDocument
+        }
+        try expect(
+            markdownPDFInvocationCount == 0 && markdownPrintInvocationCount == 0,
+            "Markdown document output routed before either action was activated"
+        )
+        markdownWindowController.qaActivatePDFExport()
+        markdownWindowController.qaActivatePrint()
+        try await waitUntil("Markdown PDF export and Print actions to route") {
+            markdownPDFInvocationCount == 1 && markdownPrintInvocationCount == 1
+        }
+        try await Task.sleep(nanoseconds: 80_000_000)
+        try expect(
+            markdownPDFInvocationCount == 1 && markdownPrintInvocationCount == 1,
+            "one Markdown PDF export or Print activation routed more than once"
+        )
+
+        var textPDFInvocationCount = 0
+        var textPrintInvocationCount = 0
+        textWindowController.qaPrepareDocumentOutputProbes(
+            exportPDF: { textPDFInvocationCount += 1 },
+            print: { textPrintInvocationCount += 1 }
+        )
+        try await waitUntil("plain-text View printing to become available") {
+            textWindowController.qaCanPrintCurrentDocument
+        }
+        try expect(
+            !textWindowController.qaCanExportCurrentDocumentAsPDF,
+            "plain-text View incorrectly enabled Markdown PDF export"
+        )
+        textWindowController.qaActivatePDFExport()
+        textWindowController.qaActivatePrint()
+        try await waitUntil("plain-text View Print action to route") {
+            textPrintInvocationCount == 1
+        }
+        try await Task.sleep(nanoseconds: 80_000_000)
+        try expect(
+            textPDFInvocationCount == 0 && textPrintInvocationCount == 1,
+            "plain-text View routed an unsupported PDF export or duplicated Print"
+        )
+
+        var csvPDFInvocationCount = 0
+        var csvPrintInvocationCount = 0
+        csvWindowController.qaPrepareDocumentOutputProbes(
+            exportPDF: { csvPDFInvocationCount += 1 },
+            print: { csvPrintInvocationCount += 1 }
+        )
+        try expect(
+            !csvWindowController.qaCanExportCurrentDocumentAsPDF
+                && !csvWindowController.qaCanPrintCurrentDocument,
+            "CSV View incorrectly advertised PDF export or Print"
+        )
+        csvWindowController.qaActivatePDFExport()
+        csvWindowController.qaActivatePrint()
+        try await Task.sleep(nanoseconds: 80_000_000)
+        try expect(
+            csvPDFInvocationCount == 0 && csvPrintInvocationCount == 0,
+            "CSV View routed unsupported PDF export or Print actions"
+        )
+
         // Inject only the scheduler's size threshold and delay, then observe
         // both the production editor and its installed CSV table enter their
         // purged states after resignation and leave them on reactivation.
@@ -510,6 +586,26 @@ final class LighTxtWorkflowRuntimeQA {
             action: #selector(LighTxtDocumentController.openAsLighTxtDocument(_:)),
             target: documentController
         )
+        try expectMenuItem(
+            in: fileMenu,
+            title: "Export as PDF…",
+            action: #selector(LighTxtDocumentController.exportCurrentDocumentAsPDF(_:)),
+            target: documentController
+        )
+        try expectMenuItem(
+            in: fileMenu,
+            title: "Print…",
+            action: #selector(LighTxtDocumentController.printCurrentDocument(_:)),
+            target: documentController
+        )
+        guard let printItem = fileMenu.items.first(where: { $0.title == "Print…" }) else {
+            throw QAError.failed("menu item Print… is missing")
+        }
+        try expect(
+            printItem.keyEquivalent == "p"
+                && printItem.keyEquivalentModifierMask == [.command],
+            "Print… does not use Command-P"
+        )
         let tabCommands: [(String, Selector)] = [
             ("Show Tab Bar", #selector(NSWindow.toggleTabBar(_:))),
             ("Previous Tab", #selector(NSWindow.selectPreviousTab(_:))),
@@ -559,6 +655,10 @@ final class LighTxtWorkflowRuntimeQA {
         let parquetURL = directory.appendingPathComponent("workflow-delta.parquet")
         try Data(contentsOf: parquetFixture).write(to: parquetURL, options: .atomic)
         urls.append(parquetURL.standardizedFileURL)
+        let markdownURL = directory.appendingPathComponent("workflow-epsilon.md")
+        try Data("# Workflow Markdown\n\nA **rendered** document output fixture.\n".utf8)
+            .write(to: markdownURL, options: .atomic)
+        urls.append(markdownURL.standardizedFileURL)
         return urls
     }
 

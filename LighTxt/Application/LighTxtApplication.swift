@@ -297,6 +297,20 @@ final class LighTxtMenu: NSObject {
         duplicate.target = documentController
         menu.addItem(duplicate)
         menu.addItem(.separator())
+        let exportPDF = item(
+            "Export as PDF…",
+            action: #selector(LighTxtDocumentController.exportCurrentDocumentAsPDF(_:))
+        )
+        exportPDF.target = documentController
+        menu.addItem(exportPDF)
+        let printDocument = item(
+            "Print…",
+            action: #selector(LighTxtDocumentController.printCurrentDocument(_:)),
+            key: "p"
+        )
+        printDocument.target = documentController
+        menu.addItem(printDocument)
+        menu.addItem(.separator())
         let exportTable = item(
             "Export Table…",
             action: #selector(LighTxtDocumentController.exportCurrentTableView(_:))

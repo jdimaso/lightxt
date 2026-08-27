@@ -757,6 +757,30 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
         controller.exportCurrentView()
     }
 
+    @objc func exportCurrentDocumentAsPDF(_ sender: Any?) {
+        guard let document = currentDocument as? LighTxtDocument,
+              !document.isSaving,
+              !document.session.isBulkEditing,
+              let controller = activeWindowController,
+              controller.canExportCurrentDocumentAsPDF else {
+            NSSound.beep()
+            return
+        }
+        controller.exportCurrentDocumentAsPDF()
+    }
+
+    @objc func printCurrentDocument(_ sender: Any?) {
+        guard let document = currentDocument as? LighTxtDocument,
+              !document.isSaving,
+              !document.session.isBulkEditing,
+              let controller = activeWindowController,
+              controller.canPrintCurrentDocument else {
+            NSSound.beep()
+            return
+        }
+        controller.printCurrentDocument()
+    }
+
     @objc func cancelCurrentTableExport(_ sender: Any?) {
         guard let controller = activeWindowController,
               controller.isExportingCurrentView else {
@@ -914,6 +938,16 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
                 && document?.isSaving == false
                 && document?.session.isBulkEditing == false
                 && activeWindowController?.canExportCurrentView == true
+        case #selector(exportCurrentDocumentAsPDF(_:)):
+            return document != nil
+                && document?.isSaving == false
+                && document?.session.isBulkEditing == false
+                && activeWindowController?.canExportCurrentDocumentAsPDF == true
+        case #selector(printCurrentDocument(_:)):
+            return document != nil
+                && document?.isSaving == false
+                && document?.session.isBulkEditing == false
+                && activeWindowController?.canPrintCurrentDocument == true
         case #selector(cancelCurrentTableExport(_:)):
             return activeWindowController?.isExportingCurrentView == true
         case #selector(reloadCurrentLighTxtDocument(_:)):

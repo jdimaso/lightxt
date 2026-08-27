@@ -70,6 +70,10 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
     var isFollowingEndOfFile: Bool { followsEndOfFile }
     var canExportCurrentView: Bool { editorViewController.canExportCurrentView }
     var isExportingCurrentView: Bool { editorViewController.isExportingCurrentView }
+    var canExportCurrentDocumentAsPDF: Bool {
+        editorViewController.canExportCurrentDocumentAsPDF
+    }
+    var canPrintCurrentDocument: Bool { editorViewController.canPrintCurrentDocument }
 
     init(document: LighTxtDocument) {
         let initialSize = Self.initialContentSize()
@@ -247,6 +251,7 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
             isSaving: document.isSaving,
             isBulkEditing: document.session.isBulkEditing,
             isExporting: editorViewController.isExportingCurrentView
+                || editorViewController.isPreparingDocumentOutput
         )
         guard InactiveDocumentPurgePolicy.canPurge(conditions) else {
             if conditions.isKeyWindow { return }
@@ -693,6 +698,14 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         editorViewController.exportCurrentView()
     }
 
+    func exportCurrentDocumentAsPDF() {
+        editorViewController.exportCurrentDocumentAsPDF()
+    }
+
+    func printCurrentDocument() {
+        editorViewController.printCurrentDocument()
+    }
+
     func cancelExport() {
         editorViewController.cancelExport()
     }
@@ -723,6 +736,32 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
 
     func qaActivateExportControl() {
         editorViewController.qaActivateExportControl()
+    }
+
+    func qaPrepareDocumentOutputProbes(
+        exportPDF: (() -> Void)?,
+        print: (() -> Void)?
+    ) {
+        editorViewController.qaPrepareDocumentOutputProbes(
+            exportPDF: exportPDF,
+            print: print
+        )
+    }
+
+    var qaCanExportCurrentDocumentAsPDF: Bool {
+        editorViewController.qaCanExportCurrentDocumentAsPDF
+    }
+
+    var qaCanPrintCurrentDocument: Bool {
+        editorViewController.qaCanPrintCurrentDocument
+    }
+
+    func qaActivatePDFExport() {
+        editorViewController.qaActivatePDFExport()
+    }
+
+    func qaActivatePrint() {
+        editorViewController.qaActivatePrint()
     }
 
     var qaIsReloadControlReady: Bool {
@@ -826,6 +865,16 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         return table
     }()
     private lazy var prettifiedViewportView = PrettifiedViewportView()
+    private lazy var documentPDFOutputCoordinator: DocumentPDFOutputCoordinator = {
+        let coordinator = DocumentPDFOutputCoordinator()
+        coordinator.onStatusChange = { [weak self] text, busy, isError in
+            self?.statusBar.setState(text, busy: busy, isError: isError)
+        }
+        coordinator.onBusyChange = { [weak self] _ in
+            self?.refreshChrome()
+        }
+        return coordinator
+    }()
     private weak var installedPrimaryContentView: NSView?
     private var findHeightConstraint: NSLayoutConstraint!
     private var externalBannerHeightConstraint: NSLayoutConstraint!
@@ -834,6 +883,8 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private var presentationMode: DocumentPresentationMode = .edit
 #if LIGHTXT_RUNTIME_QA
     private var runtimeQAExportProbe: (() -> Void)?
+    private var runtimeQAPDFExportProbe: (() -> Void)?
+    private var runtimeQAPrintProbe: (() -> Void)?
 #endif
     private var preferredStructureWidth: CGFloat = 340
     private var sidebarShowsSearchResults = false
@@ -904,6 +955,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         searchPreviewCancellation?.cancel()
         prettifyCancellation?.cancel()
         prettifyGeneration &+= 1
+        documentPDFOutputCoordinator.cancel()
         (installedPrimaryContentView as? MarkdownPreviewView)?.deactivate()
         (installedPrimaryContentView as? CSVTableView)?.deactivate()
         (installedPrimaryContentView as? ParquetTableView)?.deactivate()
@@ -2777,6 +2829,26 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         header.qaActivateExport()
     }
 
+    func qaPrepareDocumentOutputProbes(
+        exportPDF: (() -> Void)?,
+        print: (() -> Void)?
+    ) {
+        runtimeQAPDFExportProbe = exportPDF
+        runtimeQAPrintProbe = print
+        setPresentationMode(.view, notifyIntegration: true)
+    }
+
+    var qaCanExportCurrentDocumentAsPDF: Bool { canExportCurrentDocumentAsPDF }
+    var qaCanPrintCurrentDocument: Bool { canPrintCurrentDocument }
+
+    func qaActivatePDFExport() {
+        exportCurrentDocumentAsPDF()
+    }
+
+    func qaActivatePrint() {
+        printCurrentDocument()
+    }
+
     var qaIsReloadControlReady: Bool {
         header.qaReloadIsVisible && header.qaReloadIsEnabled
     }
@@ -3086,6 +3158,22 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         return false
     }
 
+    var canExportCurrentDocumentAsPDF: Bool {
+        presentationMode == .view
+            && session.syntaxFileType == .markdown
+            && session.isSourceTextValidated
+            && !documentPDFOutputCoordinator.isBusy
+    }
+
+    var canPrintCurrentDocument: Bool {
+        presentationMode == .view
+            && (session.syntaxFileType == .markdown || session.syntaxFileType == .plainText)
+            && session.isSourceTextValidated
+            && !documentPDFOutputCoordinator.isBusy
+    }
+
+    var isPreparingDocumentOutput: Bool { documentPDFOutputCoordinator.isBusy }
+
     var pinnedParquetSourceFileState: ExternalFileState? {
         (installedPrimaryContentView as? ParquetTableView)?.pinnedSourceFileState
     }
@@ -3150,6 +3238,77 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             table.exportCurrentView()
         } else {
             NSSound.beep()
+        }
+    }
+
+    func exportCurrentDocumentAsPDF() {
+        guard canExportCurrentDocumentAsPDF,
+              let request = currentDocumentPDFRequest() else {
+            NSSound.beep()
+            return
+        }
+#if LIGHTXT_RUNTIME_QA
+        if let runtimeQAPDFExportProbe {
+            runtimeQAPDFExportProbe()
+            return
+        }
+#endif
+        documentPDFOutputCoordinator.exportPDF(
+            snapshot: request.snapshot,
+            kind: request.kind,
+            title: request.title,
+            suggestedFileName: request.suggestedFileName,
+            window: view.window
+        )
+    }
+
+    func printCurrentDocument() {
+        guard canPrintCurrentDocument,
+              let request = currentDocumentPDFRequest() else {
+            NSSound.beep()
+            return
+        }
+#if LIGHTXT_RUNTIME_QA
+        if let runtimeQAPrintProbe {
+            runtimeQAPrintProbe()
+            return
+        }
+#endif
+        documentPDFOutputCoordinator.print(
+            snapshot: request.snapshot,
+            kind: request.kind,
+            title: request.title,
+            window: view.window
+        )
+    }
+
+    private func currentDocumentPDFRequest() -> (
+        snapshot: DocumentSnapshot,
+        kind: DocumentPDFSourceKind,
+        title: String,
+        suggestedFileName: String
+    )? {
+        let kind: DocumentPDFSourceKind
+        switch session.syntaxFileType {
+        case .markdown: kind = .markdown
+        case .plainText: kind = .plainText
+        default: return nil
+        }
+        do {
+            let snapshot = try session.editorSnapshot()
+            let title = document?.fileURL?.lastPathComponent
+                ?? session.originalSourceURL?.lastPathComponent
+                ?? "Untitled"
+            let baseName = (title as NSString).deletingPathExtension
+            return (
+                snapshot,
+                kind,
+                title,
+                (baseName.isEmpty ? "Untitled" : baseName) + ".pdf"
+            )
+        } catch {
+            statusBar.setState(error.localizedDescription, busy: false, isError: true)
+            return nil
         }
     }
 

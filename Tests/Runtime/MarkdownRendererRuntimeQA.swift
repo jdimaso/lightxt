@@ -1,6 +1,7 @@
 #if LIGHTXT_STANDALONE_MARKDOWN_QA
 import AppKit
 import Foundation
+import PDFKit
 
 // Minimal declarations used only when this file is compiled as the standalone
 // renderer QA executable. The production app receives these types from its
@@ -15,6 +16,23 @@ final class DocumentSnapshot: @unchecked Sendable {
     }
     func data(in range: Range<Int64>) throws -> Data {
         bytes.subdata(in: Int(range.lowerBound)..<Int(range.upperBound))
+    }
+    func forEachByteSlice(
+        in requestedRange: Range<Int64>? = nil,
+        _ body: (UnsafeRawBufferPointer) throws -> Void
+    ) throws {
+        let range = requestedRange ?? 0..<byteCount
+        var offset = range.lowerBound
+        while offset < range.upperBound {
+            let upper = min(range.upperBound, offset + 4_096)
+            try bytes.withUnsafeBytes { rawBytes in
+                let slice = UnsafeRawBufferPointer(
+                    rebasing: rawBytes[Int(offset)..<Int(upper)]
+                )
+                try body(slice)
+            }
+            offset = upper
+        }
     }
 }
 final class CancellationToken: @unchecked Sendable {
@@ -88,6 +106,10 @@ struct MarkdownRendererRuntimeQA {
         try assertWideTableLayout(lightResult)
         try render(lightResult, appearance: light, to: outputDirectory.appendingPathComponent("markdown-light.png"))
         try render(darkResult, appearance: dark, to: outputDirectory.appendingPathComponent("markdown-dark.png"))
+        let pdfSummary = try assertPDFExport(
+            fixtureSource: source,
+            outputDirectory: outputDirectory
+        )
         let mainApplyMilliseconds = try measureBoundedMainApply(appearance: light)
         guard mainApplyMilliseconds < 100 else {
             throw QAError.failed(
@@ -110,8 +132,219 @@ struct MarkdownRendererRuntimeQA {
                 + "bounded main apply \(String(format: "%.3f", mainApplyMilliseconds)) ms, "
                 + "production switch enqueue \(String(format: "%.3f", asyncSample.enqueue)) ms / "
                 + "apply \(String(format: "%.3f", asyncSample.apply)) ms, stale publication rejected; "
-                + "light/dark captures rendered, \(partialTableSummary)\(scrollingSummary)"
+                + "light/dark captures rendered, \(pdfSummary), \(partialTableSummary)\(scrollingSummary)"
         )
+    }
+
+    private static func assertPDFExport(
+        fixtureSource: String,
+        outputDirectory: URL
+    ) throws -> String {
+        let pageSetup = pdfPageSetup()
+
+        let semanticURL = outputDirectory.appendingPathComponent("markdown-runtime-qa.pdf")
+        let lineAndFenceEdges = "\r## Bare CR Heading\rBare CR paragraph\r\n\n"
+            + "```swift\nMIXED FENCE CONTENT\n~~~\n# STILL CODE\n```\n\n"
+            + "## AFTER FENCE\n\n"
+        let semanticSource = fixtureSource + lineAndFenceEdges + String(
+            repeating: "A printable Markdown paragraph keeps this semantic fixture on multiple pages.\n\n",
+            count: 60
+        )
+        let semanticResult = try DocumentPDFExporter.export(
+            snapshot: DocumentSnapshot(Data(semanticSource.utf8)),
+            kind: .markdown,
+            title: "RuntimeQA",
+            to: semanticURL,
+            pageSetup: pageSetup,
+            cancellation: CancellationToken(),
+            progress: nil
+        )
+        let semanticPDF = try inspectPDF(at: semanticURL)
+        guard semanticResult.pageCount == semanticPDF.pageCount,
+              semanticPDF.pageCount > 1 else {
+            throw QAError.failed(
+                "RuntimeQA Markdown PDF did not paginate: exporter \(semanticResult.pageCount), PDFKit \(semanticPDF.pageCount)"
+            )
+        }
+        let semanticText = extractedText(from: semanticPDF)
+        let required = [
+            "LighTxt Markdown Preview",
+            "clean",
+            "calm",
+            "Clickable links",
+            "inline code",
+            "let message = \"Rendered without WebKit\"",
+            "Bare CR Heading",
+            "# STILL CODE",
+            "AFTER FENCE",
+        ]
+        let forbidden = [
+            "# LighTxt Markdown Preview",
+            "**clean**",
+            "*calm*",
+            "[Clickable links](",
+            "https://example.com",
+            "`inline code`",
+            "```swift",
+            "## Bare CR Heading",
+            "## AFTER FENCE",
+        ]
+        guard required.allSatisfy(semanticText.contains) else {
+            throw QAError.failed("Markdown PDF omitted rendered fixture semantics")
+        }
+        guard forbidden.allSatisfy({ !semanticText.contains($0) }) else {
+            throw QAError.failed("Markdown PDF exposed source delimiters or link destinations")
+        }
+        try assertLinkAnnotation(in: semanticPDF, destination: "https://example.com")
+        try assertPrintablePaletteIfInspectable(in: semanticPDF, locating: "LighTxt Markdown Preview")
+
+        let markdownHead = "PDFMARKDOWNHEAD7E6A"
+        let markdownTail = "PDFMARKDOWNTAIL9C31"
+        let markdownBody = String(
+            repeating: "- A **bounded** export row with [a link](https://example.com) and `inline code`.\n",
+            count: 700
+        )
+        let oversizedMarkdown = "# \(markdownHead)\n\n" + markdownBody + "\n## \(markdownTail)\n"
+        guard oversizedMarkdown.utf8.count > MarkdownPreviewView.maximumViewportBytes else {
+            throw QAError.failed("Generated Markdown PDF fixture did not exceed the View-mode window")
+        }
+        let oversizedMarkdownURL = outputDirectory.appendingPathComponent("markdown-over-viewport.pdf")
+        let oversizedMarkdownResult = try DocumentPDFExporter.export(
+            snapshot: DocumentSnapshot(Data(oversizedMarkdown.utf8)),
+            kind: .markdown,
+            title: "Oversized Markdown",
+            to: oversizedMarkdownURL,
+            pageSetup: pageSetup,
+            cancellation: CancellationToken(),
+            progress: nil
+        )
+        let oversizedMarkdownPDF = try inspectPDF(at: oversizedMarkdownURL)
+        let oversizedMarkdownText = extractedText(from: oversizedMarkdownPDF)
+        guard oversizedMarkdownResult.pageCount == oversizedMarkdownPDF.pageCount,
+              oversizedMarkdownPDF.pageCount > 1,
+              oversizedMarkdownText.contains(markdownHead),
+              oversizedMarkdownText.contains(markdownTail) else {
+            throw QAError.failed("Markdown PDF lost content beyond its 48 KiB View-mode window")
+        }
+
+        let plainTextHead = "PDFPLAINTEXTHEAD4B20"
+        let plainTextTail = "PDFPLAINTEXTTAIL1D8F"
+        let plainTextBody = String(
+            repeating: "Plain text remains complete when printing through the shared PDF pipeline.\n",
+            count: 7_500
+        )
+        let oversizedPlainText = plainTextHead + "\n" + plainTextBody + plainTextTail + "\n"
+        guard oversizedPlainText.utf8.count > 512 * 1_024 else {
+            throw QAError.failed("Generated plain-text PDF fixture did not exceed the editor window")
+        }
+        let plainTextURL = outputDirectory.appendingPathComponent("plain-text-over-viewport.pdf")
+        let plainTextResult = try DocumentPDFExporter.export(
+            snapshot: DocumentSnapshot(Data(oversizedPlainText.utf8)),
+            kind: .plainText,
+            title: "Oversized Plain Text",
+            to: plainTextURL,
+            pageSetup: pageSetup,
+            cancellation: CancellationToken(),
+            progress: nil
+        )
+        let plainTextPDF = try inspectPDF(at: plainTextURL)
+        let plainText = extractedText(from: plainTextPDF)
+        guard plainTextResult.pageCount == plainTextPDF.pageCount,
+              plainTextPDF.pageCount > 1,
+              plainText.contains(plainTextHead),
+              plainText.contains(plainTextTail) else {
+            throw QAError.failed("Plain-text PDF lost content beyond its bounded source window")
+        }
+
+        let emptyURL = outputDirectory.appendingPathComponent("empty-document.pdf")
+        let emptyResult = try DocumentPDFExporter.export(
+            snapshot: DocumentSnapshot(Data()),
+            kind: .plainText,
+            title: "Empty Document",
+            to: emptyURL,
+            pageSetup: pageSetup,
+            cancellation: CancellationToken(),
+            progress: nil
+        )
+        let emptyPDF = try inspectPDF(at: emptyURL)
+        guard emptyResult.pageCount == 1, emptyPDF.pageCount == 1,
+              let page = emptyPDF.page(at: 0), !page.bounds(for: .mediaBox).isEmpty else {
+            throw QAError.failed("An empty document did not produce exactly one valid PDF page")
+        }
+
+        return "four complete PDF export cases rendered"
+    }
+
+    private static func pdfPageSetup() -> DocumentPDFPageSetup {
+        let info = (NSPrintInfo.shared.copy() as? NSPrintInfo) ?? NSPrintInfo.shared
+        info.orientation = .portrait
+        info.paperSize = NSSize(width: 612, height: 792)
+        info.topMargin = 54
+        info.bottomMargin = 54
+        info.leftMargin = 54
+        info.rightMargin = 54
+        return DocumentPDFPageSetup.from(info)
+    }
+
+    private static func inspectPDF(at url: URL) throws -> PDFDocument {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber,
+              size.intValue > 8,
+              let document = PDFDocument(url: url),
+              document.pageCount > 0 else {
+            throw QAError.failed("Could not open valid PDF output at \(url.lastPathComponent)")
+        }
+        return document
+    }
+
+    private static func extractedText(from document: PDFDocument) -> String {
+        (0..<document.pageCount).compactMap { document.page(at: $0)?.string }
+            .joined(separator: "\n")
+    }
+
+    private static func assertLinkAnnotation(
+        in document: PDFDocument,
+        destination: String
+    ) throws {
+        guard let expected = URL(string: destination) else {
+            throw QAError.failed("Invalid expected PDF link URL: \(destination)")
+        }
+        let links = (0..<document.pageCount).flatMap { pageIndex in
+            document.page(at: pageIndex)?.annotations.compactMap(\.url) ?? []
+        }
+        guard links.contains(expected) else {
+            throw QAError.failed("Markdown PDF lost the clickable \(destination) link annotation")
+        }
+    }
+
+    /// PDFKit preserves text color on some OS releases but omits it from the
+    /// extracted selection on others. When exposed, verify the print renderer
+    /// did not inherit light-on-dark screen colors for white paper.
+    private static func assertPrintablePaletteIfInspectable(
+        in document: PDFDocument,
+        locating marker: String
+    ) throws {
+        for pageIndex in 0..<document.pageCount {
+            guard let page = document.page(at: pageIndex),
+                  let pageText = page.string else { continue }
+            let range = (pageText as NSString).range(of: marker)
+            guard range.location != NSNotFound,
+                  let attributed = page.selection(for: range)?.attributedString,
+                  attributed.length > 0,
+                  let color = attributed.attribute(
+                    .foregroundColor,
+                    at: 0,
+                    effectiveRange: nil
+                  ) as? NSColor,
+                  let rgb = color.usingColorSpace(.deviceRGB) else { continue }
+            let luminance = 0.2126 * rgb.redComponent
+                + 0.7152 * rgb.greenComponent
+                + 0.0722 * rgb.blueComponent
+            guard luminance < 0.55 else {
+                throw QAError.failed("PDF text did not use a printable dark-on-light palette")
+            }
+            return
+        }
     }
 
     private static func assertSemanticRendering(_ rendered: NSAttributedString) throws {

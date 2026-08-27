@@ -557,8 +557,10 @@ qa_markdown_renderer() {
     /bin/mkdir -p "$output"
     swift_qa "$executable" \
         -DLIGHTXT_STANDALONE_MARKDOWN_QA \
+        -framework PDFKit \
         LighTxt/UI/LighTxtTheme.swift \
         LighTxt/UI/MarkdownPreviewView.swift \
+        LighTxt/UI/DocumentPDFExporter.swift \
         Tests/Runtime/MarkdownRendererRuntimeQA.swift
     "$executable" Tests/Fixtures/RuntimeQA.md "$output"
 }
