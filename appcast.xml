@@ -9,6 +9,20 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Secure LighTxt application updates</description>
         <language>en</language>
         <item>
+            <title>1.7.1</title>
+            <pubDate>Thu, 27 Aug 2026 12:30:08 -0400</pubDate>
+            <link>https://github.com/jdimaso/lightxt</link>
+            <sparkle:version>14</sparkle:version>
+            <sparkle:shortVersionString>1.7.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[# LighTxt 1.7.1
+
+- Fixed printing Markdown and plain-text documents in View mode. macOS now opens the native print panel instead of incorrectly reporting that LighTxt does not support printing.
+- Added release checks for the sandbox printing permission so signed builds cannot ship without it again.
+]]></description>
+            <enclosure url="https://github.com/jdimaso/lightxt/releases/download/v1.7.1/LighTxt-1.7.1-macOS-universal.zip" length="39866099" type="application/octet-stream" sparkle:edSignature="OxVIe1NlvMxM3gwo1uxP5fy2EduKH30Z/to0EjxGplADM1ifU2YvwWYwTUNyIt6Swi9vIUuom2zh2HC2cmq6CQ=="/>
+        </item>
+        <item>
             <title>1.7</title>
             <pubDate>Thu, 27 Aug 2026 11:01:51 -0400</pubDate>
             <link>https://github.com/jdimaso/lightxt</link>
@@ -171,6 +185,6 @@ This release also includes the large-file JSON, CSV, Markdown, navigation, and p
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: UyjkS7yzsJ9TZ3TwYatE5Ng4r8Ssb7UrmCuja2MKkqWl7DP2q/DyAh12jb64gcHY15A9UXRQsb7Us6hUUOLGCw==
-length: 13302
+edSignature: MtEMpUQqldIYAFcM6xwBf6mZNh/ZJjz/vrXAwpBxr1AbHpIfwcK3w6+w5h7h5+i5wfP1jnnnFmMOlkGvo0biBA==
+length: 14356
 -->
