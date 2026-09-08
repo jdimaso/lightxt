@@ -180,6 +180,25 @@ struct DocumentChromeRuntimeQA {
         expect(!header.qaReloadIsVisible, "Reload hides when leaving Parquet View mode")
         expect(!header.qaReloadIsEnabled, "Hidden Reload is disabled")
 
+        let statusBar = DocumentStatusBar()
+        let multilineDiagnostic = "The Parquet query failed.\nOut of Memory Error:\nfailed to allocate a data chunk"
+        statusBar.setState(multilineDiagnostic, busy: false, isError: true)
+        expect(
+            statusBar.qaStateText == "The Parquet query failed. Out of Memory Error: failed to allocate a data chunk",
+            "Status diagnostics are flattened onto one line"
+        )
+        expect(
+            statusBar.qaStateToolTip == multilineDiagnostic,
+            "The full status diagnostic remains available in a tooltip"
+        )
+        expect(statusBar.qaStateIsError, "Status diagnostics retain their error state")
+        expect(
+            statusBar.qaStateIsStrictlySingleLine,
+            "The status label enforces one-line middle truncation"
+        )
+        statusBar.setState("Ready")
+        expect(!statusBar.qaStateIsError, "Ordinary status clears the prior error state")
+
         let diskState = ExternalFileState(
             identity: .init(device: 1, inode: 2),
             byteCount: 128,
@@ -213,7 +232,7 @@ struct DocumentChromeRuntimeQA {
         expect(keepActivations == 1, "Don’t Reload invokes its callback exactly once")
 
         if failures.isEmpty {
-            print("Document chrome QA passed: 38 assertions")
+            print("Document chrome QA passed: 43 assertions")
             Darwin.exit(EXIT_SUCCESS)
         }
         failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }

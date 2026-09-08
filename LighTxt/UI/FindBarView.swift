@@ -7,6 +7,9 @@ enum FindBarPresentation {
 
 @MainActor
 protocol FindBarViewDelegate: AnyObject {
+    /// Sent immediately for each user edit so an older long-running search can
+    /// be cancelled while publication of the replacement query stays debounced.
+    func findBarSearchWillChange(_ findBar: FindBarView)
     func findBar(
         _ findBar: FindBarView,
         queryDidChange query: String,
@@ -21,8 +24,14 @@ protocol FindBarViewDelegate: AnyObject {
     func findBarDidRequestClose(_ findBar: FindBarView)
 }
 
+extension FindBarViewDelegate {
+    func findBarSearchWillChange(_ findBar: FindBarView) {}
+}
+
 @MainActor
 final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldDelegate {
+    private static let queryDebounceDelay: TimeInterval = 0.30
+
     weak var findDelegate: FindBarViewDelegate?
 
     var presentation: FindBarPresentation = .findAndReplace {
@@ -127,6 +136,7 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
 
     func controlTextDidChange(_ notification: Notification) {
         guard notification.object as AnyObject? === searchField else { return }
+        findDelegate?.findBarSearchWillChange(self)
         notifyQueryChanged(immediately: false)
     }
 
@@ -136,6 +146,8 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
         doCommandBy commandSelector: Selector
     ) -> Bool {
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            pendingChange?.cancel()
+            pendingChange = nil
             findDelegate?.findBarDidRequestClose(self)
             return true
         }
@@ -143,6 +155,7 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
               commandSelector == #selector(NSResponder.insertNewline(_:)) else {
             return false
         }
+        flushPendingQueryChange()
         let backwards = NSApp.currentEvent?.modifierFlags.contains(.shift) == true
         findDelegate?.findBarFindNext(self, backwards: backwards)
         return true
@@ -159,6 +172,11 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
         searchField.font = NSFont.systemFont(ofSize: 13)
         searchField.toolTip = "Find text in the current document. Return finds next; Shift-Return finds previous."
 
+        replaceField.cell = VerticallyCenteredTextFieldCell(textCell: "")
+        replaceField.isBezeled = true
+        replaceField.isBordered = true
+        replaceField.isEditable = true
+        replaceField.drawsBackground = true
         replaceField.placeholderString = "Replacement text"
         replaceField.delegate = self
         replaceField.focusRingType = .exterior
@@ -394,22 +412,42 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
 
     private func notifyQueryChanged(immediately: Bool) {
         pendingChange?.cancel()
+        pendingChange = nil
+        if immediately {
+            sendQueryChanged()
+            return
+        }
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.findDelegate?.findBar(
-                self,
-                queryDidChange: self.query,
-                regularExpression: self.usesRegularExpression,
-                caseSensitive: self.isCaseSensitive,
-                wholeWords: self.matchesWholeWords
-            )
+            self.pendingChange = nil
+            self.sendQueryChanged()
         }
         pendingChange = work
-        if immediately {
-            work.perform()
-        } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
-        }
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.queryDebounceDelay,
+            execute: work
+        )
+    }
+
+    private func sendQueryChanged() {
+        findDelegate?.findBar(
+            self,
+            queryDidChange: query,
+            regularExpression: usesRegularExpression,
+            caseSensitive: isCaseSensitive,
+            wholeWords: matchesWholeWords
+        )
+    }
+
+    /// Return and action buttons should never operate on the previous query
+    /// merely because the user acted before the typing debounce elapsed.
+    @discardableResult
+    func flushPendingQueryChange() -> Bool {
+        guard pendingChange != nil else { return false }
+        pendingChange?.cancel()
+        pendingChange = nil
+        sendQueryChanged()
+        return true
     }
 
     @objc private func searchOptionChanged(_ sender: Any?) {
@@ -424,35 +462,47 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
     }
 
     @objc private func previousMatch(_ sender: Any?) {
+        flushPendingQueryChange()
         findDelegate?.findBarFindNext(self, backwards: true)
     }
 
     @objc private func nextMatch(_ sender: Any?) {
+        flushPendingQueryChange()
         findDelegate?.findBarFindNext(self, backwards: false)
     }
 
     @objc private func findAll(_ sender: Any?) {
+        flushPendingQueryChange()
         findDelegate?.findBarFindAll(self)
     }
 
     @objc private func replaceCurrent(_ sender: Any?) {
+        flushPendingQueryChange()
         findDelegate?.findBarReplaceCurrent(self, replacement: replacement)
     }
 
     @objc private func replaceAll(_ sender: Any?) {
+        flushPendingQueryChange()
         findDelegate?.findBarReplaceAll(self, replacement: replacement)
     }
 
     @objc private func close(_ sender: Any?) {
+        pendingChange?.cancel()
+        pendingChange = nil
         findDelegate?.findBarDidRequestClose(self)
     }
 
-#if LIGHTXT_STANDALONE_STRUCTURE_QA
+#if LIGHTXT_STANDALONE_STRUCTURE_QA || LIGHTXT_RUNTIME_QA
     var qaSecondRowIsHidden: Bool { secondRow.isHidden }
+    var qaStatusText: String { statusLabel.stringValue }
     var qaReplaceControlsAreEnabled: Bool {
         replaceField.isEnabled && replaceButton.isEnabled && replaceAllButton.isEnabled
     }
     var qaSearchFieldFrame: NSRect { searchField.convert(searchField.bounds, to: self) }
+    var qaReplacementFieldBounds: NSRect { replaceField.bounds }
+    var qaReplacementTextDrawingRect: NSRect {
+        replaceField.cell?.drawingRect(forBounds: replaceField.bounds) ?? .zero
+    }
     var qaFirstRowControlFrames: [NSRect] {
         firstRow.arrangedSubviews
             .filter { !$0.isHidden }
@@ -463,10 +513,62 @@ final class FindBarView: NSVisualEffectView, NSSearchFieldDelegate, NSTextFieldD
             .filter { !$0.isHidden && !$0.ancestors.contains(where: \.isHidden) }
             .compactMap { $0.accessibilityLabel() }
     }
+    func qaTypeQuery(_ value: String) {
+        searchField.stringValue = value
+        controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: searchField))
+    }
+    func qaActivateNext() { nextMatch(nil) }
+    func qaActivateClose() { close(nil) }
 #endif
 }
 
-#if LIGHTXT_STANDALONE_STRUCTURE_QA
+private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        var drawing = super.drawingRect(forBounds: rect)
+        let resolvedFont = font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let lineHeight = ceil(resolvedFont.ascender - resolvedFont.descender + resolvedFont.leading)
+        guard drawing.height > lineHeight else { return drawing }
+        drawing.origin.y += floor((drawing.height - lineHeight) / 2)
+        drawing.size.height = lineHeight
+        return drawing
+    }
+
+    override func edit(
+        withFrame rect: NSRect,
+        in controlView: NSView,
+        editor textObject: NSText,
+        delegate: Any?,
+        event: NSEvent?
+    ) {
+        super.edit(
+            withFrame: drawingRect(forBounds: rect),
+            in: controlView,
+            editor: textObject,
+            delegate: delegate,
+            event: event
+        )
+    }
+
+    override func select(
+        withFrame rect: NSRect,
+        in controlView: NSView,
+        editor textObject: NSText,
+        delegate: Any?,
+        start selStart: Int,
+        length selLength: Int
+    ) {
+        super.select(
+            withFrame: drawingRect(forBounds: rect),
+            in: controlView,
+            editor: textObject,
+            delegate: delegate,
+            start: selStart,
+            length: selLength
+        )
+    }
+}
+
+#if LIGHTXT_STANDALONE_STRUCTURE_QA || LIGHTXT_RUNTIME_QA
 private extension NSView {
     var ancestors: [NSView] {
         var result: [NSView] = []

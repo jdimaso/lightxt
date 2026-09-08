@@ -772,8 +772,80 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
         editorViewController.qaIsParquetTableReady
     }
 
+    var qaIsCSVMemoryControlReady: Bool {
+        editorViewController.qaIsCSVMemoryControlReady
+    }
+
+    func qaActivateCSVMemoryControl() {
+        editorViewController.qaActivateCSVMemoryControl()
+    }
+
+    var qaIsCSVInMemoryTableReady: Bool {
+        editorViewController.qaIsCSVInMemoryTableReady
+    }
+
+    func qaReturnToFileBackedCSV() {
+        editorViewController.qaReturnToFileBackedCSV()
+    }
+
     func qaActivateReloadControl() {
         editorViewController.qaActivateReloadControl()
+    }
+
+    func qaBeginCSVFind(query: String) {
+        editorViewController.qaBeginCSVFind(query: query)
+    }
+
+    var qaCSVFindResultCount: Int? {
+        editorViewController.qaCSVFindResultCount
+    }
+
+    var qaCSVFindSupportsReplace: Bool {
+        editorViewController.qaCSVFindSupportsReplace
+    }
+
+    var qaCSVFocusedMatchRange: Range<Int64>? {
+        editorViewController.qaCSVFocusedMatchRange
+    }
+
+    var qaCSVSelectedDisplayedRow: Int {
+        editorViewController.qaCSVSelectedDisplayedRow
+    }
+
+    var qaCSVFindResultSubtitles: [String] {
+        editorViewController.qaCSVFindResultSubtitles
+    }
+
+    var qaCSVCollapseAllIsHidden: Bool {
+        editorViewController.qaCSVCollapseAllIsHidden
+    }
+
+    var qaCSVFindStatus: String {
+        editorViewController.qaCSVFindStatus
+    }
+
+    var qaCSVFindIsClosed: Bool {
+        editorViewController.qaCSVFindIsClosed
+    }
+
+    func qaCSVFindNext() {
+        editorViewController.qaCSVFindNext()
+    }
+
+    func qaActivateCSVFindResult(at index: Int) {
+        editorViewController.qaActivateCSVFindResult(at: index)
+    }
+
+    func qaCSVReplaceCurrent(with replacement: String) {
+        editorViewController.qaCSVReplaceCurrent(with: replacement)
+    }
+
+    func qaCSVReplaceAll(with replacement: String) {
+        editorViewController.qaCSVReplaceAll(with: replacement)
+    }
+
+    func qaCloseCSVFind() {
+        editorViewController.qaCloseCSVFind()
     }
 
     var qaExternalChangeBannerIsVisible: Bool {
@@ -804,6 +876,9 @@ final class LighTxtWindowController: NSWindowController, NSWindowDelegate {
 
 @MainActor
 final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, StructureSidebarDelegate, NSSplitViewDelegate, NSMenuItemValidation {
+    private static let largeCSVSearchThreshold: Int64 = 250 * 1_024 * 1_024
+    private static let largeCSVInteractiveMatchLimit = 100
+
     let editorView = VirtualTextEditorView()
 
     private weak var document: LighTxtDocument?
@@ -846,21 +921,36 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             }
             self.refreshChrome()
         }
+        table.onLoadInMemoryRequest = { [weak self] delimiter, firstRowIsHeader, columnNames in
+            self?.requestLoadCSVInMemory(
+                delimiter: delimiter,
+                firstRowIsHeader: firstRowIsHeader,
+                columnNames: columnNames
+            )
+        }
         return table
     }()
     private lazy var parquetTableView: ParquetTableView = {
         let table = ParquetTableView()
-        table.onStatusChange = { [weak self] text, busy in
+        table.onStatusChange = { [weak self] text, busy, isError in
             guard let self else { return }
-            self.statusBar.setState(text, busy: busy)
+            self.statusBar.setState(text, busy: busy, isError: isError)
             self.refreshExportAvailability()
         }
         table.onSourceChanged = { [weak self] in
-            guard let self, let url = self.document?.fileURL else { return }
+            guard let self,
+                  self.session.syntaxFileType == .parquet,
+                  let url = self.document?.fileURL else { return }
             _ = self.documentErrorHandler?(
                 LighTxtCoreError.fileChangedExternally(path: url.path)
             )
             self.refreshExportAvailability()
+        }
+        table.onReturnToFileBackedCSV = { [weak self] in
+            self?.returnToFileBackedCSV()
+        }
+        table.onCSVInMemoryLoadFailure = { [weak self] error in
+            self?.handleCSVInMemoryLoadFailure(error)
         }
         return table
     }()
@@ -881,6 +971,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private var structureIsVisible = false
     private var editModeStructureWasVisible = false
     private var presentationMode: DocumentPresentationMode = .edit
+    private var isCSVInMemoryMode = false
 #if LIGHTXT_RUNTIME_QA
     private var runtimeQAExportProbe: (() -> Void)?
     private var runtimeQAPDFExportProbe: (() -> Void)?
@@ -893,6 +984,13 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     private var viewSearchOriginRange: Range<Int64>?
     private var structureSearchResultsByRange: [Range<Int64>: StructureSearchResult] = [:]
     private var focusedStructureSearchRange: Range<Int64>?
+    private var hasPublishedCSVFindAll = false
+    private var isPublishingCSVFindAll = false
+    private var pendingCSVReplaceCurrent: String?
+    private var isReplacingCSVSearchMatch = false
+    private var isAdvancingAfterCSVReplace = false
+    private var preferredCSVSearchFocusRange: Range<Int64>?
+    private var skipNextCSVSidebarRevealRange: Range<Int64>?
     private var lastStructurePayload: (folds: [SyntaxFoldRange], data: Data, base: Int64, type: SyntaxFileType)?
     private var saveObserver: NSObjectProtocol?
     private let jsonStructureController = JSONStructureController()
@@ -1080,13 +1178,16 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             textDocument,
             unavailableReason: session.readOnlyNotice
         )
-        header.setFindAvailable(
-            textDocument,
-            unavailableReason: session.hasUnresolvedSourceEncoding
+        let findUnavailableReason: String? = isCSVInMemoryPresentation
+            ? "Unload the in-memory CSV copy to use Find and Replace. Column filters remain available here."
+            : session.hasUnresolvedSourceEncoding
                 ? session.readOnlyNotice.map {
                     "\($0) Find remains available after reopening with an explicit encoding."
                 }
                 : session.readOnlyNotice
+        header.setFindAvailable(
+            textDocument && !isCSVInMemoryPresentation,
+            unavailableReason: findUnavailableReason
         )
         header.setPrettifyAvailable(
             textDocument
@@ -1275,7 +1376,49 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             (self.installedPrimaryContentView as? CSVTableView)?.refreshDocumentAccessState()
         }
         session.callbacks.matchChanged = { [weak self] match in
-            guard let self, let match else { return }
+            guard let self else { return }
+            if self.isCSVViewPresentation {
+                if self.isReplacingCSVSearchMatch { return }
+                self.isAdvancingAfterCSVReplace = false
+                guard let match else {
+                    self.csvTableView.focusSearchMatch(nil)
+                    return
+                }
+                self.viewSearchOriginRange = match.byteRange
+                self.csvTableView.focusSearchMatch(match.byteRange)
+                if self.hasPublishedCSVFindAll {
+                    if self.structureSearchResultsByRange[match.byteRange] != nil {
+                        self.structureSidebar.selectSearchResult(matching: match.byteRange)
+                    } else {
+                        self.revealCSVSearchMatch(match.byteRange)
+                    }
+                    return
+                }
+                self.revealCSVSearchMatch(match.byteRange)
+                if self.isPublishingCSVFindAll {
+                    self.preferredCSVSearchFocusRange = match.byteRange
+                    self.skipNextCSVSidebarRevealRange = match.byteRange
+                    return
+                }
+                self.csvTableView.updateSearchMatches(
+                    [match.byteRange],
+                    focusedRange: match.byteRange
+                )
+                self.preferredCSVSearchFocusRange = match.byteRange
+                self.presentSearchResults(
+                    [match],
+                    total: 1,
+                    truncated: false,
+                    title: self.searchResultTitle(forFindAll: false),
+                    selecting: nil
+                )
+                // This one-match state can occur when Return/Next flushes a
+                // just-typed query. Follow it with the same automatic CSV
+                // Find All used by the settled typing path.
+                self.performAutomaticCSVSearch()
+                return
+            }
+            guard let match else { return }
             guard self.presentationMode == .edit else {
                 self.viewSearchOriginRange = match.byteRange
                 self.presentSearchResults(
@@ -1291,15 +1434,75 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         }
         session.callbacks.findAllCompleted = { [weak self] summary in
             guard let self else { return }
+            let selectedRange: Range<Int64>?
+            if self.isCSVViewPresentation {
+                let preferredRange = self.preferredCSVSearchFocusRange
+                    ?? self.session.currentMatch?.byteRange
+                let focusedMatch = preferredRange.flatMap { preferred in
+                    summary.retainedMatches.first { $0.byteRange == preferred }
+                }
+                selectedRange = focusedMatch?.byteRange
+                self.isAdvancingAfterCSVReplace = false
+                self.hasPublishedCSVFindAll = false
+                self.isPublishingCSVFindAll = true
+                self.preferredCSVSearchFocusRange = selectedRange
+                // The active row is projection-aware and therefore cannot be
+                // chosen until byte offsets have been mapped off-main. Never
+                // expose a provisional raw-first match to Replace Current.
+                self.session.focusSearchMatch(nil)
+                self.viewSearchOriginRange = selectedRange
+                self.csvTableView.updateSearchMatches(
+                    summary.retainedMatches.map(\.byteRange),
+                    focusedRange: selectedRange
+                )
+            } else {
+                selectedRange = nil
+            }
             self.presentSearchResults(
                 summary.retainedMatches,
                 total: summary.totalMatches,
                 truncated: summary.retainedLimitReached,
+                totalIsExact: summary.isComplete,
                 title: self.searchResultTitle(forFindAll: true),
-                selecting: nil
+                selecting: selectedRange,
+                selectFirstVisibleCSVMatch: self.isCSVViewPresentation,
+                onPresented: self.isCSVViewPresentation ? { [weak self] resolvedRange in
+                    guard let self, self.isCSVViewPresentation else { return }
+                    self.isPublishingCSVFindAll = false
+                    self.hasPublishedCSVFindAll = true
+                    let range = resolvedRange
+                    self.preferredCSVSearchFocusRange = nil
+                    self.viewSearchOriginRange = range
+                    self.csvTableView.focusSearchMatch(range)
+                    if let range,
+                       let result = self.structureSearchResultsByRange[range] {
+                        self.session.focusSearchMatch(result.match)
+                    } else {
+                        self.session.focusSearchMatch(nil)
+                    }
+                    if let replacement = self.pendingCSVReplaceCurrent {
+                        self.pendingCSVReplaceCurrent = nil
+                        if range != nil {
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self, self.isCSVViewPresentation else { return }
+                                self.findBarReplaceCurrent(self.findBar, replacement: replacement)
+                            }
+                        } else if summary.retainedMatches.isEmpty {
+                            self.findBar.setStatus("No matches")
+                        } else {
+                            self.findBar.setStatus("No matching data row is visible")
+                        }
+                    }
+                } : nil
             )
-            let noun = summary.totalMatches == 1 ? "match" : "matches"
-            self.findBar.setStatus("\(summary.totalMatches.formatted()) \(noun)")
+            if summary.isComplete {
+                let noun = summary.totalMatches == 1 ? "match" : "matches"
+                self.findBar.setStatus("\(summary.totalMatches.formatted()) \(noun)")
+            } else {
+                self.findBar.setStatus(
+                    "Showing first \(summary.totalMatches.formatted()) matches  ·  Find All to count"
+                )
+            }
         }
         session.callbacks.searchResultsInvalidated = { [weak self] in
             guard let self else { return }
@@ -1307,10 +1510,21 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             self.searchPreviewCancellation?.cancel()
             self.searchPreviewCancellation = nil
             self.viewSearchOriginRange = nil
+            self.hasPublishedCSVFindAll = false
+            self.isPublishingCSVFindAll = false
+            self.pendingCSVReplaceCurrent = nil
+            self.isAdvancingAfterCSVReplace = false
+            self.preferredCSVSearchFocusRange = nil
+            self.skipNextCSVSidebarRevealRange = nil
+            (self.installedPrimaryContentView as? CSVTableView)?.clearSearchMatches()
             self.structureSearchResultsByRange.removeAll(keepingCapacity: true)
             self.focusedStructureSearchRange = nil
             guard self.sidebarShowsSearchResults else { return }
             self.sidebarShowsSearchResults = false
+            if self.isCSVViewPresentation {
+                self.setStructureVisible(false)
+                return
+            }
             if self.presentationMode == .view, self.session.syntaxFileType == .json {
                 self.restoreJSONStructureAfterSearch()
                 return
@@ -1361,13 +1575,55 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         }
     }
 
+    private func performAutomaticCSVSearch() {
+        if session.byteCount > Self.largeCSVSearchThreshold {
+            session.findAll(
+                retainedLimit: Self.largeCSVInteractiveMatchLimit,
+                scanMatchLimit: Self.largeCSVInteractiveMatchLimit
+            )
+        } else {
+            session.findAll()
+        }
+    }
+
     private func presentSearchResults(
         _ matches: [SearchMatch],
         total: Int,
         truncated: Bool,
+        totalIsExact: Bool = true,
         title: String,
-        selecting selectedRange: Range<Int64>?
+        selecting selectedRange: Range<Int64>?,
+        selectFirstVisibleCSVMatch: Bool = false,
+        onPresented: ((Range<Int64>?) -> Void)? = nil
     ) {
+        if isCSVViewPresentation,
+           !csvTableView.isSearchNavigationProjectionSettled {
+            // A sort/filter transition still owns the row projection. Wait
+            // without scanning the old map repeatedly, then resolve against
+            // the projection that actually reaches the table.
+            searchPreviewGeneration &+= 1
+            searchPreviewCancellation?.cancel()
+            searchPreviewCancellation = nil
+            let retryGeneration = searchPreviewGeneration
+            let retryQuery = session.searchQuery
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80)) { [weak self] in
+                guard let self,
+                      self.searchPreviewGeneration == retryGeneration,
+                      self.session.searchQuery == retryQuery,
+                      self.isCSVViewPresentation else { return }
+                self.presentSearchResults(
+                    matches,
+                    total: total,
+                    truncated: truncated,
+                    totalIsExact: totalIsExact,
+                    title: title,
+                    selecting: self.preferredCSVSearchFocusRange ?? selectedRange,
+                    selectFirstVisibleCSVMatch: selectFirstVisibleCSVMatch,
+                    onPresented: onPresented
+                )
+            }
+            return
+        }
         searchPreviewGeneration &+= 1
         searchPreviewCancellation?.cancel()
         let cancellation = CancellationToken()
@@ -1375,6 +1631,9 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         let generation = searchPreviewGeneration
         let query = session.searchQuery
         let wasViewing = presentationMode == .view
+        let csvNavigationContext = isCSVViewPresentation
+            ? csvTableView.makeSearchNavigationContext()
+            : nil
         let snapshot: DocumentSnapshot
         do {
             snapshot = try session.engine.snapshot()
@@ -1383,9 +1642,43 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             return
         }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let navigationResolution = try? csvNavigationContext?.resolve(
+                ranges: matches.map(\.byteRange),
+                cancellation: cancellation
+            )
+            let csvRecords = navigationResolution.map { resolution in
+                matches.map { resolution.sourceRecordsByRange[$0.byteRange] }
+            }
+            let resolvedSelectedRange: Range<Int64>?
+            if selectFirstVisibleCSVMatch, let navigationResolution {
+                func displayedRow(for range: Range<Int64>) -> Int64? {
+                    guard let record = navigationResolution.sourceRecordsByRange[range] else {
+                        return nil
+                    }
+                    return navigationResolution.displayedRowsByRecord[record]
+                }
+                if let selectedRange, displayedRow(for: selectedRange) != nil {
+                    resolvedSelectedRange = selectedRange
+                } else {
+                    resolvedSelectedRange = matches.enumerated().compactMap { index, match in
+                        displayedRow(for: match.byteRange).map {
+                            (range: match.byteRange, displayedRow: $0, index: index)
+                        }
+                    }.min { lhs, rhs in
+                        if lhs.displayedRow != rhs.displayedRow {
+                            return lhs.displayedRow < rhs.displayedRow
+                        }
+                        return lhs.index < rhs.index
+                    }?.range
+                }
+            } else {
+                resolvedSelectedRange = selectedRange
+            }
             let results = StructureSearchResultBuilder.build(
                 snapshot: snapshot,
                 matches: matches,
+                csvRecords: csvRecords,
+                csvFirstRowIsHeader: csvNavigationContext?.firstRowIsHeader == true,
                 cancellation: cancellation
             )
             DispatchQueue.main.async {
@@ -1395,6 +1688,46 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
                       self.session.searchQuery == query,
                       self.presentationMode == (wasViewing ? .view : .edit) else { return }
                 self.searchPreviewCancellation = nil
+                let csvProjectionChanged: Bool
+                if let csvNavigationContext, let navigationResolution {
+                    csvProjectionChanged = !self.csvTableView.installSearchNavigation(
+                        navigationResolution,
+                        from: csvNavigationContext
+                    )
+                } else if let csvNavigationContext {
+                    csvProjectionChanged = !self.csvTableView.isSearchNavigationContextCurrent(
+                        csvNavigationContext
+                    )
+                } else {
+                    csvProjectionChanged = false
+                }
+                if csvProjectionChanged {
+                    // A filter, sort, reload, or edit changed the projection
+                    // while row mapping ran. Resolve again against the current
+                    // table instead of selecting from the stale projection.
+                    self.presentSearchResults(
+                        matches,
+                        total: total,
+                        truncated: truncated,
+                        totalIsExact: totalIsExact,
+                        title: title,
+                        selecting: self.preferredCSVSearchFocusRange ?? selectedRange,
+                        selectFirstVisibleCSVMatch: selectFirstVisibleCSVMatch,
+                        onPresented: onPresented
+                    )
+                    return
+                }
+                var presentedSelectedRange = resolvedSelectedRange
+                if selectFirstVisibleCSVMatch,
+                   let navigationResolution,
+                   let latestPreferred = self.preferredCSVSearchFocusRange,
+                   let preferredRecord = navigationResolution.sourceRecordsByRange[latestPreferred],
+                   navigationResolution.displayedRowsByRecord[preferredRecord] != nil {
+                    // Find Next may complete while the result previews are
+                    // still being built. Preserve that newer user intent
+                    // instead of snapping back to the earlier initial row.
+                    presentedSelectedRange = latestPreferred
+                }
                 self.sidebarShowsSearchResults = true
                 self.structureSearchResultsByRange = Dictionary(
                     uniqueKeysWithValues: results.map { ($0.match.byteRange, $0) }
@@ -1405,12 +1738,17 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
                     results,
                     total: total,
                     truncated: truncated,
+                    totalIsExact: totalIsExact,
                     title: title
                 )
                 self.setStructureVisible(true)
-                if let selectedRange {
-                    self.structureSidebar.selectSearchResult(matching: selectedRange)
+                if let presentedSelectedRange {
+                    self.structureSidebar.selectSearchResult(matching: presentedSelectedRange)
                 }
+                // A direct reveal used while this preview was being built is
+                // now represented by the sidebar selection (or proved hidden).
+                self.skipNextCSVSidebarRevealRange = nil
+                onPresented?(presentedSelectedRange)
             }
         }
     }
@@ -1471,6 +1809,25 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
                         index: index
                     )
                 }
+            }
+        }
+    }
+
+    private func revealCSVSearchMatch(_ range: Range<Int64>) {
+        csvTableView.revealSearchMatch(range) { [weak self] location in
+            guard let self, self.isCSVViewPresentation, let location else { return }
+            if location.isHeader {
+                self.statusBar.setState("Match is in the CSV header", busy: false)
+            } else if location.displayedRow == nil {
+                self.statusBar.setState(
+                    "CSV row \(location.sourceRowNumber.formatted()) is hidden by the current filters",
+                    busy: false
+                )
+            } else {
+                self.statusBar.setState(
+                    "Viewing CSV row \(location.sourceRowNumber.formatted())",
+                    busy: false
+                )
             }
         }
     }
@@ -1634,6 +1991,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     /// reinstall the presentation for the new format immediately.
     private func handleSyntaxFileTypeChange(to newType: SyntaxFileType) {
         endPrettifyPreview(focusEditor: false)
+        isCSVInMemoryMode = false
         observedSyntaxFileType = newType
         syntaxChangedDuringSave = true
         jsonRebuildWork?.cancel()
@@ -1688,7 +2046,11 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             if session.syntaxFileType == .markdown {
                 window.makeFirstResponder(markdownPreviewView)
             } else if session.syntaxFileType == .csv {
-                window.makeFirstResponder(csvTableView)
+                if isCSVInMemoryMode {
+                    parquetTableView.focusTable()
+                } else {
+                    window.makeFirstResponder(csvTableView)
+                }
             } else if session.syntaxFileType == .parquet {
                 parquetTableView.focusTable()
             } else {
@@ -1918,12 +2280,20 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
 
     @objc func showFindPanel(_ sender: Any?) {
         if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
+        guard !isCSVInMemoryPresentation else {
+            NSSound.beep()
+            statusBar.setState(
+                "Use File-Backed View to Find or Replace CSV text.",
+                busy: false
+            )
+            return
+        }
         guard !session.isReadOnly else {
             NSSound.beep()
             parquetTableView.focusTable()
             return
         }
-        findBar.presentation = presentationMode == .view ? .findOnly : .findAndReplace
+        findBar.presentation = findBarPresentation
         findBar.isHidden = false
         findHeightConstraint.constant = findBar.preferredHeight
         NSAnimationContext.runAnimationGroup { context in
@@ -1932,23 +2302,28 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             view.layoutSubtreeIfNeeded()
         }
         findBar.focus(selectAll: false)
+        if isCSVViewPresentation, !findBar.query.isEmpty {
+            performAutomaticCSVSearch()
+        }
     }
 
     @objc func findNext(_ sender: Any?) {
         if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
-        guard !session.isReadOnly else { return }
+        guard !session.isReadOnly, !isCSVInMemoryPresentation else { return }
+        if !findBar.isHidden { findBar.flushPendingQueryChange() }
         session.findNext(backwards: false, from: searchOriginRange)
     }
 
     @objc func findPrevious(_ sender: Any?) {
         if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
-        guard !session.isReadOnly else { return }
+        guard !session.isReadOnly, !isCSVInMemoryPresentation else { return }
+        if !findBar.isHidden { findBar.flushPendingQueryChange() }
         session.findNext(backwards: true, from: searchOriginRange)
     }
 
     @objc func useSelectionForFind(_ sender: Any?) {
         if isPrettifyPreviewActive { endPrettifyPreview(focusEditor: false) }
-        guard !session.isReadOnly else { return }
+        guard !session.isReadOnly, !isCSVInMemoryPresentation else { return }
         guard let selected = editorView.useSelectionForFind(), !selected.isEmpty else { return }
         showFindPanel(sender)
         findBar.query = selected
@@ -2042,6 +2417,24 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         presentationMode == .view && Self.supportsStructure(for: session.syntaxFileType)
     }
 
+    private var isCSVViewPresentation: Bool {
+        presentationMode == .view
+            && session.syntaxFileType == .csv
+            && !isCSVInMemoryMode
+    }
+
+    private var isCSVInMemoryPresentation: Bool {
+        presentationMode == .view
+            && session.syntaxFileType == .csv
+            && isCSVInMemoryMode
+    }
+
+    private var findBarPresentation: FindBarPresentation {
+        presentationMode == .edit || isCSVViewPresentation
+            ? .findAndReplace
+            : .findOnly
+    }
+
     private var searchOriginRange: Range<Int64> {
         if presentationMode == .view {
             return viewSearchOriginRange ?? session.currentMatch?.byteRange ?? 0..<0
@@ -2099,7 +2492,53 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
             findBar.setStatus("Search this document")
             return
         }
-        session.findNext(backwards: false, from: searchOriginRange)
+        if isCSVViewPresentation {
+            performAutomaticCSVSearch()
+        } else {
+            session.findNext(backwards: false, from: searchOriginRange)
+        }
+    }
+
+    func findBarSearchWillChange(_ findBar: FindBarView) {
+        let wasShowingSearchResults = sidebarShowsSearchResults
+        searchPreviewGeneration &+= 1
+        searchPreviewCancellation?.cancel()
+        searchPreviewCancellation = nil
+        session.cancelSearchOperation()
+        session.focusSearchMatch(nil)
+        viewSearchOriginRange = nil
+        sidebarShowsSearchResults = false
+        hasPublishedCSVFindAll = false
+        isPublishingCSVFindAll = false
+        pendingCSVReplaceCurrent = nil
+        isAdvancingAfterCSVReplace = false
+        preferredCSVSearchFocusRange = nil
+        skipNextCSVSidebarRevealRange = nil
+        (installedPrimaryContentView as? CSVTableView)?.clearSearchMatches()
+        structureSearchResultsByRange.removeAll(keepingCapacity: true)
+        focusedStructureSearchRange = nil
+
+        if wasShowingSearchResults {
+            if isCSVViewPresentation {
+                setStructureVisible(false)
+            } else if presentationMode == .view, session.syntaxFileType == .json {
+                restoreJSONStructureAfterSearch()
+            } else if let payload = lastStructurePayload {
+                structureSidebar.update(
+                    folds: payload.folds,
+                    viewportData: payload.data,
+                    viewportBaseOffset: payload.base,
+                    fileType: payload.type
+                )
+            }
+        }
+
+        findBar.setStatus(findBar.query.isEmpty ? "Search this document" : "Waiting to search…")
+        if let notice = session.readOnlyNotice {
+            statusBar.setState(notice, busy: false, isError: true)
+        } else {
+            statusBar.setState("Ready", busy: false)
+        }
     }
 
     func findBarFindNext(_ findBar: FindBarView, backwards: Bool) {
@@ -2111,34 +2550,83 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     func findBarReplaceCurrent(_ findBar: FindBarView, replacement: String) {
-        guard presentationMode == .edit else {
+        guard presentationMode == .edit || isCSVViewPresentation else {
             NSSound.beep()
             return
         }
+        if isCSVViewPresentation, isAdvancingAfterCSVReplace {
+            findBar.setStatus("Finding the next match…")
+            return
+        }
+        if isCSVViewPresentation,
+           isPublishingCSVFindAll || pendingCSVReplaceCurrent != nil {
+            // Coalesce repeated clicks while the visible row is still being
+            // resolved. Replacing a provisional raw match could target a
+            // filtered row or the header.
+            pendingCSVReplaceCurrent = replacement
+            findBar.setStatus("Finding matches…")
+            return
+        }
+        guard commitPendingPresentationEdit() else { return }
+        guard !session.searchQuery.isEmpty else {
+            findBar.setStatus("Enter text to find")
+            return
+        }
+        if isCSVViewPresentation, session.currentMatch == nil {
+            pendingCSVReplaceCurrent = replacement
+            findBar.setStatus("Finding matches…")
+            performAutomaticCSVSearch()
+            return
+        }
+        let replacingCSVMatch = isCSVViewPresentation
+        if replacingCSVMatch { isReplacingCSVSearchMatch = true }
+        defer {
+            if replacingCSVMatch { isReplacingCSVSearchMatch = false }
+        }
         do {
             if let range = try session.replaceCurrent(with: replacement)?.byteRange {
-                editorView.reloadPreservingSelection()
-                editorView.scrollTo(byteRange: range)
-                session.findNext(backwards: false, from: range)
+                if isCSVViewPresentation {
+                    viewSearchOriginRange = range
+                    // The replacement range is not necessarily another match.
+                    // Clear it before asynchronous navigation so a rapid
+                    // second Replace cannot rewrite the inserted text.
+                    session.focusSearchMatch(nil)
+                    isAdvancingAfterCSVReplace = true
+                    session.findNext(backwards: false, from: range)
+                } else {
+                    editorView.reloadPreservingSelection()
+                    editorView.scrollTo(byteRange: range)
+                    session.findNext(backwards: false, from: range)
+                }
             } else {
-                session.findNext(backwards: false, from: editorView.selectedGlobalByteRange)
+                session.findNext(backwards: false, from: searchOriginRange)
             }
         } catch {
+            isAdvancingAfterCSVReplace = false
             findBar.setStatus(error.localizedDescription, isError: true)
         }
     }
 
     func findBarReplaceAll(_ findBar: FindBarView, replacement: String) {
-        guard presentationMode == .edit else {
+        guard presentationMode == .edit || isCSVViewPresentation else {
             NSSound.beep()
             return
         }
+        guard commitPendingPresentationEdit() else { return }
+        guard !session.searchQuery.isEmpty else {
+            findBar.setStatus("Enter text to find")
+            return
+        }
+        isAdvancingAfterCSVReplace = false
+        pendingCSVReplaceCurrent = nil
         session.replaceAll(with: replacement) { [weak self] result in
             switch result {
             case .success(let count):
                 let noun = count == 1 ? "match" : "matches"
                 self?.findBar.setStatus("Replaced \(count.formatted()) \(noun)")
-                self?.editorView.reloadPreservingSelection()
+                if self?.isCSVViewPresentation != true {
+                    self?.editorView.reloadPreservingSelection()
+                }
             case .failure(let error):
                 self?.findBar.setStatus(error.localizedDescription, isError: true)
             }
@@ -2146,15 +2634,27 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     func findBarDidRequestClose(_ findBar: FindBarView) {
+        let wasShowingSearchResults = sidebarShowsSearchResults
         searchPreviewGeneration &+= 1
         searchPreviewCancellation?.cancel()
         searchPreviewCancellation = nil
+        sidebarShowsSearchResults = false
+        hasPublishedCSVFindAll = false
+        isPublishingCSVFindAll = false
+        pendingCSVReplaceCurrent = nil
+        isAdvancingAfterCSVReplace = false
+        preferredCSVSearchFocusRange = nil
+        skipNextCSVSidebarRevealRange = nil
+        (installedPrimaryContentView as? CSVTableView)?.clearSearchMatches()
         structureSearchResultsByRange.removeAll(keepingCapacity: true)
         focusedStructureSearchRange = nil
-        if presentationMode == .view, sidebarShowsSearchResults {
-            sidebarShowsSearchResults = false
+        session.focusSearchMatch(nil)
+        session.cancelSearchOperation()
+        if presentationMode == .view, wasShowingSearchResults {
             if session.syntaxFileType == .json {
                 restoreJSONStructureAfterSearch()
+            } else if session.syntaxFileType == .csv {
+                setStructureVisible(false)
             } else if let payload = lastStructurePayload {
                 structureSidebar.update(
                     folds: payload.folds,
@@ -2163,6 +2663,11 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
                     fileType: payload.type
                 )
             }
+        }
+        if let notice = session.readOnlyNotice {
+            statusBar.setState(notice, busy: false, isError: true)
+        } else {
+            statusBar.setState("Ready", busy: false)
         }
         findHeightConstraint.constant = 0
         NSAnimationContext.runAnimationGroup({ context in
@@ -2178,6 +2683,37 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         if sidebarShowsSearchResults {
             viewSearchOriginRange = range
             if presentationMode == .view {
+                if session.syntaxFileType == .csv {
+                    // A result-row click is newer intent than any Find Next
+                    // still scanning in the background.
+                    session.cancelSearchOperation()
+                    let focusedStatus = "Match at byte \(range.lowerBound.formatted())"
+                    findBar.setStatus(focusedStatus)
+                    statusBar.setState(focusedStatus, busy: false)
+                    if let result = structureSearchResultsByRange[range] {
+                        session.focusSearchMatch(result.match)
+                    }
+                    let suppressDuplicateReveal = skipNextCSVSidebarRevealRange == range
+                    if skipNextCSVSidebarRevealRange != nil {
+                        skipNextCSVSidebarRevealRange = nil
+                    }
+                    if isPublishingCSVFindAll {
+                        preferredCSVSearchFocusRange = range
+                    }
+                    focusedStructureSearchRange = range
+                    csvTableView.focusSearchMatch(range)
+                    if suppressDuplicateReveal { return }
+                    revealCSVSearchMatch(range)
+                    if isPublishingCSVFindAll {
+                        // The replacement panel will select this same result;
+                        // that programmatic selection need not reveal it twice.
+                        skipNextCSVSidebarRevealRange = range
+                    }
+                    return
+                }
+                if let result = structureSearchResultsByRange[range] {
+                    session.focusSearchMatch(result.match)
+                }
                 if focusedStructureSearchRange == range {
                     statusBar.setState(
                         "Viewing match at byte \(range.lowerBound.formatted())",
@@ -2202,6 +2738,9 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
                     busy: false
                 )
             } else {
+                if let result = structureSearchResultsByRange[range] {
+                    session.focusSearchMatch(result.match)
+                }
                 revealPendingRangeInEditor(range)
             }
         } else if presentationMode == .view {
@@ -2857,8 +3396,91 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         (installedPrimaryContentView as? ParquetTableView)?.runtimeQAIsReady == true
     }
 
+    var qaIsCSVMemoryControlReady: Bool {
+        (installedPrimaryContentView as? CSVTableView)?.runtimeQALoadInMemoryControlIsReady == true
+    }
+
+    func qaActivateCSVMemoryControl() {
+        (installedPrimaryContentView as? CSVTableView)?.runtimeQARequestLoadInMemory()
+    }
+
+    var qaIsCSVInMemoryTableReady: Bool {
+        isCSVInMemoryPresentation
+            && (installedPrimaryContentView as? ParquetTableView)?.runtimeQAIsReady == true
+            && statusBar.qaMemoryBadgeText.hasPrefix("IN-MEMORY CSV")
+    }
+
+    func qaReturnToFileBackedCSV() {
+        returnToFileBackedCSV()
+    }
+
     func qaActivateReloadControl() {
         header.qaActivateReload()
+    }
+
+    func qaBeginCSVFind(query: String) {
+        setPresentationMode(.view, notifyIntegration: true)
+        showFindPanel(nil)
+        findBar.query = query
+    }
+
+    var qaCSVFindResultCount: Int? {
+        guard isCSVViewPresentation,
+              hasPublishedCSVFindAll,
+              sidebarShowsSearchResults else { return nil }
+        return structureSearchResultsByRange.count
+    }
+
+    var qaCSVFindSupportsReplace: Bool {
+        isCSVViewPresentation
+            && !findBar.qaSecondRowIsHidden
+            && findBar.qaReplaceControlsAreEnabled
+    }
+
+    var qaCSVFocusedMatchRange: Range<Int64>? {
+        guard isCSVViewPresentation else { return nil }
+        return session.currentMatch?.byteRange
+    }
+
+    var qaCSVSelectedDisplayedRow: Int {
+        csvTableView.runtimeQASelectedDisplayedRow
+    }
+
+    var qaCSVFindResultSubtitles: [String] {
+        structureSidebar.runtimeQASearchSubtitles
+    }
+
+    var qaCSVCollapseAllIsHidden: Bool {
+        structureSidebar.runtimeQACollapseAllButtonIsHidden
+    }
+
+    var qaCSVFindStatus: String { findBar.qaStatusText }
+
+    var qaCSVFindIsClosed: Bool {
+        findBar.isHidden
+            && !sidebarShowsSearchResults
+            && !hasPublishedCSVFindAll
+            && !isPublishingCSVFindAll
+    }
+
+    func qaCSVFindNext() {
+        findBarFindNext(findBar, backwards: false)
+    }
+
+    func qaActivateCSVFindResult(at index: Int) {
+        structureSidebar.runtimeQAActivateSearchResult(at: index)
+    }
+
+    func qaCSVReplaceCurrent(with replacement: String) {
+        findBarReplaceCurrent(findBar, replacement: replacement)
+    }
+
+    func qaCSVReplaceAll(with replacement: String) {
+        findBarReplaceAll(findBar, replacement: replacement)
+    }
+
+    func qaCloseCSVFind() {
+        findBarDidRequestClose(findBar)
     }
 
     var qaExternalChangeBannerIsVisible: Bool {
@@ -2915,7 +3537,9 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         case #selector(undoDocumentEdit(_:)): session.canUndo
         case #selector(redoDocumentEdit(_:)): session.canRedo
         case #selector(findNext(_:)), #selector(findPrevious(_:)):
-            !session.isReadOnly && !session.searchQuery.isEmpty
+            !session.isReadOnly
+                && !isCSVInMemoryPresentation
+                && !session.searchQuery.isEmpty
         case #selector(toggleStructure(_:)): canToggleStructure
         default: true
         }
@@ -2951,12 +3575,22 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
         searchPreviewGeneration &+= 1
         searchPreviewCancellation?.cancel()
         searchPreviewCancellation = nil
+        sidebarShowsSearchResults = false
+        hasPublishedCSVFindAll = false
+        isPublishingCSVFindAll = false
+        pendingCSVReplaceCurrent = nil
+        isAdvancingAfterCSVReplace = false
+        preferredCSVSearchFocusRange = nil
+        skipNextCSVSidebarRevealRange = nil
+        session.cancelSearchOperation()
+        session.focusSearchMatch(nil)
+        (installedPrimaryContentView as? CSVTableView)?.clearSearchMatches()
         structureSearchResultsByRange.removeAll(keepingCapacity: true)
         focusedStructureSearchRange = nil
         if mode == .view { editModeStructureWasVisible = structureIsVisible }
         presentationMode = mode
         header.presentationMode = mode
-        findBar.presentation = mode == .view ? .findOnly : .findAndReplace
+        findBar.presentation = findBarPresentation
         if !findBar.isHidden {
             findHeightConstraint.constant = findBar.preferredHeight
         }
@@ -2964,6 +3598,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
 
         switch mode {
         case .edit:
+            isCSVInMemoryMode = false
             if previousMode == .view, session.syntaxFileType == .json {
                 jsonRebuildWork?.cancel()
                 jsonRebuildWork = nil
@@ -3032,6 +3667,11 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
                 structureSidebar.presentation = .sidebar
                 setStructureVisible(false)
                 statusBar.showFileBackedView(totalByteCount: session.byteCount)
+            }
+        }
+        if isCSVViewPresentation, !findBar.isHidden, !findBar.query.isEmpty {
+            if !findBar.flushPendingQueryChange() {
+                performAutomaticCSVSearch()
             }
         }
         refreshChrome()
@@ -3330,6 +3970,7 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     private func prepareCSVTable() {
+        isCSVInMemoryMode = false
         installPrimaryContentView(csvTableView)
         csvTableView.setDelimiter(session.delimitedTextDelimiter, reload: false)
         if csvTableView.editorDelegate !== session {
@@ -3340,12 +3981,87 @@ final class LighTxtEditorViewController: NSViewController, FindBarViewDelegate, 
     }
 
     private func prepareParquetTable() {
+        isCSVInMemoryMode = false
         installPrimaryContentView(parquetTableView)
         guard let url = document?.fileURL else {
             statusBar.setState("Parquet View needs a file on disk.", busy: false, isError: true)
             return
         }
         parquetTableView.load(url: url)
+    }
+
+    private func requestLoadCSVInMemory(
+        delimiter: DelimitedTextDelimiter,
+        firstRowIsHeader: Bool,
+        columnNames: [String]
+    ) {
+        guard presentationMode == .view,
+              session.syntaxFileType == .csv,
+              !isCSVInMemoryMode,
+              let document,
+              let url = document.fileURL else {
+            NSSound.beep()
+            return
+        }
+        guard !session.isEdited, !document.isDocumentEdited else {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Save the CSV First"
+            alert.informativeText = "The in-memory table is loaded from the file on disk. Save your current changes, then choose Load CSV in Memory again."
+            alert.addButton(withTitle: "OK")
+            if let window = view.window {
+                alert.beginSheetModal(for: window)
+            } else {
+                alert.runModal()
+            }
+            return
+        }
+
+        if !findBar.isHidden { findBarDidRequestClose(findBar) }
+        isCSVInMemoryMode = true
+        installPrimaryContentView(parquetTableView)
+        primaryContentHost.isHidden = false
+        structureSidebar.presentation = .sidebar
+        setStructureVisible(false)
+        statusBar.showMemoryBackedCSV(totalByteCount: session.byteCount)
+        parquetTableView.loadCSVInMemory(
+            url: url,
+            delimiter: delimiter,
+            firstRowIsHeader: firstRowIsHeader,
+            columnNames: columnNames
+        )
+        parquetTableView.focusTable()
+        refreshChrome()
+    }
+
+    private func returnToFileBackedCSV() {
+        guard isCSVInMemoryPresentation else { return }
+        isCSVInMemoryMode = false
+        prepareCSVTable()
+        statusBar.showFileBackedView(totalByteCount: session.byteCount)
+        findBar.presentation = findBarPresentation
+        view.window?.makeFirstResponder(csvTableView)
+        refreshChrome()
+    }
+
+    private func handleCSVInMemoryLoadFailure(_ error: Error) {
+        guard isCSVInMemoryPresentation else { return }
+        isCSVInMemoryMode = false
+        prepareCSVTable()
+        statusBar.showFileBackedView(totalByteCount: session.byteCount)
+        statusBar.setState(error.localizedDescription, busy: false, isError: true)
+        refreshChrome()
+
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Couldn’t Load CSV in Memory"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "Continue File-Backed")
+        if let window = view.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     private func showStructureFullWorkspace() {

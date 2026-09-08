@@ -4,6 +4,20 @@ import Testing
 
 @Suite("Tabular export")
 struct TabularExportTests {
+    @Test("Parquet uses its dedicated atomic writer")
+    func parquetRequiresDedicatedWriter() throws {
+        let url = temporaryURL(extension: "parquet")
+        #expect(throws: TabularExportError.formatRequiresDedicatedWriter(.parquet)) {
+            _ = try TabularExportSink(
+                targetURL: url,
+                format: .parquet,
+                headers: nil,
+                expectedDestination: nil
+            )
+        }
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+    }
+
     @Test("CSV, TSV, and pipe rows are escaped incrementally")
     func delimitedFormats() throws {
         for (format, expected) in [

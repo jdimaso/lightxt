@@ -31,17 +31,22 @@ final class TabularExportAccessoryView: NSView {
         action: nil
     )
     private var selectedRowCount = 0
+    private var textFormatHeaderState: NSControl.StateValue = .off
 
     var onFormatChange: ((TabularExportFormat) -> Void)?
 
-    init(selectedRowCount: Int, hasHeaders: Bool) {
+    init(
+        selectedRowCount: Int,
+        hasHeaders: Bool,
+        formats: [TabularExportFormat] = TabularExportFormat.textFormats
+    ) {
         self.selectedRowCount = max(0, selectedRowCount)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
         let formatLabel = NSTextField(labelWithString: "Format:")
         let scopeLabel = NSTextField(labelWithString: "Rows:")
-        for format in TabularExportFormat.allCases {
+        for format in formats.isEmpty ? TabularExportFormat.textFormats : formats {
             formatPopup.addItem(withTitle: format.displayName)
             formatPopup.lastItem?.representedObject = format.rawValue
         }
@@ -59,6 +64,8 @@ final class TabularExportAccessoryView: NSView {
             scopePopup.item(at: 1)?.isEnabled = false
         }
         headerCheckbox.state = hasHeaders ? .on : .off
+        textFormatHeaderState = headerCheckbox.state
+        updateHeaderAvailability()
 
         let grid = NSGridView(views: [
             [formatLabel, formatPopup],
@@ -97,6 +104,26 @@ final class TabularExportAccessoryView: NSView {
     }
 
     @objc private func formatChanged(_ sender: Any?) {
+        updateHeaderAvailability()
         onFormatChange?(request.format)
+    }
+
+    private func updateHeaderAvailability() {
+        let isParquet = request.format == .parquet
+        if isParquet {
+            if headerCheckbox.isEnabled {
+                textFormatHeaderState = headerCheckbox.state
+            }
+            headerCheckbox.state = .on
+            headerCheckbox.isEnabled = false
+        } else {
+            if !headerCheckbox.isEnabled {
+                headerCheckbox.state = textFormatHeaderState
+            }
+            headerCheckbox.isEnabled = true
+        }
+        headerCheckbox.toolTip = isParquet
+            ? "Parquet files always include column names."
+            : nil
     }
 }

@@ -120,7 +120,10 @@ struct StructuredViewRuntimeQA {
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
 
         try assertFindOnlyLayoutAtMinimumWidth()
+        try assertReplacementTextIsVerticallyCentered()
+        try assertFindDebounceAndActionFlush()
         let sourceResult = try assertSourceFaithfulUnicodeHighlight()
+        try assertLongSearchResultEllipsizes()
         try assertBoundedAndCancellablePreviewReads()
         try assertStructureInteractionsAndZoom()
         try assertYAMLOffViewportParity(sourceResult: sourceResult)
@@ -170,6 +173,62 @@ struct StructuredViewRuntimeQA {
         }
     }
 
+    private static func assertReplacementTextIsVerticallyCentered() throws {
+        let bar = FindBarView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 104))
+        bar.presentation = .findAndReplace
+        let window = host(bar, size: bar.frame.size, appearance: .aqua)
+        defer { window.close() }
+        settle(window)
+        let bounds = bar.qaReplacementFieldBounds
+        let drawing = bar.qaReplacementTextDrawingRect
+        guard !drawing.isEmpty, abs(bounds.midY - drawing.midY) <= 1 else {
+            throw QAError.failed(
+                "Replacement text was not vertically centered: field \(bounds), text \(drawing)"
+            )
+        }
+    }
+
+    private static func assertFindDebounceAndActionFlush() throws {
+        let bar = FindBarView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 104))
+        let spy = FindBarSpy()
+        bar.findDelegate = spy
+        let window = host(bar, size: bar.frame.size, appearance: .aqua)
+        defer { window.close() }
+
+        bar.qaTypeQuery("E")
+        bar.qaTypeQuery("Em")
+        bar.qaTypeQuery("Empire")
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.18))
+        guard spy.events.isEmpty, spy.willChangeCount == 3 else {
+            throw QAError.failed(
+                "Find did not cancel stale work immediately while preserving its typing debounce: \(spy.events), cancellations=\(spy.willChangeCount)"
+            )
+        }
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.18))
+        guard spy.events == ["query:Empire"] else {
+            throw QAError.failed("Find did not debounce rapid typing to the final query: \(spy.events)")
+        }
+
+        spy.events.removeAll()
+        bar.qaTypeQuery("Empire Blue")
+        bar.qaActivateNext()
+        guard spy.events == ["query:Empire Blue", "next:false"] else {
+            throw QAError.failed("Find Next used a stale debounced query: \(spy.events)")
+        }
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.34))
+        guard spy.events.count == 2 else {
+            throw QAError.failed("A flushed Find query was delivered twice: \(spy.events)")
+        }
+
+        spy.events.removeAll()
+        bar.qaTypeQuery("must not escape")
+        bar.qaActivateClose()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.34))
+        guard spy.events == ["close"] else {
+            throw QAError.failed("Closing Find delivered a pending query: \(spy.events)")
+        }
+    }
+
     private static func assertSourceFaithfulUnicodeHighlight() throws -> StructureSearchResult {
         let source = #"{"note":"before 🚀 café \u00E9 after"}"#
         let bytes = Data(source.utf8)
@@ -199,6 +258,74 @@ struct StructuredViewRuntimeQA {
             )
         }
         return result
+    }
+
+    private static func assertLongSearchResultEllipsizes() throws {
+        let source = "heading\n" + String(repeating: "a", count: 100)
+            + "Empire" + String(repeating: "b", count: 300) + "\n"
+        let bytes = Data(source.utf8)
+        guard let found = bytes.range(of: Data("Empire".utf8)),
+              let result = StructureSearchResultBuilder.build(
+                  snapshot: DocumentSnapshot(bytes),
+                  matches: [SearchMatch(
+                      byteRange: Int64(found.lowerBound)..<Int64(found.upperBound)
+                  )]
+              ).first else {
+            throw QAError.failed("Long Find Results fixture could not be built")
+        }
+        guard result.text.hasPrefix("…"), result.text.hasSuffix("…") else {
+            throw QAError.failed("Bounded Find context omitted its ellipses: \(result.text)")
+        }
+
+        let view = StructureSidebarView(frame: NSRect(x: 0, y: 0, width: 340, height: 180))
+        let window = host(view, size: view.frame.size, appearance: .aqua)
+        defer { window.close() }
+        view.updateSearchResults([result], total: 1, truncated: false)
+        settle(window)
+        let identifier = "search:\(result.match.byteRange.lowerBound):\(result.match.byteRange.upperBound):0"
+        guard let layout = view.qaSearchRowLayout(identifier: identifier),
+              layout.usesSingleLineLabels,
+              layout.bounds.insetBy(dx: -0.5, dy: -0.5).contains(layout.title),
+              layout.bounds.insetBy(dx: -0.5, dy: -0.5).contains(layout.subtitle),
+              layout.title.intersection(layout.subtitle).isEmpty else {
+            throw QAError.failed("A long Find result wrapped or escaped its fixed row")
+        }
+        guard view.qaScope == "1 match" else {
+            throw QAError.failed("Find Results did not use singular match grammar: \(view.qaScope)")
+        }
+
+        let csvResult = StructureSearchResult(
+            match: result.match,
+            text: result.text,
+            highlightUTF16Range: result.highlightUTF16Range,
+            csvRecord: 41
+        )
+        view.updateSearchResults(
+            [csvResult],
+            total: 100,
+            truncated: true,
+            totalIsExact: false
+        )
+        settle(window)
+        guard view.qaCollapseAllButtonIsHidden,
+              view.qaSubtitle(atRow: 0)?.hasPrefix("Row 42  ·  Match 1") == true,
+              view.qaScope == "Showing first 1 matches  ·  Find All to count" else {
+            throw QAError.failed(
+                "CSV Find Results retained structure-only controls or omitted row/partial metadata"
+            )
+        }
+
+        let csvHeaderResult = StructureSearchResult(
+            match: result.match,
+            text: result.text,
+            highlightUTF16Range: result.highlightUTF16Range,
+            csvRecord: 0,
+            csvIsHeader: true
+        )
+        view.updateSearchResults([csvHeaderResult], total: 1, truncated: false)
+        guard view.qaSubtitle(atRow: 0)?.hasPrefix("Header  ·  Match 1") == true else {
+            throw QAError.failed("A CSV header match was mislabeled as a filtered data row")
+        }
     }
 
     private static func assertBoundedAndCancellablePreviewReads() throws {
@@ -435,6 +562,39 @@ struct StructuredViewRuntimeQA {
     private static func recursiveSubviews(of view: NSView) -> [NSView] {
         [view] + view.subviews.flatMap(recursiveSubviews)
     }
+}
+
+@MainActor
+private final class FindBarSpy: FindBarViewDelegate {
+    var events: [String] = []
+    var willChangeCount = 0
+
+    func findBarSearchWillChange(_ findBar: FindBarView) {
+        willChangeCount += 1
+    }
+
+    func findBar(
+        _ findBar: FindBarView,
+        queryDidChange query: String,
+        regularExpression: Bool,
+        caseSensitive: Bool,
+        wholeWords: Bool
+    ) {
+        events.append("query:\(query)")
+    }
+
+    func findBarFindNext(_ findBar: FindBarView, backwards: Bool) {
+        events.append("next:\(backwards)")
+    }
+
+    func findBarFindAll(_ findBar: FindBarView) { events.append("all") }
+    func findBarReplaceCurrent(_ findBar: FindBarView, replacement: String) {
+        events.append("replace:\(replacement)")
+    }
+    func findBarReplaceAll(_ findBar: FindBarView, replacement: String) {
+        events.append("replace-all:\(replacement)")
+    }
+    func findBarDidRequestClose(_ findBar: FindBarView) { events.append("close") }
 }
 
 @MainActor

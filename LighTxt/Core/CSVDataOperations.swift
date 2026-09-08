@@ -662,11 +662,13 @@ public nonisolated struct CSVQueryProgress: Sendable, Equatable {
 public nonisolated final class CSVRowMap: @unchecked Sendable {
     private let store: CSVTemporaryOrdinalStore
     public let rowCount: Int64
+    public let isSourceOrdered: Bool
 
-    fileprivate init(store: CSVTemporaryOrdinalStore) throws {
+    fileprivate init(store: CSVTemporaryOrdinalStore, isSourceOrdered: Bool) throws {
         try store.finishWriting()
         self.store = store
         self.rowCount = store.count
+        self.isSourceOrdered = isSourceOrdered
     }
 
     public func record(at displayedRow: Int64) throws -> Int64 {
@@ -687,6 +689,35 @@ public nonisolated final class CSVRowMap: @unchecked Sendable {
         let upper = min(rowCount, requestedRange.upperBound)
         let cappedUpper = min(upper, requestedRange.lowerBound + 4_096)
         return try store.values(in: requestedRange.lowerBound..<cappedUpper)
+    }
+
+    /// Finds display positions only for the requested source records. Sorted
+    /// projections require one sequential pass over the compact eight-byte
+    /// ordinal store; filter-only projections can stop once their ascending
+    /// source ordinals pass the largest requested record.
+    public func displayedRows(
+        forSourceRecords requestedRecords: Set<Int64>,
+        cancellation: (@Sendable () -> Bool)? = nil
+    ) throws -> [Int64: Int64] {
+        guard !requestedRecords.isEmpty, rowCount > 0 else { return [:] }
+        var unresolved = requestedRecords
+        var resolved: [Int64: Int64] = [:]
+        resolved.reserveCapacity(requestedRecords.count)
+        let maximumRequested = requestedRecords.max()!
+        var displayedStart: Int64 = 0
+        while displayedStart < rowCount, !unresolved.isEmpty {
+            if cancellation?() == true { throw CancellationError() }
+            let page = try store.values(
+                in: displayedStart..<min(rowCount, displayedStart + 4_096)
+            )
+            guard !page.isEmpty else { break }
+            for (localIndex, record) in page.enumerated() where unresolved.remove(record) != nil {
+                resolved[record] = displayedStart + Int64(localIndex)
+            }
+            if isSourceOrdered, let last = page.last, last >= maximumRequested { break }
+            displayedStart += Int64(page.count)
+        }
+        return resolved
     }
 
     /// Releases the temporary result immediately. It is also closed on deinit.
@@ -886,7 +917,7 @@ public nonisolated enum CSVRowQueryEngine {
         try flushDirectMatches()
         report()
         if query.sortDescriptors.isEmpty {
-            return try CSVRowMap(store: directStore)
+            return try CSVRowMap(store: directStore, isSourceOrdered: true)
         }
         if !sortEntries.isEmpty {
             let run = try spillSortedRun(
@@ -910,7 +941,7 @@ public nonisolated enum CSVRowQueryEngine {
             configuration: configuration,
             cancellation: cancellation
         )
-        return try CSVRowMap(store: sortedStore)
+        return try CSVRowMap(store: sortedStore, isSourceOrdered: false)
     }
 
     private static func makeSortEntry(
@@ -990,7 +1021,11 @@ public nonisolated enum CSVRowQueryEngine {
             return try CSVTemporaryOrdinalStore()
         }
         var runs = initialRuns
-        while runs.count > 1 {
+        // Preserve comparison keys only while another merge level still needs
+        // them. Once the remaining runs fit in one fan-in group, stream their
+        // source ordinals directly into the final row map instead of writing a
+        // complete key-bearing run and reading it back one more time.
+        while runs.count > configuration.mergeFanIn {
             var merged: [CSVTemporarySortRun] = []
             merged.reserveCapacity((runs.count + configuration.mergeFanIn - 1) / configuration.mergeFanIn)
             var start = 0
@@ -1010,15 +1045,27 @@ public nonisolated enum CSVRowQueryEngine {
             }
             runs = merged
         }
+        return try mergeRunGroupIntoOrdinalStore(
+            runs,
+            descriptors: descriptors,
+            cancellation: cancellation
+        )
+    }
+
+    private static func mergeRunGroupIntoOrdinalStore(
+        _ runs: [CSVTemporarySortRun],
+        descriptors: [CSVSortDescriptor],
+        cancellation: CSVRowIndex.CancellationCheck?
+    ) throws -> CSVTemporaryOrdinalStore {
         let output = try CSVTemporaryOrdinalStore()
-        var offset: Int64 = 0
         var records: [Int64] = []
         records.reserveCapacity(4_096)
-        while offset < runs[0].byteCount {
-            if cancellation?() == true { throw CancellationError() }
-            let decoded = try runs[0].entry(at: offset)
-            records.append(decoded.entry.record)
-            offset = decoded.nextOffset
+        try consumeMergedRuns(
+            runs,
+            descriptors: descriptors,
+            cancellation: cancellation
+        ) { entry in
+            records.append(entry.record)
             if records.count == 4_096 {
                 try output.append(records)
                 records.removeAll(keepingCapacity: true)
@@ -1033,32 +1080,15 @@ public nonisolated enum CSVRowQueryEngine {
         descriptors: [CSVSortDescriptor],
         cancellation: CSVRowIndex.CancellationCheck?
     ) throws -> CSVTemporarySortRun {
-        var cursors: [CSVSortRunCursor] = []
-        cursors.reserveCapacity(runs.count)
-        for run in runs where run.count > 0 {
-            let decoded = try run.entry(at: 0)
-            cursors.append(CSVSortRunCursor(
-                store: run,
-                nextOffset: decoded.nextOffset,
-                entry: decoded.entry
-            ))
-        }
-
         let output = try CSVTemporarySortRun()
         var buffer: [CSVSortEntry] = []
         buffer.reserveCapacity(64)
         var bufferBytes = 0
-        while !cursors.isEmpty {
-            if cancellation?() == true { throw CancellationError() }
-            var best = 0
-            for candidate in cursors.indices.dropFirst() where compare(
-                cursors[candidate].entry,
-                cursors[best].entry,
-                descriptors: descriptors
-            ) == .orderedAscending {
-                best = candidate
-            }
-            let entry = cursors[best].entry
+        try consumeMergedRuns(
+            runs,
+            descriptors: descriptors,
+            cancellation: cancellation
+        ) { entry in
             let projected = bufferBytes.addingReportingOverflow(entry.estimatedResidentByteCount)
             if !buffer.isEmpty, projected.overflow || projected.partialValue > (64 << 10) {
                 try output.append(buffer)
@@ -1068,17 +1098,104 @@ public nonisolated enum CSVRowQueryEngine {
             buffer.append(entry)
             let nextBytes = bufferBytes.addingReportingOverflow(entry.estimatedResidentByteCount)
             bufferBytes = nextBytes.overflow ? Int.max : nextBytes.partialValue
-            if cursors[best].nextOffset >= cursors[best].store.byteCount {
-                cursors.remove(at: best)
-            } else {
-                let decoded = try cursors[best].store.entry(at: cursors[best].nextOffset)
-                cursors[best].entry = decoded.entry
-                cursors[best].nextOffset = decoded.nextOffset
-            }
         }
         try output.append(buffer)
         try output.finishWriting()
         return output
+    }
+
+    /// Merges already-sorted runs with one buffered sequential reader per run.
+    /// A binary heap reduces selection from O(fan-in) comparisons per emitted
+    /// row to O(log fan-in), while every run reader amortizes positional I/O
+    /// across many frames instead of issuing a header and payload read per row.
+    private static func consumeMergedRuns(
+        _ runs: [CSVTemporarySortRun],
+        descriptors: [CSVSortDescriptor],
+        cancellation: CSVRowIndex.CancellationCheck?,
+        consume: (CSVSortEntry) throws -> Void
+    ) throws {
+        var heap: [CSVSortRunCursor] = []
+        heap.reserveCapacity(runs.count)
+        for run in runs where run.count > 0 {
+            let reader = try run.makeSequentialReader()
+            guard let entry = try reader.next() else {
+                throw CSVRowIndex.IndexError.inconsistentCheckpointData
+            }
+            insertIntoRunHeap(
+                CSVSortRunCursor(reader: reader, entry: entry),
+                heap: &heap,
+                descriptors: descriptors
+            )
+        }
+
+        while !heap.isEmpty {
+            if cancellation?() == true { throw CancellationError() }
+            var cursor = removeMinimumFromRunHeap(
+                &heap,
+                descriptors: descriptors
+            )
+            try consume(cursor.entry)
+            if let next = try cursor.reader.next() {
+                cursor.entry = next
+                insertIntoRunHeap(
+                    cursor,
+                    heap: &heap,
+                    descriptors: descriptors
+                )
+            }
+        }
+    }
+
+    private static func insertIntoRunHeap(
+        _ cursor: CSVSortRunCursor,
+        heap: inout [CSVSortRunCursor],
+        descriptors: [CSVSortDescriptor]
+    ) {
+        heap.append(cursor)
+        var child = heap.count - 1
+        while child > 0 {
+            let parent = (child - 1) / 2
+            guard runCursorPrecedes(heap[child], heap[parent], descriptors: descriptors) else {
+                break
+            }
+            heap.swapAt(child, parent)
+            child = parent
+        }
+    }
+
+    private static func removeMinimumFromRunHeap(
+        _ heap: inout [CSVSortRunCursor],
+        descriptors: [CSVSortDescriptor]
+    ) -> CSVSortRunCursor {
+        precondition(!heap.isEmpty)
+        if heap.count == 1 { return heap.removeLast() }
+        let minimum = heap[0]
+        heap[0] = heap.removeLast()
+        var parent = 0
+        while true {
+            let left = parent * 2 + 1
+            guard left < heap.count else { break }
+            let right = left + 1
+            var child = left
+            if right < heap.count,
+               runCursorPrecedes(heap[right], heap[left], descriptors: descriptors) {
+                child = right
+            }
+            guard runCursorPrecedes(heap[child], heap[parent], descriptors: descriptors) else {
+                break
+            }
+            heap.swapAt(parent, child)
+            parent = child
+        }
+        return minimum
+    }
+
+    private static func runCursorPrecedes(
+        _ lhs: CSVSortRunCursor,
+        _ rhs: CSVSortRunCursor,
+        descriptors: [CSVSortDescriptor]
+    ) -> Bool {
+        compare(lhs.entry, rhs.entry, descriptors: descriptors) == .orderedAscending
     }
 
     private static func compare(
@@ -2036,9 +2153,133 @@ private nonisolated struct CSVSortEntry {
 }
 
 private nonisolated struct CSVSortRunCursor {
-    let store: CSVTemporarySortRun
-    var nextOffset: Int64
+    let reader: CSVSortRunReader
     var entry: CSVSortEntry
+}
+
+/// Sequential decoder for one sorted run. It deliberately shares the run's
+/// existing descriptor instead of opening another one, keeping the external
+/// sort's descriptor bound unchanged while amortizing `pread` calls.
+private nonisolated final class CSVSortRunReader {
+    private static let bufferByteCount = 256 << 10
+
+    private let store: CSVTemporarySortRun
+    private let byteCount: Int64
+    private var nextReadOffset: Int64 = 0
+    private var buffer = Data()
+    private var cursor = 0
+
+    init(store: CSVTemporarySortRun, byteCount: Int64) {
+        self.store = store
+        self.byteCount = byteCount
+        buffer.reserveCapacity(Self.bufferByteCount)
+    }
+
+    func next() throws -> CSVSortEntry? {
+        guard try ensureAvailable(4, permitsCleanEndOfFile: true) else { return nil }
+        let payloadCount = buffer.withUnsafeBytes { bytes in
+            Int(UInt32(littleEndian: bytes.loadUnaligned(
+                fromByteOffset: cursor,
+                as: UInt32.self
+            )))
+        }
+        guard payloadCount >= 12 else {
+            throw CSVRowIndex.IndexError.inconsistentCheckpointData
+        }
+        let frameByteCount = 4 + payloadCount
+        guard try ensureAvailable(frameByteCount, permitsCleanEndOfFile: false) else {
+            throw CSVRowIndex.IndexError.inconsistentCheckpointData
+        }
+
+        let payloadStart = cursor + 4
+        let payloadEnd = payloadStart + payloadCount
+        let entry: CSVSortEntry = try buffer.withUnsafeBytes { bytes in
+            let record = Int64(littleEndian: bytes.loadUnaligned(
+                fromByteOffset: payloadStart,
+                as: Int64.self
+            ))
+            let keyCount = Int(UInt32(littleEndian: bytes.loadUnaligned(
+                fromByteOffset: payloadStart + 8,
+                as: UInt32.self
+            )))
+            guard keyCount <= (payloadCount - 12) / 4 else {
+                throw CSVRowIndex.IndexError.inconsistentCheckpointData
+            }
+            var valueCursor = payloadStart + 12
+            var values: [String] = []
+            values.reserveCapacity(keyCount)
+            for _ in 0..<keyCount {
+                guard valueCursor + 4 <= payloadEnd else {
+                    throw CSVRowIndex.IndexError.inconsistentCheckpointData
+                }
+                let length = Int(UInt32(littleEndian: bytes.loadUnaligned(
+                    fromByteOffset: valueCursor,
+                    as: UInt32.self
+                )))
+                valueCursor += 4
+                guard length <= payloadEnd - valueCursor else {
+                    throw CSVRowIndex.IndexError.inconsistentCheckpointData
+                }
+                values.append(String(
+                    decoding: bytes[valueCursor..<(valueCursor + length)],
+                    as: UTF8.self
+                ))
+                valueCursor += length
+            }
+            guard valueCursor == payloadEnd else {
+                throw CSVRowIndex.IndexError.inconsistentCheckpointData
+            }
+            return CSVSortEntry(record: record, values: values)
+        }
+        cursor = payloadEnd
+        discardConsumedBytesIfUseful()
+        return entry
+    }
+
+    private func ensureAvailable(
+        _ requiredByteCount: Int,
+        permitsCleanEndOfFile: Bool
+    ) throws -> Bool {
+        guard requiredByteCount >= 0 else {
+            throw CSVRowIndex.IndexError.inconsistentCheckpointData
+        }
+        if buffer.count - cursor >= requiredByteCount { return true }
+        if cursor > 0 {
+            buffer.removeSubrange(0..<cursor)
+            cursor = 0
+        }
+        while buffer.count < requiredByteCount, nextReadOffset < byteCount {
+            let requested = max(
+                Self.bufferByteCount,
+                requiredByteCount - buffer.count
+            )
+            let chunk = try store.readSequentialChunk(
+                at: nextReadOffset,
+                maximumByteCount: requested
+            )
+            guard !chunk.isEmpty else {
+                throw CSVRowIndex.IndexError.inconsistentCheckpointData
+            }
+            nextReadOffset += Int64(chunk.count)
+            buffer.append(chunk)
+        }
+        if buffer.count >= requiredByteCount { return true }
+        if permitsCleanEndOfFile, buffer.isEmpty, nextReadOffset == byteCount {
+            return false
+        }
+        throw CSVRowIndex.IndexError.inconsistentCheckpointData
+    }
+
+    private func discardConsumedBytesIfUseful() {
+        guard cursor == buffer.count else { return }
+        if buffer.count > Self.bufferByteCount * 2 {
+            buffer = Data()
+            buffer.reserveCapacity(Self.bufferByteCount)
+        } else {
+            buffer.removeAll(keepingCapacity: true)
+        }
+        cursor = 0
+    }
 }
 
 private nonisolated final class CSVTemporaryRewriteOutput {
@@ -2298,52 +2539,27 @@ private nonisolated final class CSVTemporarySortRun: @unchecked Sendable {
         isFinished = true
     }
 
-    func entry(at offset: Int64) throws -> (entry: CSVSortEntry, nextOffset: Int64) {
+    func makeSequentialReader() throws -> CSVSortRunReader {
         lock.lock()
         defer { lock.unlock() }
         guard descriptor >= 0, isFinished else { throw CSVDataOperationError.rowMapClosed }
-        guard offset >= 0, offset + 4 <= storedByteCount else {
+        return CSVSortRunReader(store: self, byteCount: storedByteCount)
+    }
+
+    fileprivate func readSequentialChunk(
+        at offset: Int64,
+        maximumByteCount: Int
+    ) throws -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        guard descriptor >= 0, isFinished else { throw CSVDataOperationError.rowMapClosed }
+        guard offset >= 0, offset <= storedByteCount, maximumByteCount > 0 else {
             throw CSVDataOperationError.rowMapOutOfBounds(offset)
         }
-        let header = try readData(at: offset, count: 4)
-        let payloadCount = header.withUnsafeBytes { bytes in
-            Int(UInt32(littleEndian: bytes.loadUnaligned(as: UInt32.self)))
-        }
-        let nextOffset = offset + 4 + Int64(payloadCount)
-        guard payloadCount >= 12, nextOffset <= storedByteCount else {
-            throw CSVRowIndex.IndexError.inconsistentCheckpointData
-        }
-        let payload = try readData(at: offset + 4, count: payloadCount)
-        let decoded: CSVSortEntry = try payload.withUnsafeBytes { bytes in
-            let record = Int64(littleEndian: bytes.loadUnaligned(as: Int64.self))
-            let keyCount = Int(UInt32(littleEndian: bytes.loadUnaligned(
-                fromByteOffset: 8,
-                as: UInt32.self
-            )))
-            var cursor = 12
-            var values: [String] = []
-            values.reserveCapacity(keyCount)
-            for _ in 0..<keyCount {
-                guard cursor + 4 <= bytes.count else {
-                    throw CSVRowIndex.IndexError.inconsistentCheckpointData
-                }
-                let length = Int(UInt32(littleEndian: bytes.loadUnaligned(
-                    fromByteOffset: cursor,
-                    as: UInt32.self
-                )))
-                cursor += 4
-                guard length <= bytes.count - cursor else {
-                    throw CSVRowIndex.IndexError.inconsistentCheckpointData
-                }
-                values.append(String(decoding: bytes[cursor..<(cursor + length)], as: UTF8.self))
-                cursor += length
-            }
-            guard cursor == bytes.count else {
-                throw CSVRowIndex.IndexError.inconsistentCheckpointData
-            }
-            return CSVSortEntry(record: record, values: values)
-        }
-        return (decoded, nextOffset)
+        let remaining = storedByteCount - offset
+        guard remaining > 0 else { return Data() }
+        let count = Int(min(remaining, Int64(maximumByteCount)))
+        return try readData(at: offset, count: count)
     }
 
     private func appendBytes(_ data: Data) throws {

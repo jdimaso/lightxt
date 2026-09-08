@@ -4,6 +4,40 @@ import XCTest
 @testable import LighTxt
 
 final class CSVFilterV2Tests: XCTestCase {
+    func testRowMapReverseLookupSupportsFilteredAndSortedProjections() throws {
+        let fixture = try makeFixture(
+            "id,name\n1,delta\n2,alpha\n3,charlie\n4,bravo\n"
+        )
+        let filtered = try CSVRowQueryEngine.execute(
+            snapshot: fixture.snapshot,
+            index: fixture.index,
+            query: CSVRowQuery(firstRecord: 1, filters: [
+                CSVColumnFilter(column: 1, predicate: .contains("a", caseSensitive: false)),
+            ])
+        )
+        defer { filtered.close() }
+        XCTAssertTrue(filtered.isSourceOrdered)
+        XCTAssertEqual(
+            try filtered.displayedRows(forSourceRecords: [1, 3, 99]),
+            [1: 0, 3: 2]
+        )
+
+        let sorted = try CSVRowQueryEngine.execute(
+            snapshot: fixture.snapshot,
+            index: try CSVRowIndex(snapshot: fixture.snapshot),
+            query: CSVRowQuery(
+                firstRecord: 1,
+                sortDescriptors: [CSVSortDescriptor(column: 1)]
+            )
+        )
+        defer { sorted.close() }
+        XCTAssertFalse(sorted.isSourceOrdered)
+        XCTAssertEqual(
+            try sorted.displayedRows(forSourceRecords: [1, 2, 4]),
+            [2: 0, 4: 1, 1: 3]
+        )
+    }
+
     func testContainsAndSelectedValuesComposeAsIntersectionWithORWithinSelection() throws {
         let fixture = try makeFixture(
             "id,fruit,region\r\n"

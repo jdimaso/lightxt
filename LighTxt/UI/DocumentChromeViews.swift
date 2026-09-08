@@ -725,8 +725,9 @@ final class DocumentStatusBar: NSView {
     }
 
     func setState(_ text: String, busy: Bool = false, isError: Bool = false) {
-        stateLabel.stringValue = text
+        stateLabel.stringValue = Self.singleLineStatusText(text)
         stateLabel.toolTip = text
+        stateLabel.setAccessibilityValue(text)
         stateIsError = isError
         applyResolvedAppearance()
         progress.isHidden = !busy
@@ -745,6 +746,11 @@ final class DocumentStatusBar: NSView {
         memoryBadge.toolTip = "The document remains file-backed while this view is open"
     }
 
+    func showMemoryBackedCSV(totalByteCount: Int64) {
+        memoryBadge.stringValue = "IN-MEMORY CSV · \(ByteCountFormatter.lighTxt.string(fromByteCount: totalByteCount))"
+        memoryBadge.toolTip = "The CSV is materialized in DuckDB memory for fast sorting and filtering"
+    }
+
     private func configure() {
         positionLabel.font = LighTxtTheme.detailFont
         positionLabel.textColor = LighTxtTheme.secondaryText
@@ -754,6 +760,9 @@ final class DocumentStatusBar: NSView {
         stateLabel.textColor = LighTxtTheme.secondaryText
         stateLabel.alignment = .center
         stateLabel.lineBreakMode = .byTruncatingMiddle
+        stateLabel.maximumNumberOfLines = 1
+        stateLabel.cell?.wraps = false
+        stateLabel.cell?.usesSingleLineMode = true
         stateLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         progress.style = .spinning
@@ -782,6 +791,13 @@ final class DocumentStatusBar: NSView {
         ])
     }
 
+    private static func singleLineStatusText(_ text: String) -> String {
+        text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
     private func applyResolvedAppearance() {
         let appearance = effectiveAppearance
         layer?.backgroundColor = LighTxtTheme.resolved(
@@ -802,4 +818,17 @@ final class DocumentStatusBar: NSView {
         )
         memoryBadge.textColor = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
     }
+
+#if LIGHTXT_RUNTIME_QA
+    var qaStateText: String { stateLabel.stringValue }
+    var qaStateToolTip: String? { stateLabel.toolTip }
+    var qaStateIsError: Bool { stateIsError }
+    var qaStateIsStrictlySingleLine: Bool {
+        stateLabel.maximumNumberOfLines == 1
+            && stateLabel.cell?.wraps == false
+            && stateLabel.cell?.usesSingleLineMode == true
+            && stateLabel.lineBreakMode == .byTruncatingMiddle
+    }
+    var qaMemoryBadgeText: String { memoryBadge.stringValue }
+#endif
 }

@@ -1,11 +1,74 @@
 import AppKit
+import UniformTypeIdentifiers
 
 #if !LIGHTXT_STANDALONE_PARQUET_QA
+nonisolated struct CSVSearchNavigationResolution: @unchecked Sendable {
+    let sourceRecordsByRange: [Range<Int64>: Int64]
+    let recordLocationsByRecord: [Int64: CSVRowIndex.RecordLocation]
+    let displayedRowsByRecord: [Int64: Int64]
+    let resolvedSourceRecords: Set<Int64>
+}
+
+nonisolated struct CSVSearchNavigationContext: @unchecked Sendable {
+    let rowIndex: CSVRowIndex
+    let displayedRowMap: CSVRowMap?
+    let firstRowIsHeader: Bool
+    let tableGeneration: UInt64
+    let queryGeneration: UInt64
+
+    func resolve(
+        ranges: [Range<Int64>],
+        cancellation: CancellationToken? = nil
+    ) throws -> CSVSearchNavigationResolution {
+        let locations = try rowIndex.recordLocations(
+            containingByteOffsets: ranges.map(\.lowerBound),
+            cancellation: { cancellation?.isCancelled == true }
+        )
+        var sourceRecordsByRange: [Range<Int64>: Int64] = [:]
+        var locationsByRecord: [Int64: CSVRowIndex.RecordLocation] = [:]
+        for (range, location) in zip(ranges, locations) {
+            guard let location else { continue }
+            sourceRecordsByRange[range] = location.record
+            locationsByRecord[location.record] = location
+        }
+        let records = Set(sourceRecordsByRange.values)
+        let displayedRows: [Int64: Int64]
+        if let displayedRowMap {
+            displayedRows = try displayedRowMap.displayedRows(
+                forSourceRecords: records,
+                cancellation: { cancellation?.isCancelled == true }
+            )
+        } else {
+            let headerOffset: Int64 = firstRowIsHeader ? 1 : 0
+            displayedRows = Dictionary(uniqueKeysWithValues: records.compactMap { record in
+                guard record >= headerOffset else { return nil }
+                return (record, record - headerOffset)
+            })
+        }
+        return CSVSearchNavigationResolution(
+            sourceRecordsByRange: sourceRecordsByRange,
+            recordLocationsByRecord: locationsByRecord,
+            displayedRowsByRecord: displayedRows,
+            resolvedSourceRecords: records
+        )
+    }
+}
+
+struct CSVSearchRevealLocation: Sendable, Equatable {
+    let sourceRowNumber: Int64
+    let displayedRow: Int64?
+    let column: Int?
+    let isHeader: Bool
+}
+
 /// A virtual NSTableView backed directly by a sparse CSV byte index. AppKit
 /// creates views only for visible rows; the index stores a hard-capped set of
 /// offsets, and individual cells commit exact byte-range piece-table edits.
 @MainActor
 final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSEditor, NSPopoverDelegate {
+    private static let loadInMemoryHelpText =
+        "This will enable very fast queries like sorting and filtering, but will consume a lot of memory. Make sure your system can handle it."
+
     private static let indexingQueue = DispatchQueue(
         label: "app.lightxt.csv-index",
         qos: .userInitiated,
@@ -63,10 +126,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
     var onStatusChange: ((String, Bool) -> Void)?
     var onEditingRegistrationChange: ((Bool) -> Void)?
+    var onLoadInMemoryRequest: ((DelimitedTextDelimiter, Bool, [String]) -> Void)?
 
     private let controls = NSView()
     private let delimiterPopup = NSPopUpButton()
     private let headerCheckbox = NSButton(checkboxWithTitle: "First row is header", target: nil, action: nil)
+    private lazy var loadInMemoryButton = NSButton(
+        title: "Load CSV in Memory",
+        target: self,
+        action: #selector(loadCSVInMemory(_:))
+    )
     private lazy var clearFiltersButton = QuietButton(
         title: "Clear Filters",
         symbolName: "xmark.circle",
@@ -91,6 +160,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     private var summaryCancellation: CancellationToken?
     private var mutationCancellation: CancellationToken?
     private var exportCancellation: CancellationToken?
+    private var parquetExportOperation: CSVParquetExportOperation?
     private var generation: UInt64 = 0
     private var pageDecodeGeneration: UInt64 = 0
     private var queryGeneration: UInt64 = 0
@@ -131,6 +201,15 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     private var isTableOperationInFlight = false
     private var isQueryLoadingOverlayVisible = false
     private var isSettingSortDescriptors = false
+    /// Search remains document-wide, while the table only materializes visible
+    /// cells. Sorted ranges let each recycled cell determine its highlight in
+    /// logarithmic time without building a row-sized side index.
+    private var searchMatchRanges: [Range<Int64>] = []
+    private var focusedSearchMatchRange: Range<Int64>?
+    private var searchSourceRecordsByRange: [Range<Int64>: Int64] = [:]
+    private var searchRecordLocationsByRecord: [Int64: CSVRowIndex.RecordLocation] = [:]
+    private var searchDisplayedRowsByRecord: [Int64: Int64] = [:]
+    private var searchResolvedSourceRecords: Set<Int64> = []
 #if LIGHTXT_STANDALONE_CSV_QA
     private var qaQueryLaunchCountStorage = 0
     private var qaNextColumnName: String?
@@ -158,7 +237,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         queryCancellation?.cancel()
         summaryCancellation?.cancel()
         mutationCancellation?.cancel()
-        exportCancellation?.cancel()
+        if let parquetExportOperation {
+            parquetExportOperation.cancel()
+        } else {
+            exportCancellation?.cancel()
+        }
         uniqueValuesTask?.cancel()
         pendingFilterQuery?.cancel()
         displayedRowMap?.close()
@@ -166,6 +249,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     func reloadDocument() {
         isResidentPresentationPurged = false
+        invalidateSearchNavigation()
         generation &+= 1
         let currentGeneration = generation
         indexingCancellation?.cancel()
@@ -237,8 +321,13 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         cancelQueryAndCloseRowMap()
         cancelColumnSummaryRequest()
         cancelCSVMutation()
-        exportCancellation?.cancel()
+        if let parquetExportOperation {
+            parquetExportOperation.cancel()
+        } else {
+            exportCancellation?.cancel()
+        }
         exportCancellation = nil
+        parquetExportOperation = nil
         isTableOperationInFlight = false
         cancelUniqueValueRequest()
         pendingFilterQuery?.cancel()
@@ -303,6 +392,227 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         reloadVisibleEditableCells()
     }
 
+    func updateSearchMatches(
+        _ ranges: [Range<Int64>],
+        focusedRange: Range<Int64>? = nil
+    ) {
+        searchMatchRanges = ranges.sorted {
+            if $0.lowerBound != $1.lowerBound { return $0.lowerBound < $1.lowerBound }
+            return $0.upperBound < $1.upperBound
+        }
+        focusedSearchMatchRange = focusedRange
+        reloadVisibleEditableCells()
+    }
+
+    func focusSearchMatch(_ range: Range<Int64>?) {
+        focusedSearchMatchRange = range
+        reloadVisibleEditableCells()
+    }
+
+    func clearSearchMatches() {
+        invalidateSearchNavigation()
+        guard !searchMatchRanges.isEmpty || focusedSearchMatchRange != nil else { return }
+        searchMatchRanges.removeAll(keepingCapacity: true)
+        focusedSearchMatchRange = nil
+        reloadVisibleEditableCells()
+    }
+
+    func makeSearchNavigationContext() -> CSVSearchNavigationContext? {
+        guard let rowIndex else { return nil }
+        return CSVSearchNavigationContext(
+            rowIndex: rowIndex,
+            displayedRowMap: displayedRowMap,
+            firstRowIsHeader: firstRowIsHeader,
+            tableGeneration: generation,
+            queryGeneration: queryGeneration
+        )
+    }
+
+    var isSearchNavigationProjectionSettled: Bool {
+        queryCancellation == nil && pendingFilterQuery == nil
+    }
+
+    func isSearchNavigationContextCurrent(_ context: CSVSearchNavigationContext) -> Bool {
+        generation == context.tableGeneration
+            && queryGeneration == context.queryGeneration
+            && rowIndex === context.rowIndex
+            && displayedRowMap === context.displayedRowMap
+    }
+
+    @discardableResult
+    func installSearchNavigation(
+        _ resolution: CSVSearchNavigationResolution,
+        from context: CSVSearchNavigationContext
+    ) -> Bool {
+        guard isSearchNavigationContextCurrent(context) else { return false }
+        searchSourceRecordsByRange.merge(resolution.sourceRecordsByRange) { _, new in new }
+        searchRecordLocationsByRecord.merge(resolution.recordLocationsByRecord) { _, new in new }
+        searchDisplayedRowsByRecord.merge(resolution.displayedRowsByRecord) { _, new in new }
+        searchResolvedSourceRecords.formUnion(resolution.resolvedSourceRecords)
+        if let rowIndex {
+            latestProgress = rowIndex.progress
+            tableView.reloadData()
+        }
+        return true
+    }
+
+    /// Selects and scrolls the matching CSV row. Projection-aware source-row
+    /// lookup is prepared with the Find Results list; a one-item fallback
+    /// keeps Find Next useful before that asynchronous list is ready.
+    func revealSearchMatch(
+        _ range: Range<Int64>,
+        completion: ((CSVSearchRevealLocation?) -> Void)? = nil
+    ) {
+        focusedSearchMatchRange = range
+        reloadVisibleEditableCells()
+        guard let record = searchSourceRecordsByRange[range] else {
+            guard let context = makeSearchNavigationContext() else {
+                completion?(nil)
+                return
+            }
+            let cancellation = indexingCancellation
+            Self.pageDecodingQueue.async { [weak self] in
+                let resolution = try? context.resolve(
+                    ranges: [range],
+                    cancellation: cancellation
+                )
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          let resolution,
+                          self.focusedSearchMatchRange == range,
+                          self.installSearchNavigation(resolution, from: context) else {
+                        completion?(nil)
+                        return
+                    }
+                    self.revealSearchMatch(range, completion: completion)
+                }
+            }
+            return
+        }
+        guard searchResolvedSourceRecords.contains(record) else {
+            completion?(nil)
+            return
+        }
+        guard let displayedRow = searchDisplayedRowsByRecord[record] else {
+            completion?(CSVSearchRevealLocation(
+                sourceRowNumber: record + 1,
+                displayedRow: nil,
+                column: nil,
+                isHeader: firstRowIsHeader && record == 0
+            ))
+            return
+        }
+        guard displayedRow >= 0,
+              displayedRow <= Int64(Int.max),
+              displayedRow < Int64(numberOfRows(in: tableView)) else {
+            completion?(nil)
+            return
+        }
+
+        let row = Int(displayedRow)
+        tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        tableView.scrollRowToVisible(row)
+        _ = recordForDisplay(record)
+
+        if let parsed = cachedRecords[record] {
+            let column = matchingColumn(for: range, in: parsed)
+            scrollSearchColumnToVisible(column)
+            completion?(CSVSearchRevealLocation(
+                sourceRowNumber: record + 1,
+                displayedRow: displayedRow,
+                column: column,
+                isHeader: false
+            ))
+            return
+        }
+        guard let snapshot,
+              let rowIndex,
+              let location = searchRecordLocationsByRecord[record] else {
+            completion?(CSVSearchRevealLocation(
+                sourceRowNumber: record + 1,
+                displayedRow: displayedRow,
+                column: nil,
+                isHeader: false
+            ))
+            return
+        }
+        let currentGeneration = generation
+        let currentQueryGeneration = queryGeneration
+        let limits = Self.presentationParseLimits
+        let cancellation = indexingCancellation
+        Self.pageDecodingQueue.async { [weak self] in
+            let parsed = try? CSVRecordParser.parse(
+                snapshot: snapshot,
+                location: location,
+                delimiter: rowIndex.delimiter,
+                limits: limits,
+                cancellation: { cancellation?.isCancelled == true }
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.generation == currentGeneration,
+                      self.queryGeneration == currentQueryGeneration,
+                      self.focusedSearchMatchRange == range,
+                      self.searchSourceRecordsByRange[range] == record else {
+                    completion?(nil)
+                    return
+                }
+                if let parsed { self.storeCached(parsed, for: record) }
+                let column: Int?
+                if let parsed {
+                    column = self.matchingColumn(for: range, in: parsed)
+                } else {
+                    column = nil
+                }
+                self.scrollSearchColumnToVisible(column)
+                completion?(CSVSearchRevealLocation(
+                    sourceRowNumber: record + 1,
+                    displayedRow: displayedRow,
+                    column: column,
+                    isHeader: false
+                ))
+            }
+        }
+    }
+
+    private func matchingColumn(for range: Range<Int64>, in record: CSVParsedRecord) -> Int? {
+        record.fields.firstIndex { field in
+            if range.isEmpty {
+                return field.byteRange.lowerBound <= range.lowerBound
+                    && range.lowerBound <= field.byteRange.upperBound
+            }
+            return field.byteRange.overlaps(range)
+        }
+    }
+
+    private func scrollSearchColumnToVisible(_ column: Int?) {
+        guard let column,
+              let tableColumn = tableColumnIndex(forDataColumn: column) else { return }
+        tableView.scrollColumnToVisible(tableColumn)
+    }
+
+    private func invalidateSearchNavigation() {
+        searchSourceRecordsByRange.removeAll(keepingCapacity: true)
+        searchRecordLocationsByRecord.removeAll(keepingCapacity: true)
+        searchDisplayedRowsByRecord.removeAll(keepingCapacity: true)
+        searchResolvedSourceRecords.removeAll(keepingCapacity: true)
+    }
+
+#if LIGHTXT_RUNTIME_QA
+    var runtimeQASelectedDisplayedRow: Int { tableView.selectedRow }
+    var runtimeQALoadInMemoryControlIsReady: Bool {
+        loadInMemoryButton.title == "Load CSV in Memory"
+            && loadInMemoryButton.isEnabled
+            && loadInMemoryButton.toolTip == Self.loadInMemoryHelpText
+    }
+    func runtimeQARequestLoadInMemory() {
+        let names = (0..<columnCount).map { column in
+            tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
+        }
+        onLoadInMemoryRequest?(delimiter, firstRowIsHeader, names)
+    }
+#endif
+
     func exportCurrentView() {
         guard canExportCurrentView else {
             NSSound.beep()
@@ -313,21 +623,27 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         let selectedRows = tableView.selectedRowIndexes
         let accessory = TabularExportAccessoryView(
             selectedRowCount: selectedRows.count,
-            hasHeaders: firstRowIsHeader
+            hasHeaders: firstRowIsHeader,
+            formats: TabularExportFormat.allCases
         )
         let panel = NSSavePanel()
         panel.title = "Export Table"
         panel.prompt = "Export"
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
+        panel.allowsOtherFileTypes = false
         panel.nameFieldStringValue = "Export.csv"
         panel.accessoryView = accessory
         accessory.onFormatChange = { [weak panel] format in
             guard let panel else { return }
+            panel.allowedContentTypes = [
+                UTType(filenameExtension: format.preferredPathExtension) ?? .data,
+            ]
             let base = URL(fileURLWithPath: panel.nameFieldStringValue)
                 .deletingPathExtension().lastPathComponent
             panel.nameFieldStringValue = "\(base).\(format.preferredPathExtension)"
         }
+        panel.allowedContentTypes = [UTType(filenameExtension: "csv") ?? .commaSeparatedText]
 
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self, weak panel] response in
             guard response == .OK, let self, let url = panel?.url else { return }
@@ -342,8 +658,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     func cancelExport() {
         guard let exportCancellation else { return }
-        exportCancellation.cancel()
-        setOperationBusy(text: "Cancelling export…", fraction: nil)
+        if let parquetExportOperation {
+            if parquetExportOperation.cancel() {
+                setOperationBusy(text: "Cancelling export…", fraction: nil)
+            } else {
+                setOperationBusy(text: "Finishing Parquet export…", fraction: nil)
+            }
+        } else {
+            exportCancellation.cancel()
+            setOperationBusy(text: "Cancelling export…", fraction: nil)
+        }
     }
 
     @discardableResult
@@ -456,6 +780,14 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         headerCheckbox.font = .systemFont(ofSize: 13)
         headerCheckbox.setAccessibilityHelp("Keep the first CSV row fixed as column headings")
 
+        loadInMemoryButton.bezelStyle = .rounded
+        loadInMemoryButton.controlSize = .regular
+        loadInMemoryButton.font = .systemFont(ofSize: 12, weight: .medium)
+        loadInMemoryButton.toolTip = Self.loadInMemoryHelpText
+        loadInMemoryButton.setAccessibilityLabel("Load CSV in Memory")
+        loadInMemoryButton.setAccessibilityHelp(Self.loadInMemoryHelpText)
+        loadInMemoryButton.isEnabled = false
+
         clearFiltersButton.toolTip = "Remove every CSV column filter"
         clearFiltersButton.setAccessibilityLabel("Clear all CSV filters")
 
@@ -565,7 +897,14 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             addSubview($0)
         }
         queryLoadingOverlay.isHidden = true
-        [delimiterPopup, headerCheckbox, filterStripScrollView, statusLabel, progressIndicator].forEach {
+        [
+            delimiterPopup,
+            headerCheckbox,
+            loadInMemoryButton,
+            filterStripScrollView,
+            statusLabel,
+            progressIndicator,
+        ].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             controls.addSubview($0)
         }
@@ -589,7 +928,9 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             delimiterPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
             headerCheckbox.leadingAnchor.constraint(equalTo: delimiterPopup.trailingAnchor, constant: 12),
             headerCheckbox.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
-            filterStripScrollView.leadingAnchor.constraint(equalTo: headerCheckbox.trailingAnchor, constant: 12),
+            loadInMemoryButton.leadingAnchor.constraint(equalTo: headerCheckbox.trailingAnchor, constant: 12),
+            loadInMemoryButton.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
+            filterStripScrollView.leadingAnchor.constraint(equalTo: loadInMemoryButton.trailingAnchor, constant: 12),
             filterStripScrollView.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
             filterStripScrollView.heightAnchor.constraint(equalToConstant: 32),
             stripWidth,
@@ -962,6 +1303,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         cell.placeholderString = nil
         cell.isEditable = false
         cell.toolTip = nil
+        cell.searchHighlight = .none
 
         if let parsed = recordForDisplay(record) {
             // An absent field is intentionally editable: committing it appends
@@ -974,6 +1316,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                 cell.stringValue = field.value
                 cell.originalValue = field.value
                 cell.byteRange = field.byteRange
+                cell.searchHighlight = searchHighlight(for: field.byteRange)
                 cell.isEditable = !documentIsReadOnly
                     && !field.wasTruncated
                     && !isTableOperationInFlight
@@ -986,6 +1329,45 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             cell.toolTip = "This bounded row page is loading in the background."
         }
         return cell
+    }
+
+    private func searchHighlight(for fieldRange: Range<Int64>) -> CSVCellSearchHighlight {
+        if let focusedSearchMatchRange,
+           Self.searchRange(focusedSearchMatchRange, intersects: fieldRange) {
+            return .focused
+        }
+        guard !searchMatchRanges.isEmpty else { return .none }
+
+        var lower = 0
+        var upper = searchMatchRanges.count
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            let candidate = searchMatchRanges[middle]
+            let endsBeforeField = candidate.isEmpty
+                ? candidate.lowerBound < fieldRange.lowerBound
+                : candidate.upperBound <= fieldRange.lowerBound
+            if endsBeforeField {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        guard lower < searchMatchRanges.count,
+              Self.searchRange(searchMatchRanges[lower], intersects: fieldRange) else {
+            return .none
+        }
+        return .match
+    }
+
+    private nonisolated static func searchRange(
+        _ match: Range<Int64>,
+        intersects field: Range<Int64>
+    ) -> Bool {
+        if match.isEmpty {
+            return field.contains(match.lowerBound)
+                || field.isEmpty && field.lowerBound == match.lowerBound
+        }
+        return match.overlaps(field)
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -1359,6 +1741,45 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     @objc private func headerSettingChanged(_ sender: NSButton) {
         setFirstRowIsHeader(sender.state == .on)
+    }
+
+    @objc private func loadCSVInMemory(_ sender: Any?) {
+        guard latestProgress?.isComplete == true,
+              columnCount > 0,
+              !isTableOperationInFlight,
+              mutationCancellation == nil,
+              commitPendingEdit() else {
+            NSSound.beep()
+            return
+        }
+
+        let columnNames = (0..<columnCount).map { column in
+            tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
+        }
+        let request = { [weak self] in
+            guard let self else { return }
+            self.onLoadInMemoryRequest?(
+                self.delimiter,
+                self.firstRowIsHeader,
+                columnNames
+            )
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Load CSV in Memory?"
+        alert.informativeText = Self.loadInMemoryHelpText
+            + " The in-memory copy is temporary and will be unloaded when you leave View."
+        alert.addButton(withTitle: "Load in Memory")
+        alert.addButton(withTitle: "Cancel")
+        if let window {
+            alert.beginSheetModal(for: window) { response in
+                guard response == .alertFirstButtonReturn else { return }
+                request()
+            }
+        } else if alert.runModal() == .alertFirstButtonReturn {
+            request()
+        }
     }
 
     @objc private func delimiterSettingChanged(_ sender: NSPopUpButton) {
@@ -2065,6 +2486,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         guard hasProjection else {
             let oldMap = displayedRowMap
             displayedRowMap = nil
+            invalidateSearchNavigation()
             oldMap?.close()
             pageDecodeGeneration &+= 1
             pendingPages.removeAll(keepingCapacity: true)
@@ -2157,6 +2579,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                     }
                     let oldMap = self.displayedRowMap
                     self.displayedRowMap = map
+                    self.invalidateSearchNavigation()
                     oldMap?.close()
                     self.pageDecodeGeneration &+= 1
                     self.pendingPages.removeAll(keepingCapacity: true)
@@ -2268,6 +2691,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         queryCancellation = nil
         displayedRowMap?.close()
         displayedRowMap = nil
+        invalidateSearchNavigation()
         pageDecodeGeneration &+= 1
         pendingPages.removeAll(keepingCapacity: true)
         isTableOperationInFlight = false
@@ -3018,6 +3442,59 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     var qaPresentedTableIsEnabled: Bool { tableView.isEnabled }
     var qaPopoverContentView: NSView? { presentedPopover?.contentViewController?.view }
 
+    func qaUpdateSearchMatches(
+        _ ranges: [Range<Int64>],
+        focusedRange: Range<Int64>? = nil
+    ) {
+        updateSearchMatches(ranges, focusedRange: focusedRange)
+    }
+
+    func qaResolveSearchNavigation(
+        _ ranges: [Range<Int64>]
+    ) throws -> CSVSearchNavigationResolution {
+        guard let context = makeSearchNavigationContext() else {
+            throw CSVRowIndex.IndexError.inconsistentCheckpointData
+        }
+        let resolution = try context.resolve(ranges: ranges)
+        guard installSearchNavigation(resolution, from: context) else {
+            throw CSVRowIndex.IndexError.inconsistentCheckpointData
+        }
+        return resolution
+    }
+
+    func qaRevealSearchMatch(_ range: Range<Int64>) {
+        revealSearchMatch(range)
+    }
+
+    var qaSelectedDisplayedRow: Int { tableView.selectedRow }
+
+    func qaExportCurrentView(to url: URL, format: TabularExportFormat) {
+        beginExport(
+            to: url,
+            request: TabularExportRequest(
+                format: format,
+                scope: .currentView,
+                includesHeaders: true
+            )
+        )
+    }
+
+    func qaSearchHighlight(displayedRow: Int, dataColumn: Int) -> String? {
+        guard displayedRow >= 0,
+              displayedRow < tableView.numberOfRows,
+              let visualColumn = tableColumnIndex(forDataColumn: dataColumn),
+              let field = tableView.view(
+                  atColumn: visualColumn,
+                  row: displayedRow,
+                  makeIfNecessary: true
+              ) as? CSVEditableTextField else { return nil }
+        switch field.searchHighlight {
+        case .none: return "none"
+        case .match: return "match"
+        case .focused: return "focused"
+        }
+    }
+
     func qaPreparePopoverCaptureBackground() {
         (presentedPopover?.contentViewController as? CSVFilterPopoverViewController)?
             .qaPrepareCaptureBackground()
@@ -3113,6 +3590,15 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     var qaCachedSourceRecords: Set<Int64> { Set(cachedRecords.keys) }
     var qaPendingRecordLoadCount: Int { pendingPages.count }
+    var qaLoadInMemoryButtonTitle: String { loadInMemoryButton.title }
+    var qaLoadInMemoryHelpText: String { loadInMemoryButton.toolTip ?? "" }
+    var qaLoadInMemoryIsEnabled: Bool { loadInMemoryButton.isEnabled }
+    func qaRequestLoadInMemory() {
+        let names = (0..<columnCount).map { column in
+            tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
+        }
+        onLoadInMemoryRequest?(delimiter, firstRowIsHeader, names)
+    }
     func qaResetRecordCache() {
         cachedRecords.removeAll(keepingCapacity: true)
         cacheOrder.removeAll(keepingCapacity: true)
@@ -3142,6 +3628,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         progressIndicator.isHidden = !busy
         headerCheckbox.isEnabled = latestProgress?.isComplete == true && !isTableOperationInFlight
         delimiterPopup.isEnabled = !isTableOperationInFlight
+        loadInMemoryButton.isEnabled = latestProgress?.isComplete == true
+            && columnCount > 0
+            && !isTableOperationInFlight
+            && mutationCancellation == nil
+            && !isEditingRegistered
         onStatusChange?(text, busy)
     }
 
@@ -3153,6 +3644,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         progressIndicator.isHidden = false
         headerCheckbox.isEnabled = false
         delimiterPopup.isEnabled = false
+        loadInMemoryButton.isEnabled = false
         onStatusChange?(text, true)
         reloadVisibleEditableCells()
     }
@@ -3250,8 +3742,12 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
               visible.length > 0,
               tableView.tableColumns.count > 1 else { return }
         let dataColumns = IndexSet(
-            tableView.tableColumns.indices.filter { dataColumn(forTableColumnIndex: $0) != nil }
+            tableView.tableColumns.indices.filter {
+                dataColumn(forTableColumnIndex: $0) != nil
+                    && tableView.rect(ofColumn: $0).intersects(tableView.visibleRect)
+            }
         )
+        guard !dataColumns.isEmpty else { return }
         tableView.reloadData(
             forRowIndexes: IndexSet(
                 integersIn: visible.location..<(visible.location + visible.length)
@@ -3272,7 +3768,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             // the handoff from the sheet to the export queue.
             let accessStarted = url.startAccessingSecurityScopedResource()
             defer { if accessStarted { url.stopAccessingSecurityScopedResource() } }
-            expectedDestination = try TabularExportSink.expectedDestination(at: url)
+            if request.format == .parquet {
+                expectedDestination = try CSVParquetExportOperation.expectedDestination(at: url)
+            } else {
+                expectedDestination = try TabularExportSink.expectedDestination(at: url)
+            }
         } catch {
             report(error)
             return
@@ -3302,7 +3802,8 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         let cancellation = CancellationToken()
         exportCancellation = cancellation
         isTableOperationInFlight = true
-        setOperationBusy(text: "Exporting table…", fraction: 0)
+        let exportVerb = format == .parquet ? "Preparing Parquet" : "Exporting"
+        setOperationBusy(text: "\(exportVerb) table…", fraction: 0)
 
         Self.exportQueue.async { [weak self] in
             let accessStarted = url.startAccessingSecurityScopedResource()
@@ -3311,12 +3812,33 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             }
             let result: Result<Int64, Error>
             do {
-                let sink = try TabularExportSink(
-                    targetURL: url,
-                    format: format,
-                    headers: headers,
-                    expectedDestination: expectedDestination
-                )
+                let textSink: TabularExportSink?
+                let parquetOperation: CSVParquetExportOperation?
+                if format == .parquet {
+                    textSink = nil
+                    let operation = try CSVParquetExportOperation(
+                        targetURL: url,
+                        columnNames: columnNames,
+                        expectedDestination: expectedDestination,
+                        cancellation: cancellation
+                    )
+                    parquetOperation = operation
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.exportCancellation === cancellation else {
+                            operation.cancel()
+                            return
+                        }
+                        self.parquetExportOperation = operation
+                    }
+                } else {
+                    textSink = try TabularExportSink(
+                        targetURL: url,
+                        format: format,
+                        headers: headers,
+                        expectedDestination: expectedDestination
+                    )
+                    parquetOperation = nil
+                }
                 var completed: Int64 = 0
                 var lastProgress = ContinuousClock.now
 
@@ -3330,12 +3852,12 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                         if let fraction = update.fractionCompleted {
                             let percent = Int(fraction * 100)
                             self.setOperationBusy(
-                                text: "Exporting \(percent)%  ·  \(completed.formatted()) rows",
+                                text: "\(exportVerb) \(percent)%  ·  \(update.rowsWritten.formatted()) rows",
                                 fraction: fraction
                             )
                         } else {
                             self.setOperationBusy(
-                                text: "Exporting…  ·  \(completed.formatted()) rows",
+                                text: "\(exportVerb)…  ·  \(update.rowsWritten.formatted()) rows",
                                 fraction: nil
                             )
                         }
@@ -3363,7 +3885,12 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                             ]
                         )
                     }
-                    try sink.append(row: columns.map { selected.fields[$0]?.value })
+                    let row = columns.map { selected.fields[$0]?.value }
+                    if let parquetOperation {
+                        try parquetOperation.append(row: row)
+                    } else if let textSink {
+                        try textSink.append(row: row)
+                    }
                     completed += 1
                     reportProgress()
                 }
@@ -3437,11 +3964,24 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                         }
                     }
                     if cancellation.isCancelled { throw CancellationError() }
-                    try sink.finish()
+                    if let parquetOperation {
+                        let stagedRows = completed
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, self.exportCancellation === cancellation else { return }
+                            self.setOperationBusy(
+                                text: "Converting \(stagedRows.formatted()) rows to Parquet…",
+                                fraction: nil
+                            )
+                        }
+                        _ = try parquetOperation.finish()
+                    } else if let textSink {
+                        try textSink.finish()
+                    }
                     reportProgress(force: true)
                     result = .success(completed)
                 } catch {
-                    sink.cancel()
+                    textSink?.cancel()
+                    parquetOperation?.cancel()
                     throw error
                 }
             } catch {
@@ -3451,6 +3991,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.exportCancellation === cancellation else { return }
                 self.exportCancellation = nil
+                self.parquetExportOperation = nil
                 self.isTableOperationInFlight = false
                 switch result {
                 case .success(let rows):
@@ -3815,6 +4356,12 @@ private final class CSVQueryLoadingIndicatorView: NSView {
     }
 }
 
+private enum CSVCellSearchHighlight: Equatable {
+    case none
+    case match
+    case focused
+}
+
 @MainActor
 private final class CSVEditableTextField: NSTextField {
     var displayedRow: Int64 = 0
@@ -3823,6 +4370,27 @@ private final class CSVEditableTextField: NSTextField {
     var byteRange: Range<Int64>?
     var originalValue = ""
     var originalFieldCount = 0
+    var searchHighlight: CSVCellSearchHighlight = .none {
+        didSet {
+            if oldValue != searchHighlight { needsDisplay = true }
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if searchHighlight != .none {
+            let source = searchHighlight == .focused
+                ? LighTxtTheme.selection
+                : LighTxtTheme.match
+            let color = LighTxtTheme.resolved(source, for: effectiveAppearance)
+            color.setFill()
+            NSBezierPath(
+                roundedRect: bounds.insetBy(dx: 2, dy: 2),
+                xRadius: 4,
+                yRadius: 4
+            ).fill()
+        }
+        super.draw(dirtyRect)
+    }
 }
 #endif
 

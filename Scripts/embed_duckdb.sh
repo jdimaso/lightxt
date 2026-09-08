@@ -7,12 +7,17 @@ readonly DUCKDB_ARCHIVE_SHA256="33f840404e3b420600936d5b59d342680aa4af41cc06d9a5
 readonly DUCKDB_ARCHIVE="${SRCROOT:?}/ThirdParty/DuckDB/libduckdb-osx-universal-${DUCKDB_VERSION}.zip"
 readonly DUCKDB_LICENSE_FILE_LIST="${SRCROOT}/ThirdParty/DuckDB/DuckDBLicenses.xcfilelist"
 readonly DUCKDB_LICENSE_MANIFEST_PREFIX='$(SRCROOT)/ThirdParty/DuckDB/Licenses/'
-readonly EXTRACT_DIRECTORY="${DERIVED_FILE_DIR:?}/LighTxt-DuckDB-${DUCKDB_VERSION}"
+readonly EXTRACT_DIRECTORY="${TEMP_DIR:?}/LighTxt-DuckDB-${DUCKDB_VERSION}"
 readonly FRAMEWORKS_DIRECTORY="${TARGET_BUILD_DIR:?}/${FRAMEWORKS_FOLDER_PATH:?}"
 readonly LIBRARY_DESTINATION="${FRAMEWORKS_DIRECTORY}/libduckdb.dylib"
 readonly RESOURCES_DIRECTORY="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH:?}"
 readonly LICENSE_DESTINATION="${RESOURCES_DIRECTORY}/DuckDB-Licenses"
 readonly COMPLETION_STAMP="${DERIVED_FILE_DIR}/LighTxt-DuckDB-${DUCKDB_VERSION}.stamp"
+
+cleanup_extract_directory() {
+    /bin/rm -rf "$EXTRACT_DIRECTORY"
+}
+trap cleanup_extract_directory EXIT
 
 fail() {
     print -u2 "DuckDB embed failed: $1"
@@ -27,8 +32,9 @@ ACTUAL_SHA256="$(/usr/bin/shasum -a 256 "$DUCKDB_ARCHIVE" | /usr/bin/awk '{print
     fail "Archive SHA-256 is $ACTUAL_SHA256, expected $DUCKDB_ARCHIVE_SHA256."
 }
 
-# Both destinations are confined to Xcode-owned build directories. Recreate
-# them so a version change cannot leave stale headers or license files behind.
+# Extraction is disposable Xcode-owned scratch space. Bundle outputs are
+# updated in place because Xcode's script sandbox grants access to the exact
+# declared files, not recursive deletion of their containing directories.
 /bin/rm -rf "$EXTRACT_DIRECTORY"
 /bin/mkdir -p "$EXTRACT_DIRECTORY" "$FRAMEWORKS_DIRECTORY" "$RESOURCES_DIRECTORY"
 /usr/bin/ditto -x -k "$DUCKDB_ARCHIVE" "$EXTRACT_DIRECTORY"
@@ -61,8 +67,24 @@ for architecture in arm64 x86_64; do
     }
 done
 
-/usr/bin/ditto "$EXTRACTED_LIBRARY" "$LIBRARY_DESTINATION"
-/bin/rm -rf "$LICENSE_DESTINATION"
+if [[ "${CODE_SIGNING_ALLOWED:-YES}" == "NO" ]]; then
+    /usr/bin/codesign --force --sign - --timestamp=none "$EXTRACTED_LIBRARY"
+else
+    readonly SIGNING_IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:-}"
+    [[ -n "$SIGNING_IDENTITY" ]] || fail "Xcode did not provide an expanded signing identity."
+    # Build phases must be deterministic/offline. Archive export or the
+    # existing Developer-ID release signing pass applies the trusted timestamp
+    # when it re-signs the complete bundle inside-out.
+    /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime --timestamp=none "$EXTRACTED_LIBRARY"
+fi
+/usr/bin/codesign --verify --strict --verbose=2 "$EXTRACTED_LIBRARY"
+
+# Copy directly to the declared output. `ditto` creates sibling bookkeeping
+# files while replacing an existing destination, which Xcode's user-script
+# sandbox correctly rejects on incremental builds. Signing in TEMP_DIR first
+# likewise avoids codesign's adjacent scratch files inside the app bundle.
+/bin/rm -f "$LIBRARY_DESTINATION"
+/bin/cp -f -X "$EXTRACTED_LIBRARY" "$LIBRARY_DESTINATION"
 /bin/mkdir -p "$LICENSE_DESTINATION"
 license_file_count=0
 while IFS= read -r declared_license; do
@@ -76,21 +98,10 @@ while IFS= read -r declared_license; do
     license_destination="${LICENSE_DESTINATION}/${relative_license}"
     [[ -f "$license_source" ]] || fail "Declared license is missing: $license_source"
     /bin/mkdir -p "${license_destination:h}"
-    /bin/cp -X "$license_source" "$license_destination"
+    /bin/cp -f -X "$license_source" "$license_destination"
     license_file_count=$((license_file_count + 1))
 done < "$DUCKDB_LICENSE_FILE_LIST"
 [[ "$license_file_count" == "32" ]] || fail "Expected 32 license files, copied $license_file_count."
-
-if [[ "${CODE_SIGNING_ALLOWED:-YES}" == "NO" ]]; then
-    /usr/bin/codesign --force --sign - --timestamp=none "$LIBRARY_DESTINATION"
-else
-    readonly SIGNING_IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:-}"
-    [[ -n "$SIGNING_IDENTITY" ]] || fail "Xcode did not provide an expanded signing identity."
-    # Build phases must be deterministic/offline. Archive export or the
-    # existing Developer-ID release signing pass applies the trusted timestamp
-    # when it re-signs the complete bundle inside-out.
-    /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" --options runtime --timestamp=none "$LIBRARY_DESTINATION"
-fi
 
 /usr/bin/codesign --verify --strict --verbose=2 "$LIBRARY_DESTINATION"
 [[ -f "$LICENSE_DESTINATION/LICENSE" ]] || fail "DuckDB license was not copied."

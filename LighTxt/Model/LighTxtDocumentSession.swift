@@ -724,6 +724,18 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         }
     }
 
+    /// Activates a retained Find All result without launching another scan.
+    /// The full SearchMatch is kept so regex capture groups remain available
+    /// to Replace Current when a result row is selected.
+    func focusSearchMatch(_ match: SearchMatch?) {
+        currentMatch = match
+        if let match { lastSelection = match.byteRange }
+    }
+
+    func cancelSearchOperation() {
+        searchController.cancel()
+    }
+
     func findNext(backwards: Bool, from selection: Range<Int64>? = nil) {
         guard !searchQuery.isEmpty else { return }
         let selection = selection ?? lastSelection
@@ -769,13 +781,22 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         }
     }
 
-    func findAll() {
+    func findAll(
+        retainedLimit: Int = 20_000,
+        scanMatchLimit: Int? = nil
+    ) {
         guard !searchQuery.isEmpty else { return }
-        callbacks.statusChanged?("Searching entire file…", true, false)
+        callbacks.statusChanged?(
+            scanMatchLimit == nil ? "Searching entire file…" : "Finding the first matches…",
+            true,
+            false
+        )
         searchController.findAll(
             query: searchQuery,
             regularExpression: searchUsesRegularExpression,
             options: currentSearchOptions,
+            retainedLimit: retainedLimit,
+            scanMatchLimit: scanMatchLimit,
             progress: { [weak self] update in
                 self?.callbacks.statusChanged?(
                     "Searching \(Int(update.fractionCompleted * 100))%  ·  \(update.matchesFound.formatted()) \(update.matchesFound == 1 ? "match" : "matches")",
@@ -788,12 +809,20 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
                 switch result {
                 case let .success(summary):
                     self.callbacks.findAllCompleted?(summary)
-                    let suffix = summary.retainedLimitReached ? " (first results retained)" : ""
-                    self.callbacks.statusChanged?(
-                        "\(summary.totalMatches.formatted()) \(summary.totalMatches == 1 ? "match" : "matches") in \(summary.elapsed.formatted(.number.precision(.fractionLength(2)))) s\(suffix)",
-                        false,
-                        false
-                    )
+                    if summary.isComplete {
+                        let suffix = summary.retainedLimitReached ? " (first results retained)" : ""
+                        self.callbacks.statusChanged?(
+                            "\(summary.totalMatches.formatted()) \(summary.totalMatches == 1 ? "match" : "matches") in \(summary.elapsed.formatted(.number.precision(.fractionLength(2)))) s\(suffix)",
+                            false,
+                            false
+                        )
+                    } else {
+                        self.callbacks.statusChanged?(
+                            "Showing first \(summary.totalMatches.formatted()) matches  ·  Find All to count",
+                            false,
+                            false
+                        )
+                    }
                 case .failure(let error as CancellationError):
                     _ = error
                     self.callbacks.statusChanged?("Search cancelled", false, false)

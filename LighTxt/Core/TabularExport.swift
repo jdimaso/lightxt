@@ -9,6 +9,11 @@ public nonisolated enum TabularExportFormat: String, CaseIterable, Sendable {
     case tsv
     case pipe
     case jsonLines
+    case parquet
+
+    public static var textFormats: [TabularExportFormat] {
+        [.csv, .tsv, .pipe, .jsonLines]
+    }
 
     public var displayName: String {
         switch self {
@@ -16,6 +21,7 @@ public nonisolated enum TabularExportFormat: String, CaseIterable, Sendable {
         case .tsv: "TSV (tab-delimited)"
         case .pipe: "Pipe-delimited"
         case .jsonLines: "JSON Lines"
+        case .parquet: "Parquet"
         }
     }
 
@@ -25,6 +31,7 @@ public nonisolated enum TabularExportFormat: String, CaseIterable, Sendable {
         case .tsv: "tsv"
         case .pipe: "psv"
         case .jsonLines: "jsonl"
+        case .parquet: "parquet"
         }
     }
 
@@ -33,7 +40,18 @@ public nonisolated enum TabularExportFormat: String, CaseIterable, Sendable {
         case .csv: 0x2C
         case .tsv: 0x09
         case .pipe: 0x7C
-        case .jsonLines: nil
+        case .jsonLines, .parquet: nil
+        }
+    }
+}
+
+public nonisolated enum TabularExportError: Error, LocalizedError, Equatable {
+    case formatRequiresDedicatedWriter(TabularExportFormat)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .formatRequiresDedicatedWriter(format):
+            return "\(format.displayName) export requires its dedicated writer."
         }
     }
 }
@@ -80,6 +98,9 @@ nonisolated final class TabularExportSink: @unchecked Sendable {
         headers: [String]?,
         expectedDestination: FileFingerprint?
     ) throws {
+        guard format != .parquet else {
+            throw TabularExportError.formatRequiresDedicatedWriter(format)
+        }
         let target = targetURL.standardizedFileURL
         guard try FileFingerprint.atPath(target.path) == expectedDestination else {
             throw LighTxtCoreError.fileChangedExternally(path: target.path)

@@ -5,6 +5,10 @@ struct SearchSummary: Sendable {
     let totalMatches: Int
     let retainedMatches: [SearchMatch]
     let retainedLimitReached: Bool
+    /// False when an intentionally bounded interactive search stopped before
+    /// EOF. In that case `totalMatches` is the number found so far, not a file
+    /// total.
+    let isComplete: Bool
     let elapsed: TimeInterval
 }
 
@@ -111,6 +115,7 @@ final class DocumentSearchController {
         regularExpression: Bool,
         options: SearchOptions = .init(),
         retainedLimit: Int = 20_000,
+        scanMatchLimit: Int? = nil,
         progress: ProgressHandler? = nil,
         completion: @escaping SummaryHandler
     ) {
@@ -129,6 +134,7 @@ final class DocumentSearchController {
             ? .regularExpression(query)
             : .literal(query)
         let safeLimit = min(100_000, max(0, retainedLimit))
+        let safeScanLimit = scanMatchLimit.map { min(100_000, max(1, $0)) }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let started = CFAbsoluteTimeGetCurrent()
@@ -137,6 +143,7 @@ final class DocumentSearchController {
                 let snapshot = try engine.snapshot()
                 var retained: [SearchMatch] = []
                 retained.reserveCapacity(min(safeLimit, 2_048))
+                var observedMatches = 0
                 var lastProgressUpdate = CFAbsoluteTimeGetCurrent()
                 let searchResult = try snapshot.search(
                     pattern,
@@ -152,15 +159,18 @@ final class DocumentSearchController {
                         }
                     },
                     matchHandler: { match in
+                        observedMatches += 1
                         if retained.count < safeLimit { retained.append(match) }
-                        return true
+                        return safeScanLimit.map { observedMatches < $0 } ?? true
                     }
                 )
                 if searchResult.stopReason == .cancelled { throw CancellationError() }
                 result = .success(SearchSummary(
                     totalMatches: searchResult.matchesFound,
                     retainedMatches: retained,
-                    retainedLimitReached: searchResult.matchesFound > retained.count,
+                    retainedLimitReached: searchResult.stopReason != .completed
+                        || searchResult.matchesFound > retained.count,
+                    isComplete: searchResult.stopReason == .completed,
                     elapsed: CFAbsoluteTimeGetCurrent() - started
                 ))
             } catch {

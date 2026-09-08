@@ -197,6 +197,7 @@ preflight() {
         CSVSessionMutationRuntimeQA.swift
         CSVTableRuntimeQA.swift
         DocumentChromeRuntimeQA.swift
+        DocumentSearchControllerRuntimeQA.swift
         EditorScrollingRuntimeQA.swift
         LighTxtRuntimeDriver.swift
         MarkdownRendererRuntimeQA.swift
@@ -315,6 +316,11 @@ qa_hosted_document_workflow() {
     local app_pid_file="$workspace/workflow-runtime-qa.pid"
     /bin/mkdir -p "$workspace"
     /bin/rm -f "$result" "$app_pid_file"
+    # Stage repository-owned inputs before launching the sandboxed app. Reading
+    # them directly from Documents can block on macOS privacy coordination.
+    /bin/cp \
+        "$REPOSITORY_ROOT/Tests/Fixtures/Parquet/query-service.parquet" \
+        "$workspace/workflow-delta.parquet"
 
     # LaunchServices is required here: a directly executed .app binary cannot
     # become the active application, so AppKit will never deliver genuine
@@ -420,6 +426,22 @@ qa_document_chrome() {
     "$executable"
 }
 
+qa_document_search_controller() {
+    local executable="$BIN_DIRECTORY/DocumentSearchControllerRuntimeQA"
+    swift_qa "$executable" \
+        -DLIGHTXT_STANDALONE_DOCUMENT_SEARCH_QA \
+        LighTxt/Core/LighTxtCoreError.swift \
+        LighTxt/Core/ExternalFileMonitor.swift \
+        LighTxt/Core/MemoryMappedFile.swift \
+        LighTxt/Core/StreamingFileWriter.swift \
+        LighTxt/Core/RecoveryJournal.swift \
+        LighTxt/Core/FileBackedPieceTable.swift \
+        LighTxt/Core/StreamingSearch.swift \
+        LighTxt/Model/DocumentSearchController.swift \
+        Tests/Runtime/DocumentSearchControllerRuntimeQA.swift
+    "$executable"
+}
+
 qa_runtime_driver_smoke() {
     local executable="$BIN_DIRECTORY/LighTxtRuntimeDriver"
     local fixture="$SUITE_TEMP_DIRECTORY/runtime-driver-smoke.json"
@@ -501,6 +523,7 @@ qa_csv_table() {
         -import-objc-header LighTxt/LighTxt-Bridging-Header.h \
         -Xcc -I -Xcc LighTxt/Vendor/JSONAccelerator/include \
         LighTxt/Core/LighTxtCoreError.swift \
+        LighTxt/Core/ExternalFileMonitor.swift \
         LighTxt/Core/MemoryMappedFile.swift \
         LighTxt/Core/StreamingFileWriter.swift \
         LighTxt/Core/RecoveryJournal.swift \
@@ -508,6 +531,8 @@ qa_csv_table() {
         LighTxt/Core/CSVDocumentIndex.swift \
         LighTxt/Core/CSVDataOperations.swift \
         LighTxt/Core/TabularExport.swift \
+        LighTxt/Core/ParquetQueryService.swift \
+        LighTxt/Core/CSVParquetExportOperation.swift \
         LighTxt/UI/LighTxtTheme.swift \
         LighTxt/UI/LighTxtComfortScroller.swift \
         LighTxt/UI/TabularExportAccessoryView.swift \
@@ -516,7 +541,8 @@ qa_csv_table() {
         "$NATIVE_DIRECTORY/LighTxtJSONAccelerator.o" \
         "$NATIVE_DIRECTORY/simdjson.o" \
         -Xlinker -lc++
-    "$executable" Tests/Fixtures/RuntimeQA.csv "$output"
+    LIGHTXT_DUCKDB_LIBRARY_PATH="$DUCKDB_LIBRARY" \
+        "$executable" Tests/Fixtures/RuntimeQA.csv "$output"
 }
 
 generate_editor_scrolling_fixture() {
@@ -587,6 +613,7 @@ qa_parquet_table() {
         LighTxt/Core/MemoryMappedFile.swift \
         LighTxt/Core/TabularExport.swift \
         LighTxt/Core/ParquetQueryService.swift \
+        LighTxt/Core/CSVInMemoryQueryService.swift \
         LighTxt/UI/LighTxtComfortScroller.swift \
         LighTxt/UI/TabularExportAccessoryView.swift \
         LighTxt/UI/CSVTableView.swift \
@@ -625,12 +652,14 @@ run_selected_runtime_qa() {
     # SwiftPM/AppKit boundary. Full mode is the release and handoff gate.
     if [[ "$MODE" == fast ]]; then
         run_step "Runtime QA: document chrome" qa_document_chrome
+        run_step "Runtime QA: bounded and exhaustive document search" qa_document_search_controller
         run_step "Runtime QA: CSV mutation transaction" qa_csv_session_mutation
         run_step "Runtime QA: structured view" qa_structured_view
         return
     fi
 
     run_step "Runtime QA: document chrome" qa_document_chrome
+    run_step "Runtime QA: bounded and exhaustive document search" qa_document_search_controller
     run_step "Runtime QA: non-AX driver smoke" qa_runtime_driver_smoke
     run_step "Runtime QA: CSV mutation transaction" qa_csv_session_mutation
     run_step "Runtime QA: CSV table" qa_csv_table

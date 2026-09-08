@@ -31,6 +31,46 @@ final class CSVDocumentIndexTests: XCTestCase {
         XCTAssertNil(try index.recordLocation(forRecord: 3))
     }
 
+    func testByteOffsetLookupReturnsContainingLogicalRecord() throws {
+        let source = Data("name,notes\r\nAlice,\"hello,\nworld\"\r\nBob,done".utf8)
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(source, at: 0)
+        let snapshot = try engine.snapshot()
+        let index = try CSVRowIndex(
+            snapshot: snapshot,
+            configuration: .init(readChunkByteCount: 5, initialCheckpointRecordInterval: 1)
+        )
+
+        let aliceOffset = Int64(try XCTUnwrap(source.range(of: Data("world".utf8))).lowerBound)
+        let alice = try XCTUnwrap(index.recordLocation(containingByteOffset: aliceOffset))
+        XCTAssertEqual(alice.record, 1)
+        XCTAssertEqual(
+            String(decoding: try snapshot.data(in: alice.contentRange), as: UTF8.self),
+            "Alice,\"hello,\nworld\""
+        )
+
+        let carriageReturn = Int64(try XCTUnwrap(source.range(of: Data("\r\n".utf8))).lowerBound)
+        XCTAssertEqual(
+            try index.recordLocation(containingByteOffset: carriageReturn)?.record,
+            0
+        )
+        XCTAssertEqual(
+            try index.recordLocation(containingByteOffset: carriageReturn + 1)?.record,
+            0
+        )
+
+        let bobOffset = Int64(try XCTUnwrap(source.range(of: Data("Bob".utf8))).lowerBound)
+        XCTAssertEqual(try index.recordLocation(containingByteOffset: bobOffset)?.record, 2)
+        XCTAssertEqual(
+            try index.recordLocations(
+                containingByteOffsets: [bobOffset, aliceOffset, aliceOffset, snapshot.byteCount]
+            ).map { $0?.record },
+            [2, 1, 1, nil]
+        )
+        XCTAssertNil(try index.recordLocation(containingByteOffset: snapshot.byteCount))
+        XCTAssertThrowsError(try index.recordLocation(containingByteOffset: -1))
+    }
+
     func testNativeAndSwiftScannersMatchAcrossAdversarialChunkBoundaries() throws {
         let fixtures: [(String, Int)] = [
             ("a,b\r\nc,d\r\n", 4),                    // CR | LF split
@@ -632,6 +672,55 @@ final class CSVDocumentIndexTests: XCTestCase {
             sorted.1,
             baseline.1,
             "External merge passes must consume persisted keys, not sparse source rescans"
+        )
+    }
+
+    func testExternalHeapMergeHandlesMultiplePassesAndFramesLargerThanReadBuffer() throws {
+        let padding = String(repeating: "x", count: 300 << 10)
+        let rows = [
+            ("c-\(padding)", "2"),
+            ("a-\(padding)", "2"),
+            ("b-\(padding)", "2"),
+            ("a-\(padding)", "1"),
+            ("", "9"),
+            ("c-\(padding)", "2"),
+            ("d-\(padding)", "0"),
+            ("e-\(padding)", "0"),
+        ]
+        var source = Data("key,rank\n".utf8)
+        for (key, rank) in rows {
+            source.append(Data("\(key),\(rank)\n".utf8))
+        }
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(source, at: 0)
+        let snapshot = try engine.snapshot()
+        let map = try CSVRowQueryEngine.execute(
+            snapshot: snapshot,
+            index: CSVRowIndex(snapshot: snapshot),
+            query: CSVRowQuery(
+                firstRecord: 1,
+                sortDescriptors: [
+                    CSVSortDescriptor(column: 0, valueKind: .text),
+                    CSVSortDescriptor(column: 1, order: .descending, valueKind: .number),
+                ]
+            ),
+            configuration: .init(
+                pageRecordCount: 2,
+                maximumValueBytesPerField: 1 << 20,
+                maximumRetainedValueBytesPerRecord: 2 << 20,
+                sortRunMemoryByteCount: 64 << 10,
+                mergeFanIn: 3
+            )
+        )
+        defer { map.close() }
+
+        // Each non-empty key is larger than the run reader's buffer. A fan-in
+        // of three and a one-entry memory budget also force multiple merge levels.
+        XCTAssertEqual(try map.records(in: 0..<map.rowCount), [2, 4, 3, 1, 6, 7, 8, 5])
+        XCTAssertFalse(map.isSourceOrdered)
+        XCTAssertEqual(
+            try map.displayedRows(forSourceRecords: [1, 4, 5, 99]),
+            [4: 1, 1: 3, 5: 7]
         )
     }
 

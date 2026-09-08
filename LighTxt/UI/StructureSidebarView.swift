@@ -25,6 +25,24 @@ struct StructureSearchResult: Sendable, Equatable {
     let match: SearchMatch
     let text: String
     let highlightUTF16Range: Range<Int>
+    /// Physical CSV record ordinal. Nil for non-CSV results or when resolving
+    /// it would require work outside the currently available sparse index.
+    let csvRecord: Int64?
+    let csvIsHeader: Bool
+
+    init(
+        match: SearchMatch,
+        text: String,
+        highlightUTF16Range: Range<Int>,
+        csvRecord: Int64? = nil,
+        csvIsHeader: Bool = false
+    ) {
+        self.match = match
+        self.text = text
+        self.highlightUTF16Range = highlightUTF16Range
+        self.csvRecord = csvRecord
+        self.csvIsHeader = csvIsHeader
+    }
 }
 
 /// UI-facing tree node used by both the bounded viewport discovery path and a
@@ -215,6 +233,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         documentByteCount: Int64? = nil,
         preservingExpansion: Bool = true
     ) {
+        collapseAllButton.isHidden = false
         let expanded = preservingExpansion ? expandedIdentifiers() : []
         roots = nodes
         titleLabel.stringValue = title
@@ -275,6 +294,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
     }
 
     func showMessage(title: String, detail: String, scope: String) {
+        collapseAllButton.isHidden = false
         roots = []
         locationDocumentByteCount = nil
         titleLabel.stringValue = presentation == .fullWorkspace ? "JSON Explorer" : "Structure"
@@ -287,6 +307,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
     }
 
     func showLoading(_ state: StructureSidebarLoadingState) {
+        collapseAllButton.isHidden = false
         currentLoadingState = state
         locationDocumentByteCount = state.totalByteCount.flatMap { $0 > 0 ? $0 : nil }
         titleLabel.stringValue = presentation == .fullWorkspace ? "JSON Explorer" : "Structure"
@@ -327,6 +348,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         viewportBaseOffset: Int64,
         fileType: SyntaxFileType
     ) {
+        collapseAllButton.isHidden = false
         locationDocumentByteCount = nil
         titleLabel.stringValue = presentation == .fullWorkspace ? "Document Structure" : "Structure"
         guard fileType == .json || fileType == .xml || fileType == .yaml else {
@@ -397,24 +419,39 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         _ results: [StructureSearchResult],
         total: Int,
         truncated: Bool,
+        totalIsExact: Bool = true,
         title: String = "Find Results"
     ) {
+        // Search results are flat rows, so the structure-only collapse action
+        // has no useful meaning here (including for CSV Find Results).
+        collapseAllButton.isHidden = true
         locationDocumentByteCount = nil
         titleLabel.stringValue = title
         let retained = results.prefix(20_000)
         roots = retained.enumerated().map { index, match in
-            StructureSidebarNode(
+            let rowPrefix: String
+            if match.csvIsHeader {
+                rowPrefix = "Header  ·  "
+            } else {
+                rowPrefix = match.csvRecord.map { "Row \(($0 + 1).formatted())  ·  " } ?? ""
+            }
+            return StructureSidebarNode(
                 identifier: "search:\(match.match.byteRange.lowerBound):\(match.match.byteRange.upperBound):\(index)",
                 title: match.text,
-                subtitle: "Match \((index + 1).formatted())  ·  byte \(match.match.byteRange.lowerBound.formatted())  ·  \(match.match.byteRange.count.formatted()) bytes",
+                subtitle: "\(rowPrefix)Match \((index + 1).formatted())  ·  byte \(match.match.byteRange.lowerBound.formatted())  ·  \(match.match.byteRange.count.formatted()) bytes",
                 range: match.match.byteRange,
                 kind: nil,
                 highlightUTF16Range: match.highlightUTF16Range,
                 isSearchMatch: true
             )
         }
-        let suffix = truncated ? "  ·  first \(roots.count.formatted()) shown" : ""
-        scopeLabel.stringValue = "\(total.formatted()) matches\(suffix)"
+        if totalIsExact {
+            let suffix = truncated ? "  ·  first \(roots.count.formatted()) shown" : ""
+            let noun = total == 1 ? "match" : "matches"
+            scopeLabel.stringValue = "\(total.formatted()) \(noun)\(suffix)"
+        } else {
+            scopeLabel.stringValue = "Showing first \(roots.count.formatted()) matches  ·  Find All to count"
+        }
         clearLoadingState()
         outline.reloadData()
         // Find All intentionally publishes an unselected list. A subsequent
@@ -607,8 +644,8 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
             guard let self else { return nil }
             return self.delegate?.structureSidebar(self, contextMenuFor: node)
         }
-        outline.rowGestureHandler = { [weak self] node, clickCount in
-            self?.handleRowGesture(node, clickCount: clickCount)
+        outline.rowGestureHandler = { [weak self] node, clickCount, wasSelected in
+            self?.handleRowGesture(node, clickCount: clickCount, wasSelected: wasSelected)
         }
         outline.setAccessibilityLabel("Document structure outline")
 
@@ -806,7 +843,15 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         return nil
     }
 
-    private func handleRowGesture(_ node: StructureSidebarNode, clickCount: Int) {
+    private func handleRowGesture(
+        _ node: StructureSidebarNode,
+        clickCount: Int,
+        wasSelected: Bool
+    ) {
+        if node.isSearchMatch {
+            if wasSelected { delegate?.structureSidebar(self, revealByteRange: node.range) }
+            return
+        }
         guard node.role == .content, node.isExpandable else { return }
         if clickCount >= 2 {
             if outline.isItemExpanded(node) {
@@ -817,11 +862,35 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         }
     }
 
+#if LIGHTXT_RUNTIME_QA
+    var runtimeQASearchSubtitles: [String] { roots.filter(\.isSearchMatch).map(\.subtitle) }
+    var runtimeQACollapseAllButtonIsHidden: Bool { collapseAllButton.isHidden }
+    func runtimeQAActivateSearchResult(at index: Int) {
+        let matches = roots.filter(\.isSearchMatch)
+        guard matches.indices.contains(index),
+              let row = (0..<outline.numberOfRows).first(where: {
+                  (outline.item(atRow: $0) as? StructureSidebarNode) === matches[index]
+              }) else { return }
+        if outline.selectedRow == row {
+            delegate?.structureSidebar(self, revealByteRange: matches[index].range)
+        } else {
+            outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+    }
+#endif
+
 #if LIGHTXT_STANDALONE_STRUCTURE_QA
     var qaFullWorkspaceFontSize: CGFloat { fullWorkspaceFontSize }
     var qaRowHeight: CGFloat { outline.rowHeight }
     var qaTitle: String { titleLabel.stringValue }
     var qaScope: String { scopeLabel.stringValue }
+    var qaCollapseAllButtonIsHidden: Bool { collapseAllButton.isHidden }
+    func qaSubtitle(atRow row: Int) -> String? {
+        guard row >= 0,
+              row < outline.numberOfRows,
+              let node = outline.item(atRow: row) as? StructureSidebarNode else { return nil }
+        return node.subtitle
+    }
     var qaSelectedRange: Range<Int64>? {
         guard outline.selectedRow >= 0 else { return nil }
         return (outline.item(atRow: outline.selectedRow) as? StructureSidebarNode)?.range
@@ -829,7 +898,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
 
     func qaPerformRowGesture(identifier: String, clickCount: Int) {
         guard let node = node(withIdentifier: identifier, in: roots) else { return }
-        handleRowGesture(node, clickCount: clickCount)
+        handleRowGesture(node, clickCount: clickCount, wasSelected: true)
     }
 
     func qaIsExpanded(identifier: String) -> Bool {
@@ -855,6 +924,21 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
               let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: true)
                 as? StructureRowView else { return nil }
         return cell.toolTip
+    }
+
+    func qaSearchRowLayout(identifier: String) -> (
+        bounds: NSRect,
+        title: NSRect,
+        subtitle: NSRect,
+        usesSingleLineLabels: Bool
+    )? {
+        guard let node = node(withIdentifier: identifier, in: roots),
+              let row = (0..<outline.numberOfRows).first(where: {
+                  (outline.item(atRow: $0) as? StructureSidebarNode) === node
+              }),
+              let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                as? StructureRowView else { return nil }
+        return cell.qaLayout
     }
 #endif
 
@@ -1090,7 +1174,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
 @MainActor
 private final class StructureOutlineView: NSOutlineView {
     var contextMenuProvider: ((StructureSidebarNode) -> NSMenu?)?
-    var rowGestureHandler: ((StructureSidebarNode, Int) -> Void)?
+    var rowGestureHandler: ((StructureSidebarNode, Int, Bool) -> Void)?
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
@@ -1098,9 +1182,10 @@ private final class StructureOutlineView: NSOutlineView {
         let clickedDisclosure = clickedRow >= 0
             && frameOfOutlineCell(atRow: clickedRow).contains(point)
         let node = clickedRow >= 0 ? item(atRow: clickedRow) as? StructureSidebarNode : nil
+        let wasSelected = clickedRow >= 0 && selectedRowIndexes.contains(clickedRow)
         super.mouseDown(with: event)
         guard !clickedDisclosure, let node else { return }
-        rowGestureHandler?(node, event.clickCount)
+        rowGestureHandler?(node, event.clickCount, wasSelected)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -1180,7 +1265,17 @@ private final class StructureRowView: NSTableCellView {
         addSubview(kindIcon)
 
         titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.usesSingleLineMode = true
+        titleLabel.cell?.wraps = false
+        titleLabel.cell?.truncatesLastVisibleLine = true
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         subtitleLabel.lineBreakMode = .byTruncatingTail
+        subtitleLabel.maximumNumberOfLines = 1
+        subtitleLabel.usesSingleLineMode = true
+        subtitleLabel.cell?.wraps = false
+        subtitleLabel.cell?.truncatesLastVisibleLine = true
+        subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let labels = NSStackView(views: [titleLabel, subtitleLabel])
         labels.translatesAutoresizingMaskIntoConstraints = false
         labels.orientation = .vertical
@@ -1195,7 +1290,9 @@ private final class StructureRowView: NSTableCellView {
             kindIcon.heightAnchor.constraint(equalToConstant: 16),
             labels.leadingAnchor.constraint(equalTo: kindIcon.trailingAnchor, constant: 8),
             labels.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            labels.centerYAnchor.constraint(equalTo: centerYAnchor)
+            labels.centerYAnchor.constraint(equalTo: centerYAnchor),
+            labels.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 2),
+            labels.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -2),
         ])
     }
 
@@ -1218,9 +1315,15 @@ private final class StructureRowView: NSTableCellView {
         let accent = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
         let titleColor = node.role == .loadMore ? accent : primary
         if let highlight = node.highlightUTF16Range {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineBreakMode = .byTruncatingTail
             let attributed = NSMutableAttributedString(
                 string: node.title,
-                attributes: [.font: titleFont, .foregroundColor: titleColor]
+                attributes: [
+                    .font: titleFont,
+                    .foregroundColor: titleColor,
+                    .paragraphStyle: paragraph,
+                ]
             )
             let safeLower = min(max(0, highlight.lowerBound), attributed.length)
             let safeUpper = min(max(safeLower, highlight.upperBound), attributed.length)
@@ -1270,6 +1373,22 @@ private final class StructureRowView: NSTableCellView {
 
 #if LIGHTXT_STANDALONE_STRUCTURE_QA
     var qaAttributedTitle: NSAttributedString { titleLabel.attributedStringValue }
+    var qaLayout: (
+        bounds: NSRect,
+        title: NSRect,
+        subtitle: NSRect,
+        usesSingleLineLabels: Bool
+    ) {
+        (
+            bounds,
+            titleLabel.convert(titleLabel.bounds, to: self),
+            subtitleLabel.convert(subtitleLabel.bounds, to: self),
+            titleLabel.maximumNumberOfLines == 1
+                && subtitleLabel.maximumNumberOfLines == 1
+                && titleLabel.cell?.wraps == false
+                && subtitleLabel.cell?.wraps == false
+        )
+    }
 #endif
 
     @available(*, unavailable)

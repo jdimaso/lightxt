@@ -5,6 +5,13 @@ import Foundation
 // The production Parquet table reuses the CSV filter/header chrome. These
 // compact declarations are the data-only pieces that chrome expects when the
 // mutable CSV table itself is deliberately excluded from this read-only QA.
+public enum DelimitedTextDelimiter: UInt8, CaseIterable, Sendable {
+    case comma = 0x2C
+    case tab = 0x09
+    case semicolon = 0x3B
+    case pipe = 0x7C
+}
+
 struct CSVUniqueValuesProgress: Sendable, Equatable {
     let indexedFractionCompleted: Double
     let scannedRecordCount: Int64
@@ -44,6 +51,7 @@ enum LighTxtTheme {
     static let editorBackground = NSColor.textBackgroundColor
     static let gutterBackground = NSColor.controlBackgroundColor
     static let accent = NSColor.controlAccentColor
+    static let error = NSColor.systemRed
 
     static func resolved(_ color: NSColor, for appearance: NSAppearance) -> NSColor {
         var result = color
@@ -560,13 +568,43 @@ struct ParquetTableRuntimeQA {
             errorView.deactivate()
             errorWindow.close()
         }
+        let multilineDiagnostic = "The Parquet query failed.\nOut of Memory Error:\nfailed to allocate a data chunk"
+        var statusEvents: [(text: String, busy: Bool, isError: Bool)] = []
+        errorView.onStatusChange = { text, busy, isError in
+            statusEvents.append((text, busy, isError))
+        }
+        errorView.qaReportError(
+            NSError(
+                domain: "LighTxtRuntimeQA",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: multilineDiagnostic]
+            )
+        )
+        guard errorView.qaStatus == "The Parquet query failed. Out of Memory Error: failed to allocate a data chunk",
+              errorView.qaStatusToolTip == multilineDiagnostic,
+              errorView.qaStatusIsError,
+              errorView.qaStatusIsStrictlySingleLine,
+              statusEvents.last?.text == multilineDiagnostic,
+              statusEvents.last?.busy == false,
+              statusEvents.last?.isError == true else {
+            throw QAError.failed("Parquet errors were not presented as a one-line error with the full diagnostic available")
+        }
         errorView.load(url: malformedURL)
+        guard statusEvents.last?.busy == true,
+              statusEvents.last?.isError == false else {
+            throw QAError.failed("Ordinary Parquet progress was incorrectly reported as an error")
+        }
         try wait(until: { errorView.qaStatus.contains("not a readable Parquet") }, failure: "Malformed Parquet diagnostic was not visible")
+        guard errorView.qaStatusIsError,
+              errorView.qaStatusIsStrictlySingleLine,
+              statusEvents.last?.isError == true else {
+            throw QAError.failed("A malformed Parquet failure did not retain error status through its callback")
+        }
 
         print(
             "Parquet table runtime QA passed: read-only 8-row table, exact NULL/empty/literal facets, "
                 + "deferred Contains, repeated chip/popover commits, OR/AND filters, three-state stable sort, "
-                + "typed summary, copy, bounded cache/requests, resize/reorder/scroll, malformed diagnostics, "
+                + "typed summary, copy, bounded cache/requests, resize/reorder/scroll, one-line malformed diagnostics, "
                 + "no-click header controls, bounded STRUCT/LIST/MAP expansion, stable source-row identity, "
                 + "light/dark rendering, keyboard/context-menu actions, accessibility labels, and native "
                 + "auto-hiding +2 pt scrollers."

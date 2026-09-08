@@ -282,10 +282,63 @@ public nonisolated struct ParquetColumnSummary: Sendable, Equatable {
     }
 }
 
+/// Query surface shared by file-backed Parquet and explicitly resident CSV
+/// tables. The UI owns service replacement; each actor owns query
+/// serialization, cancellation, and connection lifetime.
+public protocol TabularQueryService: Actor {
+    nonisolated var sourceFileState: ExternalFileState { get }
+
+    func open() async throws -> ParquetMetadata
+    func page(
+        offset: Int64,
+        limit: Int,
+        query: ParquetTableQuery
+    ) async throws -> ParquetPage
+    func uniqueValues(
+        forColumn columnIndex: Int,
+        query: ParquetTableQuery,
+        searchText: String,
+        searchIsCaseSensitive: Bool,
+        offset: Int64,
+        limit requestedLimit: Int?
+    ) async throws -> ParquetUniqueValues
+    func columnSummary(
+        forColumn columnIndex: Int,
+        query: ParquetTableQuery
+    ) async throws -> ParquetColumnSummary
+    func structuredCellDetail(
+        sourceRowOrdinal: Int64,
+        column columnIndex: Int
+    ) async throws -> ParquetStructuredCellDetail
+    func close() async
+    nonisolated func cancelCurrentQuery()
+}
+
+public extension TabularQueryService {
+    /// The value picker searches case-insensitively unless explicitly asked
+    /// otherwise. Keep that convenience on the shared existential surface.
+    func uniqueValues(
+        forColumn columnIndex: Int,
+        query: ParquetTableQuery,
+        searchText: String,
+        offset: Int64,
+        limit requestedLimit: Int?
+    ) async throws -> ParquetUniqueValues {
+        try await uniqueValues(
+            forColumn: columnIndex,
+            query: query,
+            searchText: searchText,
+            searchIsCaseSensitive: false,
+            offset: offset,
+            limit: requestedLimit
+        )
+    }
+}
+
 /// One serial DuckDB connection per open Parquet document. Queries never copy
 /// the source into a database: DuckDB scans the selected file directly with
 /// projection/filter pushdown and every returned result is hard-capped.
-public actor ParquetQueryService {
+public actor ParquetQueryService: TabularQueryService {
     public struct Limits: Sendable, Equatable {
         public static let maximumPhysicalColumns = 4_096
         public static let maximumSchemaFieldUTF8Bytes = 65_536
@@ -305,9 +358,6 @@ public actor ParquetQueryService {
         public let maximumSelectedValuesPerColumn: Int
         public let maximumFilterValueCharacters: Int
         public let maximumUniqueValueCacheBytes: Int
-        public let memoryLimit: String
-        public let maximumTemporaryStorage: String
-        public let workerThreads: Int
 
         public init(
             maximumPresentedColumns: Int = 256,
@@ -317,8 +367,7 @@ public actor ParquetQueryService {
             maximumUniqueValues: Int = 500,
             maximumSelectedValuesPerColumn: Int = 500,
             maximumFilterValueCharacters: Int = 16_384,
-            maximumUniqueValueCacheBytes: Int = 16 << 20,
-            workerThreads: Int = min(4, max(1, ProcessInfo.processInfo.activeProcessorCount))
+            maximumUniqueValueCacheBytes: Int = 16 << 20
         ) {
             self.maximumPresentedColumns = min(1_024, max(1, maximumPresentedColumns))
             self.maximumPageRows = min(512, max(1, maximumPageRows))
@@ -352,9 +401,6 @@ public actor ParquetQueryService {
                 64 << 20,
                 max(1, maximumUniqueValueCacheBytes)
             )
-            self.memoryLimit = "512MB"
-            self.maximumTemporaryStorage = "1GB"
-            self.workerThreads = min(4, max(1, workerThreads))
         }
 
         public static let `default` = Limits()
@@ -395,9 +441,13 @@ public actor ParquetQueryService {
         var lastAccess: UInt64
     }
 
-    /// A stable descriptor prevents later queries from silently crossing to a
-    /// replacement inode at the document's pathname. `/dev/fd/N` gives DuckDB
-    /// seekable access to the original file without copying a multi-GB source.
+    /// A stable descriptor records the selected inode and validates its
+    /// envelope without copying a multi-GB source. DuckDB must receive the
+    /// ordinary filesystem path: on macOS, scanning `/dev/fd/N` makes its
+    /// Parquet reader treat the source as a single-reader stream and silently
+    /// collapses otherwise parallel filters to one worker. Every query checks
+    /// both the descriptor and pathname revision before and after execution,
+    /// so a replacement can never publish rows from a different file.
     private let pinnedSource: PinnedParquetSource
     private let limits: Limits
     private let runtime: DuckDBDynamicAPI
@@ -417,6 +467,9 @@ public actor ParquetQueryService {
     private var executedQueryCount = 0
     private var uniqueValuesCacheHitCount = 0
     private var uniqueValuesCacheMissCount = 0
+    #endif
+    #if LIGHTXT_PACKAGE_TESTING
+    private var testingExecutedSQL: [String] = []
     #endif
     private var isClosed = false
 
@@ -493,15 +546,23 @@ public actor ParquetQueryService {
         }
         try validate(query: query, columns: metadata.columns)
         // Sort never changes the count, so all sort variants share the same
-        // filter-count entry. When it is missing, the page query below returns
-        // COUNT(*) OVER() beside the bounded rows instead of serially scanning
-        // the Parquet source once for count and again for data.
+        // filter-count entry. Keep counting separate from paging: attaching a
+        // global COUNT(*) OVER() to the first filtered page turns DuckDB's
+        // otherwise parallel, early-terminating Parquet scan into a blocking
+        // window pipeline and forces every matching row through all visible
+        // display projections before LIMIT can apply.
         let countKey = ParquetTableQuery(filters: query.filters)
-        let cachedTotal = countCache[countKey]
-        if let cachedTotal, offset >= cachedTotal {
+        let total: Int64
+        if let cachedTotal = countCache[countKey] {
+            total = cachedTotal
+        } else {
+            total = try await countRows(query: countKey)
+            storeCount(total, for: countKey)
+        }
+        if offset >= total {
             return ParquetPage(
                 offset: offset,
-                totalRowCount: cachedTotal,
+                totalRowCount: total,
                 sourceRowOrdinals: [],
                 rows: []
             )
@@ -518,11 +579,7 @@ public actor ParquetQueryService {
             displayProjection(column: column, characterLimit: cellCharacterLimit)
         }.joined(separator: ", ")
         let rowIdentifier = Self.quoteIdentifier(Self.rowOrdinalAlias)
-        let discoversTotal = cachedTotal == nil
-        let totalProjection = discoversTotal
-            ? ", COUNT(*) OVER ()::BIGINT AS \(Self.quoteIdentifier("__lightxt_total_rows"))"
-            : ""
-        let projection = "\(rowIdentifier)::BIGINT AS \(Self.quoteIdentifier("__lightxt_result_row"))\(totalProjection), \(valueProjection)"
+        let projection = "\(rowIdentifier)::BIGINT AS \(Self.quoteIdentifier("__lightxt_result_row")), \(valueProjection)"
         var bindings: [DuckDBBinding] = [.text(pinnedSource.queryPath)]
         let whereClause = buildWhereClause(
             query.filters,
@@ -553,29 +610,6 @@ public actor ParquetQueryService {
                 """
         }
         let result = try await execute(sql: sql, bindings: bindings)
-        let total: Int64
-        if let cachedTotal {
-            total = cachedTotal
-        } else if result.rowCount > 0 {
-            total = result.int64(column: 1, row: 0) ?? 0
-            storeCount(total, for: countKey)
-        } else if offset == 0 {
-            total = 0
-            storeCount(0, for: countKey)
-        } else {
-            // An out-of-range offset has no row on which the window aggregate
-            // can ride. This uncommon direct-API case alone needs a fallback.
-            total = try await countRows(query: query)
-            storeCount(total, for: countKey)
-        }
-        guard offset < total else {
-            return ParquetPage(
-                offset: offset,
-                totalRowCount: total,
-                sourceRowOrdinals: [],
-                rows: []
-            )
-        }
         var rows: [[ParquetCell]] = []
         var sourceRowOrdinals: [Int64] = []
         rows.reserveCapacity(result.rowCount)
@@ -588,7 +622,7 @@ public actor ParquetQueryService {
             var values: [ParquetCell] = []
             values.reserveCapacity(columns.count)
             for column in 0..<columns.count {
-                let valueColumn = (discoversTotal ? 2 : 1) + column * 2
+                let valueColumn = 1 + column * 2
                 let truncationColumn = valueColumn + 1
                 guard let value = result.hexDecodedString(column: valueColumn, row: row) else {
                     values.append(ParquetCell(value: nil, isTruncated: false))
@@ -990,6 +1024,33 @@ public actor ParquetQueryService {
         interruptHandle.testingQueuedCancellationNeverBegins()
             && interruptHandle.testingLateCancellationPreservesNewOwner()
     }
+
+    struct TestingResourceSettings: Sendable, Equatable {
+        let threads: Int64
+        let memoryLimit: String
+    }
+
+    func testingResourceSettings() async throws -> TestingResourceSettings {
+        let result = try await execute(
+            sql: "SELECT current_setting('threads')::BIGINT, current_setting('memory_limit')::VARCHAR",
+            bindings: []
+        )
+        guard let threads = result.int64(column: 0, row: 0),
+              let memoryLimit = result.string(column: 1, row: 0) else {
+            throw ParquetQueryError.queryFailed("DuckDB resource settings could not be inspected.")
+        }
+        return TestingResourceSettings(threads: threads, memoryLimit: memoryLimit)
+    }
+
+    func testingSourceQueryPath() -> String {
+        pinnedSource.queryPath
+    }
+    #endif
+
+    #if LIGHTXT_PACKAGE_TESTING
+    func testingRecentExecutedSQL() -> [String] {
+        testingExecutedSQL
+    }
     #endif
 
     private func cachedUniqueValues(for key: UniqueValuesCacheKey) -> ParquetUniqueValues? {
@@ -1040,20 +1101,9 @@ public actor ParquetQueryService {
 
     private func initializeDatabase() throws {
         guard connectionStorage.connection == nil else { return }
-        let options: [(String, String)] = [
-            ("threads", String(limits.workerThreads)),
-            ("memory_limit", limits.memoryLimit),
-            ("temp_directory", temporaryDirectory.path),
-            ("max_temp_directory_size", limits.maximumTemporaryStorage),
-            ("autoload_known_extensions", "false"),
-            ("autoinstall_known_extensions", "false"),
-            ("allow_community_extensions", "false"),
-            ("allow_unsigned_extensions", "false"),
-            ("enable_external_file_cache", "false"),
-            ("enable_external_access", "true"),
-            ("preserve_insertion_order", "true"),
-        ]
-        let handles = try runtime.openInMemory(options: options)
+        let handles = try runtime.openInMemory(
+            options: Self.databaseOptions(temporaryDirectory: temporaryDirectory)
+        )
         do {
             // LIST-valued settings are not accepted by duckdb_set_config's
             // scalar C interface. Bootstrap them through trusted, fully escaped
@@ -1087,6 +1137,27 @@ public actor ParquetQueryService {
         connectionStorage.install(database: handles.database, connection: handles.connection)
         interruptHandle.setConnection(handles.connection)
     }
+
+    private static func databaseOptions(temporaryDirectory: URL) -> [(String, String)] {
+        [
+            // Keep spill files inside the app's private directory, but leave
+            // DuckDB's thread count, memory allowance, and spill allowance at
+            // their engine-selected defaults. Result/page limits below bound
+            // only what crosses into the UI; they must not constrain execution.
+            ("temp_directory", temporaryDirectory.path),
+            ("autoload_known_extensions", "false"),
+            ("autoinstall_known_extensions", "false"),
+            ("allow_community_extensions", "false"),
+            ("allow_unsigned_extensions", "false"),
+            ("enable_external_access", "true"),
+        ]
+    }
+
+    #if DEBUG || LIGHTXT_PACKAGE_TESTING
+    nonisolated static var testingDatabaseOptionNames: Set<String> {
+        Set(databaseOptions(temporaryDirectory: URL(fileURLWithPath: "/private/tmp")).map(\.0))
+    }
+    #endif
 
     private func describeColumns() async throws -> [ParquetColumn] {
         // Validate only scalar lengths first. Returning unbounded schema
@@ -1346,6 +1417,12 @@ public actor ParquetQueryService {
         #if DEBUG || LIGHTXT_PACKAGE_TESTING
         executedQueryCount += 1
         #endif
+        #if LIGHTXT_PACKAGE_TESTING
+        testingExecutedSQL.append(sql)
+        if testingExecutedSQL.count > 8 {
+            testingExecutedSQL.removeFirst(testingExecutedSQL.count - 8)
+        }
+        #endif
         _ = try requiredConnection()
         let runtime = runtime
         let executor = queryExecutor
@@ -1434,9 +1511,10 @@ public actor ParquetQueryService {
 
 }
 
-/// Owns the exact inode selected by the user for the service lifetime. Path
-/// replacement is common for atomic writers; retaining this descriptor keeps
-/// every lazy page and facet internally consistent until explicit Reload.
+/// Owns the exact inode selected by the user for the service lifetime and
+/// retains the normal pathname DuckDB needs for parallel Parquet scans. Path
+/// and descriptor revisions are compared around every query so replacement or
+/// in-place mutation requires an explicit Reload before any new result appears.
 private nonisolated final class PinnedParquetSource: @unchecked Sendable {
     struct Revision: Sendable, Hashable {
         let device: UInt64
@@ -1464,7 +1542,8 @@ private nonisolated final class PinnedParquetSource: @unchecked Sendable {
     private var isClosed = false
 
     init(url: URL) throws {
-        let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
+        let queryPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let descriptor = Darwin.open(queryPath, O_RDONLY | O_CLOEXEC)
         guard descriptor >= 0 else {
             throw ParquetQueryError.malformedFile(Self.systemError("The file could not be opened"))
         }
@@ -1475,7 +1554,7 @@ private nonisolated final class PinnedParquetSource: @unchecked Sendable {
             throw ParquetQueryError.malformedFile(reason)
         }
         self.descriptor = descriptor
-        self.queryPath = "/dev/fd/\(descriptor)"
+        self.queryPath = queryPath
         self.revision = Revision(
             device: UInt64(bitPattern: Int64(information.st_dev)),
             inode: UInt64(information.st_ino),
@@ -1517,15 +1596,12 @@ private nonisolated final class PinnedParquetSource: @unchecked Sendable {
     func matchesOriginalRevision() -> Bool {
         let descriptor: Int32? = lock.withLock { isClosed ? nil : self.descriptor }
         guard let descriptor else { return false }
-        var information = stat()
-        guard Darwin.fstat(descriptor, &information) == 0 else { return false }
-        return revision == Revision(
-            device: UInt64(bitPattern: Int64(information.st_dev)),
-            inode: UInt64(information.st_ino),
-            fileSize: Int64(information.st_size),
-            modifiedSeconds: Int64(information.st_mtimespec.tv_sec),
-            modifiedNanoseconds: Int64(information.st_mtimespec.tv_nsec)
-        )
+        var descriptorInformation = stat()
+        guard Darwin.fstat(descriptor, &descriptorInformation) == 0,
+              revision == Self.revision(from: descriptorInformation) else { return false }
+        var pathInformation = stat()
+        guard Darwin.lstat(queryPath, &pathInformation) == 0 else { return false }
+        return revision == Self.revision(from: pathInformation)
     }
 
     private func read(count: Int, offset: off_t, descriptor: Int32) throws -> Data {
@@ -1542,14 +1618,24 @@ private nonisolated final class PinnedParquetSource: @unchecked Sendable {
     private static func systemError(_ prefix: String) -> String {
         "\(prefix). \(String(cString: strerror(errno)))"
     }
+
+    private static func revision(from information: stat) -> Revision {
+        Revision(
+            device: UInt64(bitPattern: Int64(information.st_dev)),
+            inode: UInt64(information.st_ino),
+            fileSize: Int64(information.st_size),
+            modifiedSeconds: Int64(information.st_mtimespec.tv_sec),
+            modifiedNanoseconds: Int64(information.st_mtimespec.tv_nsec)
+        )
+    }
 }
 
-private nonisolated enum DuckDBBinding: Sendable {
+nonisolated enum DuckDBBinding: Sendable {
     case text(String)
     case int64(Int64)
 }
 
-private nonisolated final class SecurityScopedAccess: @unchecked Sendable {
+nonisolated final class SecurityScopedAccess: @unchecked Sendable {
     private let lock = NSLock()
     private let url: URL
     private var isActive: Bool
@@ -1597,7 +1683,7 @@ private nonisolated final class DuckDBSerialExecutor: @unchecked Sendable {
     }
 }
 
-private nonisolated final class DuckDBConnectionStorage: @unchecked Sendable {
+nonisolated final class DuckDBConnectionStorage: @unchecked Sendable {
     private let lock = NSLock()
     private let runtime: DuckDBDynamicAPI
     private var databaseStorage: OpaquePointer?
@@ -1631,7 +1717,7 @@ private nonisolated final class DuckDBConnectionStorage: @unchecked Sendable {
     }
 }
 
-private nonisolated final class ParquetInterruptHandle: @unchecked Sendable {
+nonisolated final class ParquetInterruptHandle: @unchecked Sendable {
     private enum RequestState { case queued, active, cancelled }
 
     private let lock = NSLock()
@@ -1745,7 +1831,7 @@ private nonisolated final class ParquetInterruptHandle: @unchecked Sendable {
 
 /// Minimal dynamically loaded DuckDB C surface. LighTxt intentionally avoids
 /// linking the much older eager Swift wrapper and does not expose SQL to UI.
-private nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
+nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
     private typealias State = Int32
     private typealias CreateConfig = @convention(c) (UnsafeMutablePointer<OpaquePointer?>?) -> State
     private typealias SetConfig = @convention(c) (OpaquePointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> State
@@ -1874,7 +1960,7 @@ private nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
         defer { if let openError { freeValue(openError) } }
         guard state == 0, let database else {
             let reason = openError.map { String(cString: $0) } ?? "The in-memory database could not be opened."
-            throw ParquetQueryError.queryFailed(reason)
+            throw Self.queryError(reason)
         }
         var connection: OpaquePointer?
         guard connectDatabase(database, &connection) == 0, let connection else {
@@ -1911,7 +1997,7 @@ private nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
             let reason = prepareError(statement).map { String(cString: $0) } ?? "The query could not be prepared."
             var failedStatement: OpaquePointer? = statement
             destroyPrepared(&failedStatement)
-            throw ParquetQueryError.queryFailed(reason)
+            throw Self.queryError(reason)
         }
         defer {
             var mutable: OpaquePointer? = statement
@@ -1946,7 +2032,7 @@ private nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
             if Task.isCancelled || reason.localizedCaseInsensitiveContains("interrupt") {
                 throw ParquetQueryError.cancelled
             }
-            throw ParquetQueryError.queryFailed(reason)
+            throw Self.queryError(reason)
         }
         return DuckDBResult(
             storage: storage,
@@ -1958,6 +2044,45 @@ private nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
             freeValue: freeValue,
             destroy: destroyResult
         )
+    }
+
+    /// DuckDB diagnostics can contain several lines of implementation advice
+    /// intended for a SQL console. Keep the actionable failure visible in the
+    /// compact document status bar without allowing that text to cover the
+    /// table, while retaining the full engine defaults for query execution.
+    static func queryError(_ reason: String) -> ParquetQueryError {
+        let lowercase = reason.lowercased()
+        if lowercase.contains("out of memory")
+            || lowercase.contains("failed to allocate")
+            || lowercase.contains("cannot allocate") {
+            return .queryFailed(
+                "DuckDB could not obtain enough system memory to complete this query. "
+                    + "Close other memory-intensive applications and try again."
+            )
+        }
+        if lowercase.contains("no space left on device")
+            || lowercase.contains("failed to offload data block")
+            || (lowercase.contains("temporary directory") && lowercase.contains("space")) {
+            return .queryFailed(
+                "DuckDB could not obtain enough temporary disk space to complete this query. "
+                    + "Free disk space and try again."
+            )
+        }
+
+        let firstDiagnostic = reason
+            .components(separatedBy: "\nPossible solutions:")
+            .first ?? reason
+        let compact = firstDiagnostic
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard !compact.isEmpty else {
+            return .queryFailed("DuckDB returned an unknown error.")
+        }
+        let maximumCharacters = 1_024
+        if compact.count > maximumCharacters {
+            return .queryFailed(String(compact.prefix(maximumCharacters)) + "…")
+        }
+        return .queryFailed(compact)
     }
 
     private static func resolveLibraryURL(_ explicitURL: URL?) throws -> URL {
@@ -1992,7 +2117,7 @@ private nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
     }
 }
 
-private nonisolated final class DuckDBResult: @unchecked Sendable {
+nonisolated final class DuckDBResult: @unchecked Sendable {
     /// DuckDB 1.4.5's public `duckdb_result` contains three `idx_t` values and
     /// three pointers on every supported 64-bit macOS architecture.
     static let storageByteCount = 6 * MemoryLayout<UInt64>.size
@@ -2014,7 +2139,7 @@ private nonisolated final class DuckDBResult: @unchecked Sendable {
     private let freeFunction: Free
     private let destroyFunction: Destroy
 
-    init(
+    fileprivate init(
         storage: UnsafeMutableRawPointer,
         columnCount: Int,
         rowCount: Int,

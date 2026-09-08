@@ -75,6 +75,7 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
 
     public enum IndexError: Error, LocalizedError, Equatable {
         case invalidByteCount(Int64)
+        case invalidByteOffset(Int64)
         case invalidRecord(Int64)
         case invalidReaderResult(requested: Range<Int64>, actualByteCount: Int)
         case cancelled
@@ -84,6 +85,8 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
             switch self {
             case let .invalidByteCount(count):
                 return "A CSV index cannot address a negative byte count (\(count))."
+            case let .invalidByteOffset(offset):
+                return "CSV byte offsets must be zero or greater (received \(offset))."
             case let .invalidRecord(record):
                 return "CSV row numbers must be zero or greater (received \(record))."
             case let .invalidReaderResult(range, actual):
@@ -237,6 +240,85 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
             limit: 1,
             cancellation: cancellation
         ).first
+    }
+
+    /// Resolves the source record containing one byte without constructing a
+    /// dense byte-to-row table. The main index advances only far enough to
+    /// cover the byte, then this lookup rescans from the nearest sparse
+    /// checkpoint (normally no more than one checkpoint interval).
+    public func recordLocation(
+        containingByteOffset requestedOffset: Int64,
+        cancellation: CancellationCheck? = nil
+    ) throws -> RecordLocation? {
+        try recordLocations(
+            containingByteOffsets: [requestedOffset],
+            cancellation: cancellation
+        ).first ?? nil
+    }
+
+    /// Resolves many source bytes while scanning each touched sparse
+    /// checkpoint interval at most once. Results preserve input order; bytes
+    /// at or beyond EOF produce nil entries.
+    public func recordLocations(
+        containingByteOffsets requestedOffsets: [Int64],
+        cancellation: CancellationCheck? = nil
+    ) throws -> [RecordLocation?] {
+        guard let invalid = requestedOffsets.first(where: { $0 < 0 }) else {
+            guard !requestedOffsets.isEmpty else { return [] }
+            var resolved = Array<RecordLocation?>(repeating: nil, count: requestedOffsets.count)
+            let valid = requestedOffsets.enumerated().filter { $0.element < byteCount }
+            guard let maximumOffset = valid.map(\.element).max() else { return resolved }
+
+            while true {
+                let current = progress
+                if current.indexedByteCount > maximumOffset || current.isComplete { break }
+                let result = try scanNextChunk(cancellation: cancellation)
+                if result.stopReason == .cancelled { throw IndexError.cancelled }
+            }
+
+            let capture: (checkpoints: [Int64], interval: Int64) = withStateLock {
+                ($0.checkpoints, $0.checkpointInterval)
+            }
+            guard !capture.checkpoints.isEmpty else {
+                throw IndexError.inconsistentCheckpointData
+            }
+
+            var grouped: [Int: [(position: Int, offset: Int64)]] = [:]
+            for entry in valid {
+                var lower = 0
+                var upper = capture.checkpoints.count
+                while lower < upper {
+                    let middle = lower + (upper - lower) / 2
+                    if capture.checkpoints[middle] <= entry.element {
+                        lower = middle + 1
+                    } else {
+                        upper = middle
+                    }
+                }
+                grouped[max(0, lower - 1), default: []].append(
+                    (position: entry.offset, offset: entry.element)
+                )
+            }
+
+            for checkpointIndex in grouped.keys.sorted() {
+                if cancellation?() == true { throw IndexError.cancelled }
+                let entries = grouped[checkpointIndex]!.sorted { lhs, rhs in
+                    if lhs.offset != rhs.offset { return lhs.offset < rhs.offset }
+                    return lhs.position < rhs.position
+                }
+                let locations = try locateRecords(
+                    containingByteOffsets: entries.map(\.offset),
+                    checkpointRecord: Int64(checkpointIndex) * capture.interval,
+                    startOffset: capture.checkpoints[checkpointIndex],
+                    cancellation: cancellation
+                )
+                for (entry, location) in zip(entries, locations) {
+                    resolved[entry.position] = location
+                }
+            }
+            return resolved
+        }
+        throw IndexError.invalidByteOffset(invalid)
     }
 
     /// Returns a page of adjacent record ranges with one checkpoint refinement
@@ -697,6 +779,125 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
             ))
         }
         return found
+    }
+
+    private func locateRecords(
+        containingByteOffsets requestedOffsets: [Int64],
+        checkpointRecord: Int64,
+        startOffset: Int64,
+        cancellation: CancellationCheck?
+    ) throws -> [RecordLocation?] {
+        guard !requestedOffsets.isEmpty else { return [] }
+        var currentRecord = checkpointRecord
+        var recordStart = startOffset
+        var offset = startOffset
+        var inQuotedField = false
+        var pendingQuote = false
+        var atFieldStart = true
+        var skippedLineFeedOffset: Int64?
+        var requestedIndex = 0
+        var resolved = Array<RecordLocation?>(repeating: nil, count: requestedOffsets.count)
+
+        while offset < byteCount {
+            if cancellation?() == true { throw IndexError.cancelled }
+            let upper = min(byteCount, offset + Int64(configuration.readChunkByteCount))
+            let requested = offset..<upper
+            let data = try reader(requested)
+            guard data.count == Int(requested.count) else {
+                throw IndexError.invalidReaderResult(requested: requested, actualByteCount: data.count)
+            }
+
+            for (localOffset, byte) in data.enumerated() {
+                let position = offset + Int64(localOffset)
+                if localOffset.isMultiple(of: 16_384), cancellation?() == true {
+                    throw IndexError.cancelled
+                }
+                if skippedLineFeedOffset == position {
+                    skippedLineFeedOffset = nil
+                    continue
+                }
+
+                if inQuotedField {
+                    if pendingQuote {
+                        if byte == 0x22 {
+                            pendingQuote = false
+                            continue
+                        }
+                        inQuotedField = false
+                        pendingQuote = false
+                    } else if byte == 0x22 {
+                        pendingQuote = true
+                        continue
+                    } else {
+                        continue
+                    }
+                }
+
+                if atFieldStart, byte == 0x22 {
+                    inQuotedField = true
+                    pendingQuote = false
+                    atFieldStart = false
+                } else if byte == configuration.delimiter {
+                    atFieldStart = true
+                } else if byte == 0x0A || byte == 0x0D {
+                    var completeEnd = position + 1
+                    if byte == 0x0D, position + 1 < byteCount {
+                        let nextByte: UInt8
+                        if localOffset + 1 < data.count {
+                            nextByte = data[localOffset + 1]
+                        } else {
+                            let requestedNext = (position + 1)..<(position + 2)
+                            let next = try reader(requestedNext)
+                            guard next.count == 1 else {
+                                throw IndexError.invalidReaderResult(
+                                    requested: requestedNext,
+                                    actualByteCount: next.count
+                                )
+                            }
+                            nextByte = next[0]
+                        }
+                        if nextByte == 0x0A { completeEnd += 1 }
+                    }
+                    let location = RecordLocation(
+                        record: currentRecord,
+                        contentRange: recordStart..<position,
+                        completeRange: recordStart..<completeEnd
+                    )
+                    while requestedIndex < requestedOffsets.count,
+                          requestedOffsets[requestedIndex] < completeEnd {
+                        resolved[requestedIndex] = location
+                        requestedIndex += 1
+                    }
+                    if requestedIndex == requestedOffsets.count {
+                        return resolved
+                    }
+                    currentRecord += 1
+                    recordStart = completeEnd
+                    atFieldStart = true
+                    inQuotedField = false
+                    pendingQuote = false
+                    if byte == 0x0D, completeEnd == position + 2 {
+                        skippedLineFeedOffset = position + 1
+                    }
+                } else {
+                    atFieldStart = false
+                }
+            }
+            offset = upper
+        }
+
+        if recordStart < byteCount {
+            let location = RecordLocation(
+                record: currentRecord,
+                contentRange: recordStart..<byteCount,
+                completeRange: recordStart..<byteCount
+            )
+            while requestedIndex < requestedOffsets.count {
+                resolved[requestedIndex] = location
+                requestedIndex += 1
+            }
+        }
+        return resolved
     }
 
     private func makeProgress(_ state: State) -> Progress {

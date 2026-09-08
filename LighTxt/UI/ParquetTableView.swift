@@ -6,7 +6,7 @@ private nonisolated enum ParquetTableExportError: Error, LocalizedError, Sendabl
     var errorDescription: String? {
         switch self {
         case let .truncatedCell(row, column):
-            "Row \(row + 1), column \(column + 1) exceeds the Parquet reader's exact export limit. No partial file was written."
+            "Row \(row + 1), column \(column + 1) exceeds the table reader's exact export limit. No partial file was written."
         }
     }
 }
@@ -16,8 +16,15 @@ private nonisolated enum ParquetTableExportError: Error, LocalizedError, Sendabl
 /// results. No text editor or mutable document snapshot is installed.
 @MainActor
 final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSPopoverDelegate {
-    var onStatusChange: ((String, Bool) -> Void)?
+    var onStatusChange: ((String, Bool, Bool) -> Void)?
     var onSourceChanged: (() -> Void)?
+    var onReturnToFileBackedCSV: (() -> Void)?
+    var onCSVInMemoryLoadFailure: ((Error) -> Void)?
+
+    private enum SourceKind {
+        case parquet
+        case csvInMemory
+    }
 
     private static let pageSize = 64
     private static let maximumCachedPages = 4
@@ -37,12 +44,19 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private let filterContainer = NSView()
     private let statusLabel = NSTextField(labelWithString: "Open a Parquet file to begin")
     private let progress = NSProgressIndicator()
+    private lazy var returnToFileBackedCSVButton = NSButton(
+        title: "Use File-Backed View",
+        target: self,
+        action: #selector(returnToFileBackedCSV(_:))
+    )
     private let scrollView = NSScrollView()
     private let tableView = ParquetReadOnlyTableView()
     private let queryLoadingOverlay = ParquetQueryLoadingOverlayView()
 
     private var sourceURL: URL?
-    private var service: ParquetQueryService?
+    private var sourceKind: SourceKind = .parquet
+    private var service: (any TabularQueryService)?
+    private var returnButtonWidthConstraint: NSLayoutConstraint?
     private var metadata: ParquetMetadata?
     private var totalRowCount: Int64 = 0
     private var activeFilters: [Int: CSVFilterDraft] = [:]
@@ -110,6 +124,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private var isSettingSortDescriptors = false
     private var isProjectionQueryInFlight = false
     private var isQueryLoadingOverlayVisible = false
+    private var statusIsError = false
     private var requiresExplicitReload = false
     private var isResidentStatePurged = false
     private var residentPurgeAnchorRow: Int64 = 0
@@ -147,43 +162,94 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     func load(url: URL) {
+        do {
+            try beginLoad(
+                service: ParquetQueryService(url: url),
+                url: url,
+                kind: .parquet
+            )
+        } catch {
+            report(error)
+        }
+    }
+
+    func loadCSVInMemory(
+        url: URL,
+        delimiter: DelimitedTextDelimiter,
+        firstRowIsHeader: Bool,
+        columnNames: [String]
+    ) {
+        do {
+            try beginLoad(
+                service: CSVInMemoryQueryService(
+                    url: url,
+                    configuration: CSVInMemoryConfiguration(
+                        columnNames: columnNames,
+                        delimiter: delimiter,
+                        firstRowIsHeader: firstRowIsHeader
+                    )
+                ),
+                url: url,
+                kind: .csvInMemory
+            )
+        } catch {
+            report(error)
+            onCSVInMemoryLoadFailure?(error)
+        }
+    }
+
+    private func beginLoad(
+        service: any TabularQueryService,
+        url: URL,
+        kind: SourceKind
+    ) throws {
         deactivate(showPausedStatus: false)
+        sourceKind = kind
+        updateSourceModeControls()
         isResidentStatePurged = false
         generation &+= 1
         let currentGeneration = generation
         sourceURL = url.standardizedFileURL
+        self.service = service
         showQueryLoadingOverlay(
-            title: "Loading Parquet data",
-            detail: "Reading the schema and preparing the first rows…"
+            title: kind == .parquet ? "Loading Parquet data" : "Loading CSV into memory",
+            detail: kind == .parquet
+                ? "Reading the schema and preparing the first rows…"
+                : "DuckDB is materializing the CSV for fast sorting and filtering…"
         )
-        setBusy(true, text: "Reading Parquet schema…")
-        do {
-            let service = try ParquetQueryService(url: url)
-            self.service = service
-            openTask = Task { [weak self] in
-                do {
-                    let metadata = try await service.open()
-                    guard !Task.isCancelled, let self, self.generation == currentGeneration else {
-                        await service.close()
-                        return
-                    }
-                    self.openTask = nil
-                    self.metadata = metadata
-                    self.totalRowCount = metadata.rowCount
-                    self.configureColumns(metadata.columns)
-                    self.updateFilterStrip()
-                    self.tableView.reloadData()
-                    self.materializeHeaderFilterControls()
-                    self.setBusy(true, text: "Loading first Parquet rows…")
-                    self.requestPage(containing: 0, replacingCurrentProjection: true)
-                } catch {
-                    guard let self, self.generation == currentGeneration else { return }
-                    self.openTask = nil
-                    self.report(error)
+        setBusy(
+            true,
+            text: kind == .parquet ? "Reading Parquet schema…" : "Loading CSV into memory…"
+        )
+        openTask = Task { [weak self] in
+            do {
+                let metadata = try await service.open()
+                guard !Task.isCancelled, let self, self.generation == currentGeneration else {
+                    await service.close()
+                    return
+                }
+                self.openTask = nil
+                self.metadata = metadata
+                self.totalRowCount = metadata.rowCount
+                self.configureColumns(metadata.columns)
+                self.updateFilterStrip()
+                self.tableView.reloadData()
+                self.materializeHeaderFilterControls()
+                self.setBusy(
+                    true,
+                    text: kind == .parquet
+                        ? "Loading first Parquet rows…"
+                        : "Loading first in-memory rows…"
+                )
+                self.requestPage(containing: 0, replacingCurrentProjection: true)
+            } catch {
+                guard let self, self.generation == currentGeneration else { return }
+                self.openTask = nil
+                self.report(error)
+                if kind == .csvInMemory {
+                    self.onCSVInMemoryLoadFailure?(error)
                 }
             }
-        } catch {
-            report(error)
         }
     }
 
@@ -210,7 +276,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
 
 #if LIGHTXT_RUNTIME_QA
     /// Hosted-app probe: unlike the standalone harness, this crosses the real
-    /// sandbox entitlement and proves DuckDB can scan the pinned `/dev/fd/N`.
+    /// sandbox entitlement and proves DuckDB can scan the security-scoped
+    /// ordinary path used by its parallel Parquet reader.
     var runtimeQAIsReady: Bool {
         metadata != nil
             && cachedPages[0] != nil
@@ -232,11 +299,14 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             hasHeaders: !metadata.columns.isEmpty
         )
         let panel = NSSavePanel()
-        panel.title = "Export Parquet Table"
+        panel.title = sourceKind == .csvInMemory
+            ? "Export In-Memory CSV Table"
+            : "Export Parquet Table"
         panel.prompt = "Export"
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
-        let baseName = sourceURL?.deletingPathExtension().lastPathComponent ?? "Parquet"
+        let baseName = sourceURL?.deletingPathExtension().lastPathComponent
+            ?? (sourceKind == .csvInMemory ? "CSV" : "Parquet")
         panel.nameFieldStringValue = "\(baseName)-export.csv"
         panel.accessoryView = accessory
         accessory.onFormatChange = { [weak panel] format in
@@ -344,11 +414,26 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         tableView.reloadData()
         hideQueryLoadingOverlay()
         updateFilterStrip()
-        if showPausedStatus { setBusy(false, text: "Parquet table paused") }
+        if showPausedStatus {
+            setBusy(
+                false,
+                text: sourceKind == .csvInMemory
+                    ? "In-memory CSV table unloaded"
+                    : "Parquet table paused"
+            )
+        }
     }
 
     private func configureControls() {
         controls.wantsLayer = true
+        returnToFileBackedCSVButton.bezelStyle = .rounded
+        returnToFileBackedCSVButton.controlSize = .small
+        returnToFileBackedCSVButton.font = .systemFont(ofSize: 11, weight: .medium)
+        returnToFileBackedCSVButton.toolTip = "Unload the in-memory copy and return to the editable, file-backed CSV view"
+        returnToFileBackedCSVButton.setAccessibilityHelp(
+            "Unloads the in-memory CSV table and returns to the file-backed view"
+        )
+        returnToFileBackedCSVButton.isHidden = true
         progress.style = .spinning
         progress.controlSize = .small
         progress.isDisplayedWhenStopped = false
@@ -356,6 +441,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.maximumNumberOfLines = 1
+        statusLabel.cell?.wraps = false
+        statusLabel.cell?.usesSingleLineMode = true
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         filterStrip.documentView = filterContainer
@@ -423,22 +511,37 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     private func configureLayout() {
-        [controls, filterStrip, filterContainer, statusLabel, progress, scrollView, queryLoadingOverlay].forEach {
+        [
+            controls,
+            filterStrip,
+            filterContainer,
+            statusLabel,
+            progress,
+            returnToFileBackedCSVButton,
+            scrollView,
+            queryLoadingOverlay,
+        ].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
         }
         addSubview(controls)
+        controls.addSubview(returnToFileBackedCSVButton)
         controls.addSubview(filterStrip)
         controls.addSubview(statusLabel)
         controls.addSubview(progress)
         addSubview(scrollView)
         addSubview(queryLoadingOverlay)
         queryLoadingOverlay.isHidden = true
+        let returnButtonWidth = returnToFileBackedCSVButton.widthAnchor.constraint(equalToConstant: 0)
+        returnButtonWidthConstraint = returnButtonWidth
         NSLayoutConstraint.activate([
             controls.leadingAnchor.constraint(equalTo: leadingAnchor),
             controls.trailingAnchor.constraint(equalTo: trailingAnchor),
             controls.topAnchor.constraint(equalTo: topAnchor),
             controls.heightAnchor.constraint(equalToConstant: 44),
-            filterStrip.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 10),
+            returnToFileBackedCSVButton.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 10),
+            returnToFileBackedCSVButton.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
+            returnButtonWidth,
+            filterStrip.leadingAnchor.constraint(equalTo: returnToFileBackedCSVButton.trailingAnchor, constant: 8),
             filterStrip.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
             filterStrip.heightAnchor.constraint(equalToConstant: 32),
             filterStrip.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
@@ -461,6 +564,26 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         width.isActive = true
     }
 
+    @objc private func returnToFileBackedCSV(_ sender: Any?) {
+        onReturnToFileBackedCSV?()
+    }
+
+    private func updateSourceModeControls() {
+        let isCSVInMemory = sourceKind == .csvInMemory
+        returnToFileBackedCSVButton.isHidden = !isCSVInMemory
+        returnButtonWidthConstraint?.constant = isCSVInMemory ? 154 : 0
+        progress.setAccessibilityLabel(
+            isCSVInMemory ? "In-memory CSV query progress" : "Parquet query progress"
+        )
+        filterStrip.setAccessibilityLabel(
+            isCSVInMemory ? "Active in-memory CSV filters" : "Active Parquet filters"
+        )
+        tableView.setAccessibilityLabel(
+            isCSVInMemory ? "Read-only in-memory CSV table" : "Read-only Parquet table"
+        )
+        needsLayout = true
+    }
+
     private func applyAppearance() {
         let appearance = effectiveAppearance
         let background = LighTxtTheme.resolved(LighTxtTheme.editorBackground, for: appearance)
@@ -468,7 +591,10 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             LighTxtTheme.gutterBackground,
             for: appearance
         ).cgColor
-        statusLabel.textColor = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
+        statusLabel.textColor = LighTxtTheme.resolved(
+            statusIsError ? LighTxtTheme.error : LighTxtTheme.secondaryText,
+            for: appearance
+        )
         scrollView.drawsBackground = true
         scrollView.backgroundColor = background
         tableView.backgroundColor = background
@@ -771,7 +897,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                     self.isProjectionQueryInFlight = false
                     self.restorePublishedProjection()
                     self.hideQueryLoadingOverlay()
-                    self.setBusy(false, text: "Parquet query cancelled")
+                    self.setBusy(false, text: self.queryCancellationText)
                 }
             } catch let error as ParquetQueryError where error == .cancelled {
                 guard let self,
@@ -781,7 +907,17 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                     self.isProjectionQueryInFlight = false
                     self.restorePublishedProjection()
                     self.hideQueryLoadingOverlay()
-                    self.setBusy(false, text: "Parquet query cancelled")
+                    self.setBusy(false, text: self.queryCancellationText)
+                }
+            } catch let error as CSVInMemoryQueryError where error == .cancelled {
+                guard let self,
+                      self.generation == currentGeneration,
+                      self.finishPageRequest(offset: offset, id: requestID) else { return }
+                if replacingCurrentProjection {
+                    self.isProjectionQueryInFlight = false
+                    self.restorePublishedProjection()
+                    self.hideQueryLoadingOverlay()
+                    self.setBusy(false, text: self.queryCancellationText)
                 }
             } catch {
                 guard let self, self.generation == currentGeneration else { return }
@@ -935,6 +1071,10 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                       self.finishStructuredDetailRequest(key: key, id: requestID) else { return }
                 self.startWaitingStructuredDetails()
             } catch let error as ParquetQueryError where error == .cancelled {
+                guard let self,
+                      self.finishStructuredDetailRequest(key: key, id: requestID) else { return }
+                self.startWaitingStructuredDetails()
+            } catch let error as CSVInMemoryQueryError where error == .cancelled {
                 guard let self,
                       self.finishStructuredDetailRequest(key: key, id: requestID) else { return }
                 self.startWaitingStructuredDetails()
@@ -1305,7 +1445,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         column: Int,
         controller: CSVFilterPopoverViewController,
         popover: NSPopover,
-        service: ParquetQueryService,
+        service: any TabularQueryService,
         searchText: String,
         offset: Int64,
         replacing: Bool,
@@ -1395,6 +1535,12 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                     self?.uniqueValuesRequestKey = nil
                 }
                 return
+            } catch let error as CSVInMemoryQueryError where error == .cancelled {
+                if self?.uniqueValuesRequestID == requestID {
+                    self?.uniqueValuesTask = nil
+                    self?.uniqueValuesRequestKey = nil
+                }
+                return
             } catch {
                 guard let self,
                       let controller,
@@ -1446,7 +1592,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                 guard !Task.isCancelled, let self, let controller, self.generation == currentGeneration else { return }
                 controller.show(CSVColumnSummaryPresentation(
                     type: summary.column.typeName,
-                    samplingDescription: "Filtered Parquet dataset",
+                    samplingDescription: sourceKind == .csvInMemory
+                        ? "Filtered in-memory CSV dataset"
+                        : "Filtered Parquet dataset",
                     rowLabel: "Rows",
                     rowCount: summary.rowCount,
                     emptyCount: summary.nullCount,
@@ -1752,6 +1900,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                     self.setBusy(false, text: "Export cancelled")
                 case .failure(let error as ParquetQueryError) where error == .cancelled:
                     self.setBusy(false, text: "Export cancelled")
+                case .failure(let error as CSVInMemoryQueryError) where error == .cancelled:
+                    self.setBusy(false, text: "Export cancelled")
                 case let .failure(error):
                     self.report(error)
                 }
@@ -1764,7 +1914,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         to url: URL,
         format: TabularExportFormat,
         headers: [String]?,
-        service: ParquetQueryService,
+        service: any TabularQueryService,
         query: ParquetTableQuery,
         selectedRows: IndexSet?,
         expectedDestination: FileFingerprint?,
@@ -1909,12 +2059,28 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         setBusy(false, text: description)
     }
 
-    private func setBusy(_ busy: Bool, text: String) {
-        statusLabel.stringValue = text
+    private var queryCancellationText: String {
+        sourceKind == .csvInMemory ? "In-memory CSV query cancelled" : "Parquet query cancelled"
+    }
+
+    private func setBusy(_ busy: Bool, text: String, isError: Bool = false) {
+        statusIsError = isError
+        statusLabel.stringValue = Self.singleLineStatusText(text)
         statusLabel.toolTip = text
-        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.setAccessibilityValue(text)
+        statusLabel.textColor = LighTxtTheme.resolved(
+            isError ? LighTxtTheme.error : LighTxtTheme.secondaryText,
+            for: effectiveAppearance
+        )
         if busy { progress.startAnimation(nil) } else { progress.stopAnimation(nil) }
-        onStatusChange?(text, busy)
+        onStatusChange?(text, busy, isError)
+    }
+
+    private static func singleLineStatusText(_ text: String) -> String {
+        text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
     }
 
     /// Parquet queries publish atomically: the last complete page remains
@@ -1978,9 +2144,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         latchSourceChangeIfNeeded(error)
         isProjectionQueryInFlight = false
         hideQueryLoadingOverlay()
-        setBusy(false, text: error.localizedDescription)
-        statusLabel.textColor = .systemRed
-        statusLabel.toolTip = error.localizedDescription
+        setBusy(false, text: error.localizedDescription, isError: true)
     }
 
     private func latchSourceChangeIfNeeded(_ error: Error) {
@@ -2061,6 +2225,14 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     var qaPendingPageCount: Int { pageTasks.count }
     var qaCacheAndRequestLimits: (cache: Int, requests: Int) { (Self.maximumCachedPages, 2) }
     var qaStatus: String { statusLabel.stringValue }
+    var qaStatusToolTip: String? { statusLabel.toolTip }
+    var qaStatusIsError: Bool { statusIsError }
+    var qaStatusIsStrictlySingleLine: Bool {
+        statusLabel.maximumNumberOfLines == 1
+            && statusLabel.cell?.wraps == false
+            && statusLabel.cell?.usesSingleLineMode == true
+    }
+    func qaReportError(_ error: Error) { report(error) }
     var qaIsQueryLoadingOverlayVisible: Bool {
         isQueryLoadingOverlayVisible && !queryLoadingOverlay.isHidden
     }

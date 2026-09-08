@@ -298,7 +298,7 @@ final class ParquetQueryServiceTests: XCTestCase {
         #endif
     }
 
-    func testFilteredFirstPageGetsExactCountInOneDuckDBQuery() async throws {
+    func testFilteredFirstPageSeparatesParallelCountFromBoundedPage() async throws {
         let service = try ParquetQueryService(
             url: Self.fixtureURL(),
             libraryURL: try Self.duckDBLibraryURL()
@@ -313,7 +313,11 @@ final class ParquetQueryServiceTests: XCTestCase {
         let afterFirst = await service.testingUniqueValuesCacheSnapshot()
         XCTAssertEqual(first.totalRowCount, 6)
         XCTAssertEqual(first.rows.count, 2)
-        XCTAssertEqual(afterFirst.executedQueryCount, before.executedQueryCount + 1)
+        XCTAssertEqual(afterFirst.executedQueryCount, before.executedQueryCount + 2)
+        let firstStatements = Array((await service.testingRecentExecutedSQL()).suffix(2))
+        XCTAssertEqual(firstStatements.count, 2)
+        XCTAssertTrue(firstStatements[0].contains("SELECT COUNT(*)::BIGINT"))
+        XCTAssertFalse(firstStatements[1].contains("COUNT(*) OVER"))
 
         let second = try await service.page(offset: 2, limit: 2, query: query)
         let afterSecond = await service.testingUniqueValuesCacheSnapshot()
@@ -332,7 +336,7 @@ final class ParquetQueryServiceTests: XCTestCase {
         XCTAssertEqual(afterEmpty.executedQueryCount, beforeEmpty.executedQueryCount + 1)
     }
 
-    func testPinnedSourceSurvivesAtomicReplacementAndRejectsInPlaceMutation() async throws {
+    func testSourceRevisionRejectsAtomicReplacementAndInPlaceMutation() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("LighTxt pinned parquet \(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -348,18 +352,28 @@ final class ParquetQueryServiceTests: XCTestCase {
         )
         let original = try await service.open()
         XCTAssertEqual(original.rowCount, 8)
-        XCTAssertEqual(Darwin.rename(replacementURL.path, sourceURL.path), 0)
-
-        // These requests were not made before replacement. They must still
-        // query the original descriptor rather than reopening the pathname.
-        let originalPage = try await service.page(offset: 6, limit: 2)
-        XCTAssertEqual(originalPage.rows.compactMap { $0.first?.value }, ["7", "8"])
-        let originalFacet = try await service.uniqueValues(
+        let atomicCachedFacet = try await service.uniqueValues(
             forColumn: 2,
             searchText: "O'Brien",
             limit: 10
         )
-        XCTAssertEqual(originalFacet.values.map(\.value), [.text("O'Brien")])
+        XCTAssertEqual(Darwin.rename(replacementURL.path, sourceURL.path), 0)
+
+        // Already-materialized UI data remains usable. New scans use the
+        // ordinary pathname required for parallel Parquet reading, so the
+        // descriptor/path revision guard must reject an atomic replacement.
+        let repeatedAtomicCachedFacet = try await service.uniqueValues(
+            forColumn: 2,
+            searchText: "O'Brien",
+            limit: 10
+        )
+        XCTAssertEqual(repeatedAtomicCachedFacet, atomicCachedFacet)
+        do {
+            _ = try await service.page(offset: 6, limit: 2)
+            XCTFail("An atomic replacement must require explicit Reload")
+        } catch let error as ParquetQueryError {
+            XCTAssertEqual(error, .sourceChanged)
+        }
         await service.close()
 
         let replacementService = try ParquetQueryService(
@@ -447,6 +461,49 @@ final class ParquetQueryServiceTests: XCTestCase {
         )
     }
 
+    func testOptInParquetSelectedValueFilterBenchmark() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["LIGHTXT_PARQUET_BENCHMARK_PATH"],
+              let requestedName = environment["LIGHTXT_PARQUET_FILTER_COLUMN"],
+              let selectedValue = environment["LIGHTXT_PARQUET_FILTER_VALUE"],
+              !path.isEmpty,
+              !requestedName.isEmpty else {
+            throw XCTSkip(
+                "Set LIGHTXT_PARQUET_BENCHMARK_PATH, LIGHTXT_PARQUET_FILTER_COLUMN, and "
+                    + "LIGHTXT_PARQUET_FILTER_VALUE to run the large-file filter benchmark."
+            )
+        }
+        let service = try ParquetQueryService(
+            url: URL(fileURLWithPath: path),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        defer { Task { await service.close() } }
+        let metadata = try await service.open()
+        guard let column = metadata.columns.firstIndex(where: {
+            $0.name.caseInsensitiveCompare(requestedName) == .orderedSame
+        }) else {
+            XCTFail("The benchmark filter column was not present in the visible schema.")
+            return
+        }
+
+        let query = ParquetTableQuery(filters: [
+            .init(column: column, selectedValues: [.text(selectedValue)]),
+        ])
+        let before = await service.testingUniqueValuesCacheSnapshot()
+        let started = ProcessInfo.processInfo.systemUptime
+        let page = try await service.page(offset: 0, limit: 64, query: query)
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        let after = await service.testingUniqueValuesCacheSnapshot()
+
+        XCTAssertEqual(after.executedQueryCount, before.executedQueryCount + 2)
+        XCTAssertFalse(page.rows.isEmpty, "The benchmark value must match at least one row")
+        XCTAssertLessThan(elapsed, 8.0, "The selected-value filter exceeded the interactive budget")
+        print(
+            "LighTxt Parquet filter benchmark: \(elapsed)s, rows=\(metadata.rowCount), "
+                + "matches=\(page.totalRowCount), displayed=\(page.rows.count)"
+        )
+    }
+
     func testStructuredDetailsCoverStructListMapSpecialTextAndBounds() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("LighTxt structured parquet \(UUID().uuidString)", isDirectory: true)
@@ -523,16 +580,24 @@ final class ParquetQueryServiceTests: XCTestCase {
     }
 
     func testQueryAndCustomLimitsRemainGloballyBounded() async throws {
+        let configuredOptions = ParquetQueryService.testingDatabaseOptionNames
+        for name in [
+            "threads", "worker_threads", "external_threads",
+            "memory_limit", "max_memory", "max_temp_directory_size",
+            "preserve_insertion_order", "enable_external_file_cache",
+        ] {
+            XCTAssertFalse(configuredOptions.contains(name), "Unexpected DuckDB override: \(name)")
+        }
+        XCTAssertTrue(configuredOptions.contains("temp_directory"))
+
         let limits = ParquetQueryService.Limits(
             maximumPageCharacters: .max,
             maximumUniqueValues: 5_000,
             maximumSelectedValuesPerColumn: 5_000,
-            maximumFilterValueCharacters: 1_048_576,
-            workerThreads: 999
+            maximumFilterValueCharacters: 1_048_576
         )
         XCTAssertEqual(limits.maximumPageCharacters, 16_777_216)
         XCTAssertEqual(limits.maximumUniqueValues, 8)
-        XCTAssertEqual(limits.workerThreads, 4)
         XCTAssertNotEqual(ParquetFilterValue.null.displayText, ParquetFilterValue.text("(null)").displayText)
         XCTAssertNotEqual(ParquetFilterValue.text("").displayText, ParquetFilterValue.text("(empty)").displayText)
 
@@ -561,6 +626,54 @@ final class ParquetQueryServiceTests: XCTestCase {
         })
         await assertInvalidFilter(service, query: tooManyFilterBytes)
         await service.close()
+    }
+
+    func testParquetUsesRegularPathAndDuckDBDefaultResources() async throws {
+        let service = try ParquetQueryService(
+            url: Self.fixtureURL(),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        defer { Task { await service.close() } }
+        _ = try await service.open()
+
+        let queryPath = await service.testingSourceQueryPath()
+        XCTAssertEqual(queryPath, Self.fixtureURL().standardizedFileURL.path)
+        XCTAssertFalse(queryPath.hasPrefix("/dev/fd/"))
+
+        let resourceSettings = try await service.testingResourceSettings()
+        XCTAssertEqual(
+            resourceSettings.threads,
+            Int64(ProcessInfo.processInfo.activeProcessorCount),
+            "LighTxt must leave DuckDB's worker pool at its engine-selected default"
+        )
+        XCTAssertFalse(resourceSettings.memoryLimit.isEmpty)
+    }
+
+    func testDuckDBFailuresAreCompactAndActionable() {
+        let outOfMemory = DuckDBDynamicAPI.queryError("""
+            Out of Memory Error: failed to allocate data of size 2.0 MiB
+            Possible solutions:
+            * Reducing the number of threads
+            * Increasing the memory limit
+            """)
+        XCTAssertEqual(
+            outOfMemory.localizedDescription,
+            "The Parquet query failed. DuckDB could not obtain enough system memory to complete this query. "
+                + "Close other memory-intensive applications and try again."
+        )
+
+        let ordinary = DuckDBDynamicAPI.queryError("Binder Error:\n  Missing column")
+        XCTAssertEqual(
+            ordinary.localizedDescription,
+            "The Parquet query failed. Binder Error: Missing column"
+        )
+
+        let oversized = DuckDBDynamicAPI.queryError(String(repeating: "x", count: 2_000))
+        guard case let .queryFailed(message) = oversized else {
+            return XCTFail("Expected a query failure")
+        }
+        XCTAssertEqual(message.count, 1_025)
+        XCTAssertTrue(message.hasSuffix("…"))
     }
 
     private func assertInvalidFilter(

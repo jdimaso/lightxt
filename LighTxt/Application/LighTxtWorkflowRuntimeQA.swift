@@ -382,6 +382,135 @@ final class LighTxtWorkflowRuntimeQA {
         try await Task.sleep(nanoseconds: 80_000_000)
         try expect(exportInvocationCount == 1, "one Export activation routed more than once")
 
+        // Cross the explicit CSV accelerator from the production file-backed
+        // controls into the shared DuckDB table, then unload it again. Core
+        // tests exercise the queries; this proves the real window wiring,
+        // lifecycle, badge, and return path inside the App Sandbox.
+        try await waitUntil("the Load CSV in Memory control to become ready") {
+            csvWindowController.qaIsCSVMemoryControlReady
+        }
+        csvWindowController.qaActivateCSVMemoryControl()
+        try await waitUntil("the CSV to materialize in DuckDB memory") {
+            csvWindowController.qaIsCSVInMemoryTableReady
+        }
+        try expect(
+            firstWindows[1].attachedSheet == nil,
+            "the QA-only CSV memory activation unexpectedly presented a modal sheet"
+        )
+        csvWindowController.qaReturnToFileBackedCSV()
+        try await waitUntil("the file-backed CSV table to return after unloading memory") {
+            csvWindowController.qaIsCSVMemoryControlReady
+        }
+
+        // CSV View owns an inline Find/Replace surface. A query must publish
+        // the complete result set automatically, preserve it while navigating,
+        // and route both replacement actions through the document session.
+        let originalCSVData = try Data(contentsOf: requestedURLs[1])
+        csvWindowController.qaBeginCSVFind(query: "Empire")
+        try await waitUntil("CSV Find to publish every match without Find All") {
+            csvWindowController.qaCSVFindResultCount == 3
+                && csvWindowController.qaCSVSelectedDisplayedRow == 0
+        }
+        try expect(
+            csvWindowController.qaCSVFindSupportsReplace,
+            "CSV View did not expose enabled inline Replace controls"
+        )
+        try expect(
+            csvWindowController.qaCSVCollapseAllIsHidden
+                && csvWindowController.qaCSVFindResultSubtitles.count == 3
+                && csvWindowController.qaCSVFindResultSubtitles[0].hasPrefix("Row 2  ·  Match 1")
+                && csvWindowController.qaCSVFindResultSubtitles[1].hasPrefix("Row 3  ·  Match 2")
+                && csvWindowController.qaCSVFindResultSubtitles[2].hasPrefix("Row 4  ·  Match 3"),
+            "CSV Find Results omitted row metadata or retained the structure-only collapse action"
+        )
+        guard let firstCSVMatch = csvWindowController.qaCSVFocusedMatchRange else {
+            throw QAError.failed("CSV Find did not focus its first result")
+        }
+        csvWindowController.qaCSVFindNext()
+        try await waitUntil("CSV Find Next to retain all results and change focus") {
+            guard let focused = csvWindowController.qaCSVFocusedMatchRange else { return false }
+            return focused != firstCSVMatch
+                && csvWindowController.qaCSVFindResultCount == 3
+                && csvWindowController.qaCSVSelectedDisplayedRow == 1
+        }
+        csvWindowController.qaActivateCSVFindResult(at: 2)
+        try await waitUntil("clicking a CSV Find Result to reveal its table row") {
+            csvWindowController.qaCSVSelectedDisplayedRow == 2
+        }
+        guard let replacementTarget = csvWindowController.qaCSVFocusedMatchRange else {
+            throw QAError.failed("CSV Find Next lost its focused result")
+        }
+        var replaceCurrentExpected = originalCSVData
+        replaceCurrentExpected.replaceSubrange(
+            Int(replacementTarget.lowerBound)..<Int(replacementTarget.upperBound),
+            with: Data("Realm".utf8)
+        )
+        csvWindowController.qaCSVReplaceCurrent(with: "Realm")
+        try expect(
+            csvWindowController.qaCSVFocusedMatchRange == nil,
+            "CSV Replace Current left the inserted text active for a rapid second Replace"
+        )
+        csvWindowController.qaCSVReplaceCurrent(with: "Realm")
+        try await waitUntil("CSV Replace Current to refresh View and remaining results") {
+            guard firstDocuments[1].session.byteCount == Int64(replaceCurrentExpected.count),
+                  (try? firstDocuments[1].session.editorReadBytes(
+                    in: 0..<Int64(replaceCurrentExpected.count)
+                  )) == replaceCurrentExpected else { return false }
+            return csvWindowController.qaCSVFindResultCount == 2
+        }
+        csvWindowController.qaCloseCSVFind()
+        try await waitUntil("closing CSV Find to remove its results presentation") {
+            csvWindowController.qaCSVFindIsClosed
+        }
+        try expect(
+            firstDocuments[1].session.undo(),
+            "CSV Replace Current was not undoable"
+        )
+        try await waitUntil("undoing CSV Replace Current to restore the fixture") {
+            guard firstDocuments[1].session.byteCount == Int64(originalCSVData.count) else {
+                return false
+            }
+            return (try? firstDocuments[1].session.editorReadBytes(
+                in: 0..<Int64(originalCSVData.count)
+            )) == originalCSVData
+        }
+
+        csvWindowController.qaBeginCSVFind(query: "Empire")
+        try await waitUntil("CSV Find to republish before Replace All") {
+            csvWindowController.qaCSVFindResultCount == 3
+        }
+        let replaceAllExpected = Data(
+            String(decoding: originalCSVData, as: UTF8.self)
+                .replacingOccurrences(of: "Empire", with: "Realm")
+                .utf8
+        )
+        csvWindowController.qaCSVReplaceAll(with: "Realm")
+        try await waitUntil("CSV Replace All to update every occurrence") {
+            guard !firstDocuments[1].session.isBulkEditing,
+                  firstDocuments[1].session.byteCount == Int64(replaceAllExpected.count),
+                  (try? firstDocuments[1].session.editorReadBytes(
+                    in: 0..<Int64(replaceAllExpected.count)
+                  )) == replaceAllExpected else { return false }
+            return csvWindowController.qaCSVFindStatus == "Replaced 3 matches"
+                && csvWindowController.qaCSVFindSupportsReplace
+        }
+        csvWindowController.qaCloseCSVFind()
+        try await waitUntil("closing CSV Find after Replace All") {
+            csvWindowController.qaCSVFindIsClosed
+        }
+        try expect(
+            firstDocuments[1].session.undo(),
+            "CSV Replace All was not one undoable operation"
+        )
+        try await waitUntil("undoing CSV Replace All to restore the fixture") {
+            guard firstDocuments[1].session.byteCount == Int64(originalCSVData.count) else {
+                return false
+            }
+            return (try? firstDocuments[1].session.editorReadBytes(
+                in: 0..<Int64(originalCSVData.count)
+            )) == originalCSVData
+        }
+
         // Route document output through the real View-mode capability checks.
         // QA probes stop immediately before production presents a save or print
         // panel, keeping this hosted run nonmodal while still crossing the
@@ -638,7 +767,10 @@ final class LighTxtWorkflowRuntimeQA {
     private func makeFixtures(in directory: URL) throws -> [URL] {
         let fixtures: [(String, String)] = [
             ("workflow-alpha.txt", "alpha\nplain text\n"),
-            ("workflow-beta.csv", "name,value\nbeta,2\n"),
+            (
+                "workflow-beta.csv",
+                "name,value\nEmpire,1\nEmpire State,2\nOther,Empire\n"
+            ),
             ("workflow-gamma.json", "{\"name\":\"gamma\",\"value\":3}\n"),
         ]
         var urls = try fixtures.map { name, contents in
@@ -646,14 +778,10 @@ final class LighTxtWorkflowRuntimeQA {
             try Data(contents.utf8).write(to: url, options: .atomic)
             return url.standardizedFileURL
         }
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let parquetFixture = repositoryRoot
-            .appendingPathComponent("Tests/Fixtures/Parquet/query-service.parquet")
         let parquetURL = directory.appendingPathComponent("workflow-delta.parquet")
-        try Data(contentsOf: parquetFixture).write(to: parquetURL, options: .atomic)
+        guard FileManager.default.fileExists(atPath: parquetURL.path) else {
+            throw QAError.failed("missing staged Parquet workflow fixture")
+        }
         urls.append(parquetURL.standardizedFileURL)
         let markdownURL = directory.appendingPathComponent("workflow-epsilon.md")
         try Data("# Workflow Markdown\n\nA **rendered** document output fixture.\n".utf8)

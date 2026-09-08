@@ -101,11 +101,100 @@ struct CSVTableRuntimeQA {
         guard let fixtureScrollView = fixtureTable.enclosingScrollView else {
             throw QAError.failed("CSV table was not hosted by its production scroll view")
         }
+        guard fixtureView.qaLoadInMemoryButtonTitle == "Load CSV in Memory",
+              fixtureView.qaLoadInMemoryIsEnabled,
+              fixtureView.qaLoadInMemoryHelpText.contains("very fast queries"),
+              fixtureView.qaLoadInMemoryHelpText.contains("consume a lot of memory") else {
+            throw QAError.failed("CSV View did not expose the opt-in memory accelerator and warning")
+        }
+        var requestedMemoryConfiguration: (DelimitedTextDelimiter, Bool, [String])?
+        fixtureView.onLoadInMemoryRequest = { delimiter, firstRowIsHeader, names in
+            requestedMemoryConfiguration = (delimiter, firstRowIsHeader, names)
+        }
+        fixtureView.qaRequestLoadInMemory()
+        guard requestedMemoryConfiguration?.0 == .comma,
+              requestedMemoryConfiguration?.1 == true,
+              requestedMemoryConfiguration?.2.count == 4 else {
+            throw QAError.failed("CSV View did not forward its current delimiter, header, and columns")
+        }
         fixtureView.layoutSubtreeIfNeeded()
         fixtureTable.headerView?.layoutSubtreeIfNeeded()
         try assertComfortScrollers(fixtureScrollView, label: "CSV table")
 
         try assertHeaderLayout(fixtureView, column: 0, label: "initial 1000pt fixture")
+
+        let fixtureSnapshot = try fixtureDelegate.editorSnapshot()
+        let fixtureBytes = try fixtureSnapshot.data(in: 0..<fixtureSnapshot.byteCount)
+        let trueNeedle = Data("true".utf8)
+        var trueRanges: [Range<Int64>] = []
+        var searchCursor = fixtureBytes.startIndex
+        while searchCursor < fixtureBytes.endIndex,
+              let found = fixtureBytes.range(
+                  of: trueNeedle,
+                  in: searchCursor..<fixtureBytes.endIndex
+              ) {
+            trueRanges.append(Int64(found.lowerBound)..<Int64(found.upperBound))
+            searchCursor = found.upperBound
+        }
+        guard trueRanges.count == 3 else {
+            throw QAError.failed("CSV search-highlight fixture did not contain three true values")
+        }
+        let navigation = try fixtureView.qaResolveSearchNavigation(trueRanges)
+        guard navigation.sourceRecordsByRange[trueRanges[0]] == 1,
+              navigation.sourceRecordsByRange[trueRanges[1]] == 2,
+              navigation.sourceRecordsByRange[trueRanges[2]] == 4 else {
+            throw QAError.failed("CSV match bytes did not resolve to their physical source rows")
+        }
+        fixtureView.qaRevealSearchMatch(trueRanges[2])
+        guard fixtureView.qaSelectedDisplayedRow == 3 else {
+            throw QAError.failed("CSV Find did not jump to the first requested matching row")
+        }
+        fixtureView.qaUpdateSearchMatches(trueRanges)
+        try wait(
+            until: {
+                [0, 1, 2, 3].allSatisfy {
+                    fixtureView.qaSearchHighlight(displayedRow: $0, dataColumn: 3) != nil
+                }
+            },
+            timeout: 2,
+            failure: "CSV search-highlight cells did not materialize"
+        )
+        guard fixtureView.qaSearchHighlight(displayedRow: 0, dataColumn: 3) == "match",
+              fixtureView.qaSearchHighlight(displayedRow: 1, dataColumn: 3) == "match",
+              fixtureView.qaSearchHighlight(displayedRow: 2, dataColumn: 3) == "none",
+              fixtureView.qaSearchHighlight(displayedRow: 3, dataColumn: 3) == "match" else {
+            throw QAError.failed("CSV Find did not highlight every matching visible cell")
+        }
+        fixtureView.qaUpdateSearchMatches(trueRanges, focusedRange: trueRanges[1])
+        guard fixtureView.qaSearchHighlight(displayedRow: 0, dataColumn: 3) == "match",
+              fixtureView.qaSearchHighlight(displayedRow: 1, dataColumn: 3) == "focused",
+              fixtureView.qaSearchHighlight(displayedRow: 3, dataColumn: 3) == "match" else {
+            throw QAError.failed("CSV Find did not distinguish the focused match")
+        }
+        fixtureView.clearSearchMatches()
+        guard [0, 1, 2, 3].allSatisfy({
+            fixtureView.qaSearchHighlight(displayedRow: $0, dataColumn: 3) == "none"
+        }) else {
+            throw QAError.failed("Clearing CSV Find left a recycled cell highlighted")
+        }
+
+        let parquetExportURL = outputDirectory.appendingPathComponent("runtime-qa-export.parquet")
+        fixtureView.qaExportCurrentView(to: parquetExportURL, format: .parquet)
+        try wait(
+            until: { !fixtureView.isExporting },
+            timeout: 15,
+            failure: "CSV View did not finish its Parquet export"
+        )
+        guard fixtureDelegate.lastError == nil,
+              let parquetData = try? Data(contentsOf: parquetExportURL),
+              parquetData.count >= 12,
+              parquetData.prefix(4) == Data("PAR1".utf8),
+              parquetData.suffix(4) == Data("PAR1".utf8) else {
+            throw QAError.failed(
+                "CSV View did not publish a valid Parquet envelope: "
+                    + (fixtureDelegate.lastError?.localizedDescription ?? "missing output")
+            )
+        }
 
         // Exercise the exact production hosting path which regressed: a real
         // titled/resizable window lets NSScrollView take ownership of the
@@ -242,6 +331,15 @@ struct CSVTableRuntimeQA {
         guard try cellValues(in: headerTable, column: idVisualColumn, rows: 0..<3)
                 == ["4", "2", "1"] else {
             throw QAError.failed("Active descending header sort did not preserve source-column targeting")
+        }
+        _ = try headerView.qaResolveSearchNavigation(trueRanges)
+        headerView.qaRevealSearchMatch(trueRanges[0])
+        guard headerView.qaSelectedDisplayedRow == 2 else {
+            throw QAError.failed("CSV Find did not reverse-map a source match through descending sort")
+        }
+        headerView.qaRevealSearchMatch(trueRanges[2])
+        guard headerView.qaSelectedDisplayedRow == 0 else {
+            throw QAError.failed("Clicking a later Find Result did not jump to its sorted table row")
         }
         headerView.qaScrollDataColumnToVisible(3)
         try settleLayout(window: headerWindow, view: headerView)
