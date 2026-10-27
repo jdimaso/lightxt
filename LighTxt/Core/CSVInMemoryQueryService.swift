@@ -362,6 +362,38 @@ public actor CSVInMemoryQueryService: TabularQueryService {
         )
     }
 
+    public func cellDetail(
+        sourceRowOrdinal: Int64,
+        column columnIndex: Int
+    ) async throws -> TabularCellDetail {
+        let metadata = try await open()
+        guard sourceRowOrdinal >= 0 else {
+            throw CSVInMemoryQueryError.queryFailed("The resident CSV row is invalid.")
+        }
+        guard metadata.columns.indices.contains(columnIndex) else {
+            throw CSVInMemoryQueryError.invalidColumn(columnIndex)
+        }
+        let value = "TRY_CAST(\(internalIdentifier(for: columnIndex)) AS VARCHAR)"
+        let limit = ParquetQueryService.Limits.maximumStructuredDetailCharacters
+        let result = try await execute(
+            sql: """
+                SELECT hex(encode(left(\(value), \(limit)))) AS cell_value,
+                       CASE WHEN length(\(value)) > \(limit) THEN 1::BIGINT ELSE 0::BIGINT END
+                \(Self.sourceClause)
+                WHERE \(Self.rowIdentifier) = ?
+                LIMIT 1
+                """,
+            bindings: [.int64(sourceRowOrdinal)]
+        )
+        guard result.rowCount == 1 else {
+            throw CSVInMemoryQueryError.queryFailed("The resident CSV row is no longer available.")
+        }
+        return TabularCellDetail(
+            value: result.hexDecodedString(column: 0, row: 0),
+            isTruncated: (result.int64(column: 1, row: 0) ?? 0) != 0
+        )
+    }
+
     public func columnSummary(
         forColumn columnIndex: Int,
         query: ParquetTableQuery = ParquetTableQuery()

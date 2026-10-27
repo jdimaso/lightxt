@@ -123,6 +123,53 @@ struct CSVTableRuntimeQA {
 
         try assertHeaderLayout(fixtureView, column: 0, label: "initial 1000pt fixture")
 
+        // Inspecting a multiline value must not enter the field editor or
+        // disturb the user's selection when Escape closes the inspector.
+        guard fixtureView.jumpToDisplayedRow(3) == nil,
+              fixtureView.qaInspectValue(row: 2, column: 2),
+              fixtureView.qaInspectorText == "multiline\ncell",
+              fixtureView.qaInspectorContext == "Source row 4 · Read-only",
+              fixtureView.qaInspectorIsReadable else {
+            throw QAError.failed("CSV multiline inspector lost wrapping, source context, or read-only behavior")
+        }
+        fixtureView.qaCloseInspector()
+        guard !fixtureView.qaInspectorIsVisible, fixtureView.qaSelectedDisplayedRow == 2,
+              fixtureView.jumpToDisplayedRow(0) != nil,
+              fixtureView.qaSelectedDisplayedRow == 2 else {
+            throw QAError.failed("CSV inspector dismissal or invalid row navigation changed selection")
+        }
+
+        let longValueURL = outputDirectory.appendingPathComponent("inspector-values.csv")
+        let completeLongValue = String(repeating: "x", count: 96_000) + "\nlast line"
+        let boundedLongValue = String(repeating: "y", count: 300_000)
+        try Data("id,note\n1,\"\(completeLongValue)\"\n2,\(boundedLongValue)\n".utf8).write(to: longValueURL)
+        let longDelegate = try QACSVDelegate(url: longValueURL)
+        let longView = CSVTableView(frame: NSRect(x: 0, y: 0, width: 900, height: 500))
+        let longWindow = makeWindow(containing: longView, appearance: .aqua)
+        longWindow.makeKeyAndOrderFront(nil)
+        longView.editorDelegate = longDelegate
+        try wait(until: { longView.qaInspectValue(row: 0, column: 1) }, timeout: 5,
+                 failure: "Long CSV value never became inspectable")
+        try wait(until: { longView.qaInspectorText == completeLongValue }, timeout: 5,
+                 failure: "CSV inspector did not fetch beyond its 64 KiB table preview")
+        guard longView.qaInspectorNotice?.contains("Complete value") == true else {
+            throw QAError.failed("Complete CSV inspector value was incorrectly labelled as partial")
+        }
+        guard longView.qaInspectValue(row: 1, column: 1) else {
+            throw QAError.failed("Oversized CSV value was not inspectable")
+        }
+        try wait(until: { longView.qaInspectorNotice?.contains("not the complete value") == true }, timeout: 5,
+                 failure: "CSV inspector did not disclose its bounded preview")
+        guard longView.qaInspectorText?.utf8.count == 256 << 10 else {
+            throw QAError.failed("CSV inspector exceeded or failed to reach its 256 KiB preview bound")
+        }
+        longView.deactivate()
+        guard !longView.qaInspectorIsVisible else {
+            throw QAError.failed("Leaving CSV table mode retained a stale inspector")
+        }
+        longWindow.close()
+        fixtureWindow.makeKeyAndOrderFront(nil)
+
         let fixtureSnapshot = try fixtureDelegate.editorSnapshot()
         let fixtureBytes = try fixtureSnapshot.data(in: 0..<fixtureSnapshot.byteCount)
         let trueNeedle = Data("true".utf8)
@@ -380,7 +427,7 @@ struct CSVTableRuntimeQA {
             throw QAError.failed("CSV filter buttons are not accessible, or removed global Add/Delete controls remain")
         }
         guard fixtureView.qaRowContextMenuTitles(row: 0) == [
-            "Add Row Above", "Add Row Below", "Delete Row",
+            "Inspect Value…", "Add Row Above", "Add Row Below", "Delete Row",
         ] else {
             throw QAError.failed("Row mutations did not move to the table body context menu")
         }

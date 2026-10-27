@@ -468,6 +468,7 @@ qa_structured_view() {
         LighTxt/UI/FindBarView.swift \
         LighTxt/UI/StructureSearchResultBuilder.swift \
         LighTxt/UI/StructureSidebarView.swift \
+        LighTxt/UI/DocumentNavigationView.swift \
         Tests/Runtime/StructuredViewRuntimeQA.swift
     "$executable" "$output"
 }
@@ -536,6 +537,7 @@ qa_csv_table() {
         LighTxt/UI/LighTxtTheme.swift \
         LighTxt/UI/LighTxtComfortScroller.swift \
         LighTxt/UI/TabularExportAccessoryView.swift \
+        LighTxt/UI/TabularValueInspector.swift \
         LighTxt/UI/CSVTableView.swift \
         Tests/Runtime/CSVTableRuntimeQA.swift \
         "$NATIVE_DIRECTORY/LighTxtJSONAccelerator.o" \
@@ -616,6 +618,7 @@ qa_parquet_table() {
         LighTxt/Core/CSVInMemoryQueryService.swift \
         LighTxt/UI/LighTxtComfortScroller.swift \
         LighTxt/UI/TabularExportAccessoryView.swift \
+        LighTxt/UI/TabularValueInspector.swift \
         LighTxt/UI/CSVTableView.swift \
         LighTxt/UI/ParquetTableView.swift \
         Tests/Runtime/ParquetTableRuntimeQA.swift

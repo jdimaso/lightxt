@@ -6,11 +6,13 @@ LighTxt is a native macOS text viewer and editor built for files that ordinary e
 
 - TXT, SCRIPT, JSON, Markdown, SQL, XML, CSV/TSV/PSV, YAML/YML, and read-only Parquet
 - Bounded content, Unicode-encoding, and table-dialect detection, with **Open As** overrides and an inferred extension the first time an untitled document is saved
-- A purpose-built **View** mode: structured JSON/YAML navigation, rendered Markdown, a virtual CSV table, and a read-only Parquet table with per-column sort, filter, and summary tools
-- A bounded **Edit** mode for supported text formats, with byte-preserving edits, SQL and other syntax highlighting, and invalid-syntax diagnostics
+- Contextual **Tree / Source**, **Table / Source**, and **Preview / Source** presentations, with explicit editability and unsaved-state labels; plain text keeps a single focused editing surface
+- A bounded **Source** presentation for supported text formats, with byte-preserving edits, SQL and other syntax highlighting, invalid-syntax diagnostics, and syntax-colored read-only JSON/YAML Prettify previews
 - A full-path top-bar breadcrumb whose folder segments open in Finder, with safe same-window document navigation
-- A resizable JSON explorer with lazy paged children, row-click expansion, double-click collapse, and adjustable View text size
-- View-only Find results that show source context and emphasize the exact matching bytes without switching into Edit; Edit mode also provides Replace and transactional Replace All
+- A resizable JSON explorer with lazy paged children, readable key/value typography, quiet type badges, clearer nesting, row-click expansion, double-click collapse, and visible, remembered reading-size controls
+- Independent **Outline** and **Results** tabs retain navigation while searching; JSON matches open source context without replacing the outline or result list. Source and editable CSV tables also provide Replace and transactional Replace All
+- A position/activity/save-state status bar, inline line or table-row navigation with visible validation, and an information popover for storage details
+- **Inspect Value** in CSV and Parquet tables opens a resizable, wrapped, read-only cell preview with copying and explicit preview limits; Escape returns to the same table selection. The shortcut is **Command-Option-I**
 - Save, Save As, Save a Copy, Duplicate, undo, and redo
 - View-mode Markdown export to paginated PDF, plus native printing for Markdown and plain-text documents through the same complete-document PDF pipeline
 - External-change monitoring with safe reload review, optional automatic reload for clean files, and follow-at-end behavior for growing logs

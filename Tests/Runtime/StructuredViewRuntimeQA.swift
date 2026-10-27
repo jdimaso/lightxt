@@ -116,6 +116,12 @@ struct StructuredViewRuntimeQA {
     static func main() throws {
         guard CommandLine.arguments.count == 2 else { throw QAError.usage }
         _ = NSApplication.shared
+        let savedReadingSize = UserDefaults.standard.object(forKey: "LighTxt.jsonReadingFontSize")
+        UserDefaults.standard.removeObject(forKey: "LighTxt.jsonReadingFontSize")
+        defer {
+            if let savedReadingSize { UserDefaults.standard.set(savedReadingSize, forKey: "LighTxt.jsonReadingFontSize") }
+            else { UserDefaults.standard.removeObject(forKey: "LighTxt.jsonReadingFontSize") }
+        }
         let output = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
 
@@ -126,6 +132,9 @@ struct StructuredViewRuntimeQA {
         try assertLongSearchResultEllipsizes()
         try assertBoundedAndCancellablePreviewReads()
         try assertStructureInteractionsAndZoom()
+        try assertIndependentNavigationTabs(sourceResult)
+        try renderReadableJSON(appearance: .aqua, to: output.appendingPathComponent("json-readability-light.png"))
+        try renderReadableJSON(appearance: .darkAqua, to: output.appendingPathComponent("json-readability-dark.png"))
         try assertYAMLOffViewportParity(sourceResult: sourceResult)
         try renderSearchResults(sourceResult, appearance: .aqua, to: output.appendingPathComponent("structured-search-light.png"))
         try renderSearchResults(sourceResult, appearance: .darkAqua, to: output.appendingPathComponent("structured-search-dark.png"))
@@ -419,9 +428,15 @@ struct StructuredViewRuntimeQA {
         guard view.qaFullWorkspaceFontSize == 15 else {
             throw QAError.failed("Structured View did not default to the larger 15pt font")
         }
+        let existingSearchContext = StructureSidebarView(frame: view.frame)
+        existingSearchContext.presentation = .fullWorkspace
         for _ in 0..<20 { view.changeFullWorkspaceFontSize(by: 1) }
         guard view.qaFullWorkspaceFontSize == 28, view.qaRowHeight >= 66 else {
             throw QAError.failed("Maximum structured zoom clips its two-line rows: \(view.qaRowHeight)")
+        }
+        guard existingSearchContext.qaFullWorkspaceFontSize == 28,
+              existingSearchContext.qaRowHeight == view.qaRowHeight else {
+            throw QAError.failed("Structured zoom did not update an existing search-context view")
         }
         for _ in 0..<30 { view.changeFullWorkspaceFontSize(by: -1) }
         guard view.qaFullWorkspaceFontSize == 11 else {
@@ -431,6 +446,11 @@ struct StructuredViewRuntimeQA {
         guard view.qaFullWorkspaceFontSize == 15 else {
             throw QAError.failed("Structured zoom reset did not restore the 15pt default")
         }
+        existingSearchContext.changeFullWorkspaceFontSize(by: 1)
+        guard view.qaFullWorkspaceFontSize == 16 else {
+            throw QAError.failed("Search-context zoom did not synchronize back to the outline")
+        }
+        view.resetFullWorkspaceFontSize()
     }
 
     private static func assertYAMLOffViewportParity(
@@ -490,6 +510,65 @@ struct StructuredViewRuntimeQA {
         guard view.qaTitle == "Document Structure", !view.qaScope.contains("matches") else {
             throw QAError.failed("Closing YAML Find would strand the Find Results list")
         }
+    }
+
+    private static func assertIndependentNavigationTabs(_ result: StructureSearchResult) throws {
+        let outline = StructureSidebarView()
+        let results = StructureSidebarView()
+        let navigation = DocumentNavigationView(outline: outline, results: results)
+        let window = host(navigation, size: NSSize(width: 700, height: 500), appearance: .aqua)
+        defer { window.close() }
+        let child = StructureSidebarNode(identifier: "kept-child", title: "name", subtitle: "value", range: 10..<20, kind: .scalar)
+        let root = StructureSidebarNode(identifier: "kept-root", title: "record", subtitle: "Object", range: 0..<30, kind: .object, children: [child])
+        outline.applyTreeSnapshot([root], title: "Outline", preservingExpansion: false)
+        outline.revealNode(withIdentifier: child.identifier)
+        results.updateSearchResults([result], total: 1, truncated: false)
+        navigation.setResultCount(1, exact: true)
+        settle(window)
+        let selectedOutline = outline.qaSelectedRange
+        navigation.qaSelectResults(true)
+        results.selectSearchResult(matching: result.match.byteRange)
+        settle(window)
+        navigation.qaSelectResults(false)
+        guard outline.qaIsExpanded(identifier: root.identifier), outline.qaSelectedRange == selectedOutline,
+              results.qaSelectedRange == result.match.byteRange, !outline.isHidden, results.isHidden else {
+            throw QAError.failed("Switching search tabs lost outline or result navigation state")
+        }
+        navigation.qaSelectResults(true)
+        guard outline.isHidden, !results.isHidden, navigation.qaResultTitle == "Results (1)" else {
+            throw QAError.failed("Results tab did not preserve its count and selection")
+        }
+        navigation.setOutlineAvailable(false)
+        navigation.showsResults = false
+        guard navigation.showsResults, outline.isHidden, !results.isHidden else {
+            throw QAError.failed("Navigation selected an unavailable Outline tab")
+        }
+    }
+
+    private static func renderReadableJSON(appearance: NSAppearance.Name, to url: URL) throws {
+        let tree = StructureSidebarView()
+        tree.presentation = .fullWorkspace
+        let nodes = [
+            StructureSidebarNode(identifier: "name", title: "display_name", subtitle: "String · Ada Lovelace", valueText: "“Ada Lovelace”", valueType: "String", range: 10..<35, kind: .scalar),
+            StructureSidebarNode(identifier: "balance", title: "balance", subtitle: "Number · 12345.67", valueText: "12345.67", valueType: "Number", range: 36..<48, kind: .scalar),
+            StructureSidebarNode(identifier: "active", title: "active", subtitle: "Boolean · true", valueText: "true", valueType: "Boolean", range: 49..<53, kind: .scalar),
+            StructureSidebarNode(identifier: "missing", title: "archived_at", subtitle: "Null", valueText: "null", valueType: "Null", range: 54..<58, kind: .scalar),
+        ]
+        let root = StructureSidebarNode(identifier: "profile", title: "profile", subtitle: "Object · 4 items", valueText: "4 items", valueType: "Object", range: 0..<100, kind: .object, children: nodes)
+        let navigation = DocumentNavigationView(outline: tree, results: StructureSidebarView())
+        let window = host(navigation, size: NSSize(width: 900, height: 520), appearance: appearance)
+        defer { window.close() }
+        tree.applyTreeSnapshot([root], title: "JSON Explorer", preservingExpansion: false)
+        tree.revealNode(withIdentifier: "name")
+        settle(window)
+        let labels = recursiveSubviews(of: tree).compactMap { $0 as? NSTextField }
+        guard let value = labels.first(where: { $0.stringValue == "“Ada Lovelace”" }),
+              let key = labels.first(where: { $0.stringValue == "display_name" }),
+              value.font?.pointSize == key.font?.pointSize,
+              (value.font?.pointSize ?? 0) >= 15 else {
+            throw QAError.failed("JSON values are still smaller than their keys")
+        }
+        try capture(navigation, to: url)
     }
 
     private static func renderSearchResults(

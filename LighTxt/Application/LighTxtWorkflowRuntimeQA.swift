@@ -107,6 +107,7 @@ final class LighTxtWorkflowRuntimeQA {
         }
 
         let firstDocuments = try documentsByURL(requestedURLs)
+        try await verifyJSONNavigation(document: firstDocuments[2])
         try expect(
             Set(firstDocuments.map { ObjectIdentifier($0) }).count == requestedURLs.count,
             "multi-open reused an NSDocument"
@@ -550,22 +551,22 @@ final class LighTxtWorkflowRuntimeQA {
             exportPDF: { textPDFInvocationCount += 1 },
             print: { textPrintInvocationCount += 1 }
         )
-        try await waitUntil("plain-text View printing to become available") {
+        try await waitUntil("plain-text printing to become available") {
             textWindowController.qaCanPrintCurrentDocument
         }
         try expect(
             !textWindowController.qaCanExportCurrentDocumentAsPDF,
-            "plain-text View incorrectly enabled Markdown PDF export"
+            "plain-text incorrectly enabled Markdown PDF export"
         )
         textWindowController.qaActivatePDFExport()
         textWindowController.qaActivatePrint()
-        try await waitUntil("plain-text View Print action to route") {
+        try await waitUntil("plain-text Print action to route") {
             textPrintInvocationCount == 1
         }
         try await Task.sleep(nanoseconds: 80_000_000)
         try expect(
             textPDFInvocationCount == 0 && textPrintInvocationCount == 1,
-            "plain-text View routed an unsupported PDF export or duplicated Print"
+            "plain-text routed an unsupported PDF export or duplicated Print"
         )
 
         var csvPDFInvocationCount = 0
@@ -762,6 +763,44 @@ final class LighTxtWorkflowRuntimeQA {
         } else {
             try expect(item.target == nil, "menu item \(title) bypasses the responder chain")
         }
+    }
+
+    private func verifyJSONNavigation(document: LighTxtDocument) async throws {
+        guard let controller = document.windowControllers.first?.window?.contentViewController as? LighTxtEditorViewController else {
+            throw QAError.failed("JSON window is missing its editor controller")
+        }
+        try await waitUntil("the JSON outline to be ready") { controller.qaJSONOutlineReady }
+        if let window = controller.view.window {
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                window.appearance = NSAppearance(named: appearance)
+                window.contentView?.layoutSubtreeIfNeeded()
+                if let bitmap = controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds) {
+                    controller.view.cacheDisplay(in: controller.view.bounds, to: bitmap)
+                    let image = bitmap.representation(using: .png, properties: [:])
+                    try image?.write(to: invocation.workspaceURL.appendingPathComponent("json-workspace-\(appearance.rawValue).png"))
+                }
+            }
+            window.appearance = nil
+        }
+        let outlineIdentity = controller.qaJSONOutlineIdentity
+        controller.qaBeginJSONFind("gamma")
+        try await waitUntil("JSON search results") { controller.qaSearchResultCount > 0 }
+        let resultCount = controller.qaSearchResultCount
+        controller.qaSelectNavigationResults(false)
+        try expect(controller.qaJSONOutlineIdentity == outlineIdentity, "search replaced the original JSON outline")
+        try expect(controller.qaSearchResultCount == resultCount && !controller.qaShowsSearchResults, "switching to Outline discarded results")
+        controller.qaSelectNavigationResults(true)
+        controller.qaActivateJSONSearchResult()
+        try await waitUntil("JSON match context") { controller.qaShowsJSONSearchContext }
+        try expect(controller.qaJSONOutlineIdentity == outlineIdentity, "inspecting a match replaced outline navigation")
+        try expect(controller.qaSearchResultCount == resultCount, "inspecting a match discarded the results list")
+        let publications = controller.qaSearchResultPublications
+        controller.qaRepeatFindAll()
+        try await waitUntil("refreshed JSON search results") { controller.qaSearchResultPublications > publications }
+        try expect(!controller.qaShowsJSONSearchContext, "new results retained the previous match context")
+        controller.qaCloseResultsPane()
+        try expect(controller.qaIsTreePresentation && !controller.qaShowsSearchResults, "closing results unexpectedly switched to source")
+        controller.qaCloseCSVFind()
     }
 
     private func makeFixtures(in directory: URL) throws -> [URL] {

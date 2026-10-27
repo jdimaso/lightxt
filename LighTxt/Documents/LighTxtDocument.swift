@@ -980,11 +980,13 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
                 && document?.session.searchQuery.isEmpty == false
         case #selector(showFindForCurrentLighTxtDocument(_:)),
              #selector(useSelectionForFindInCurrentLighTxtDocument(_:)),
-             #selector(showGoToLineForCurrentLighTxtDocument(_:)),
              #selector(increaseFontSizeInCurrentLighTxtDocument(_:)),
              #selector(decreaseFontSizeInCurrentLighTxtDocument(_:)),
              #selector(resetFontSizeInCurrentLighTxtDocument(_:)):
             return editor != nil && document?.session.isReadOnly == false
+        case #selector(showGoToLineForCurrentLighTxtDocument(_:)):
+            menuItem.title = editor?.positionNavigationTitle ?? "Go to Line…"
+            return editor?.canNavigatePosition == true
         case #selector(toggleStructureForCurrentLighTxtDocument(_:)):
             return editor?.canToggleStructure == true
         case #selector(showHelpForCurrentLighTxtDocument(_:)):

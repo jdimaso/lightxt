@@ -9,7 +9,14 @@ final class PrettifiedViewportView: NSView {
     private let statusLabel = NSTextField(labelWithString: "Preparing read-only preview…")
     private let scrollView = NSScrollView()
     private let textView = NSTextView(frame: .zero)
-    private var fontSize: CGFloat = 13
+    static let readingFontPreferenceKey = "LighTxt.prettifiedReadingFontSize"
+    private var fontSize: CGFloat = {
+        let saved = UserDefaults.standard.double(forKey: PrettifiedViewportView.readingFontPreferenceKey)
+        return saved.isFinite && saved >= 9 && saved <= 30 ? CGFloat(saved) : 15
+    }()
+    private var syntaxTask: Task<Void, Never>?
+    private var syntaxGeneration: UInt64 = 0
+    private var decorations: [PrettifiedSyntaxDecoration] = []
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -20,7 +27,10 @@ final class PrettifiedViewportView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    deinit { NotificationCenter.default.removeObserver(self) }
+    deinit {
+        syntaxTask?.cancel()
+        NotificationCenter.default.removeObserver(self)
+    }
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -35,12 +45,14 @@ final class PrettifiedViewportView: NSView {
     }
 
     func showLoading(fileType: SyntaxFileType, byteRange: Range<Int64>) {
+        cancelSyntax()
         statusLabel.stringValue = "Preparing read-only \(fileType.displayName) preview for bytes \(byteRange.lowerBound.formatted())–\(byteRange.upperBound.formatted())…"
         statusLabel.toolTip = statusLabel.stringValue
         textView.string = ""
     }
 
-    func show(_ result: ViewportPrettifier.Result) {
+    func show(_ result: ViewportPrettifier.Result, fileType: SyntaxFileType = .json) {
+        cancelSyntax()
         statusLabel.stringValue = result.status
         statusLabel.toolTip = result.status
         statusLabel.textColor = LighTxtTheme.resolved(
@@ -49,6 +61,11 @@ final class PrettifiedViewportView: NSView {
         )
         textView.string = result.text
         applyFont()
+        // Highlight only the formatter's bounded output. A fallback may begin
+        // inside a token, so retain its source-faithful plain-text treatment.
+        if result.didPrettify {
+            highlight(result.text, as: fileType, skippingPartialLine: result.preservedLeadingPartialLine)
+        }
         textView.scrollToBeginningOfDocument(nil)
         textView.setAccessibilityValueDescription(
             result.didPrettify ? "Prettified bounded source preview" : "Exact bounded source fallback"
@@ -56,10 +73,11 @@ final class PrettifiedViewportView: NSView {
     }
 
     func changeFontSize(by delta: CGFloat) { setFontSize(fontSize + delta) }
-    func resetFontSize() { setFontSize(13) }
+    func resetFontSize() { setFontSize(15) }
 
     private func setFontSize(_ value: CGFloat) {
         fontSize = min(30, max(9, value))
+        UserDefaults.standard.set(Double(fontSize), forKey: Self.readingFontPreferenceKey)
         applyFont()
     }
 
@@ -137,6 +155,54 @@ final class PrettifiedViewportView: NSView {
         if let storage = textView.textStorage, storage.length > 0 {
             storage.addAttribute(.font, value: font, range: NSRange(location: 0, length: storage.length))
         }
+        applySyntaxAppearance()
+    }
+
+    private func cancelSyntax() {
+        syntaxTask?.cancel()
+        syntaxTask = nil
+        syntaxGeneration &+= 1
+        decorations.removeAll(keepingCapacity: false)
+    }
+
+    private func highlight(_ text: String, as fileType: SyntaxFileType, skippingPartialLine: Bool) {
+        let generation = syntaxGeneration
+        syntaxTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let decorations = PrettifiedSyntaxDecoration.build(
+                text, fileType: fileType, skippingPartialLine: skippingPartialLine
+            )
+            guard !Task.isCancelled else { return }
+            await self?.install(decorations, generation: generation)
+        }
+    }
+
+    private func install(_ decorations: [PrettifiedSyntaxDecoration], generation: UInt64) {
+        guard generation == syntaxGeneration else { return }
+        syntaxTask = nil
+        self.decorations = decorations
+        applySyntaxAppearance()
+    }
+
+    private func applySyntaxAppearance() {
+        guard let storage = textView.textStorage, storage.length > 0 else { return }
+        let fontChoice = LighTxtEditorFontChoice.persisted()
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 3
+        storage.beginEditing()
+        storage.setAttributes([
+            .font: fontChoice.font(ofSize: fontSize),
+            .foregroundColor: LighTxtTheme.resolved(LighTxtTheme.primaryText, for: effectiveAppearance),
+            .paragraphStyle: paragraph,
+        ], range: NSRange(location: 0, length: storage.length))
+        for decoration in decorations where NSMaxRange(decoration.range) <= storage.length {
+            var attributes = SyntaxPalette.attributes(for: decoration.kind, appearance: effectiveAppearance)
+            attributes[.font] = fontChoice.font(
+                ofSize: fontSize,
+                emphasized: decoration.kind == .key || decoration.kind == .keyword
+            )
+            storage.addAttributes(attributes, range: decoration.range)
+        }
+        storage.endEditing()
     }
 
     private func applyResolvedAppearance() {
@@ -151,6 +217,7 @@ final class PrettifiedViewportView: NSView {
         textView.backgroundColor = background
         textView.textColor = LighTxtTheme.resolved(LighTxtTheme.primaryText, for: appearance)
         statusLabel.textColor = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
+        applySyntaxAppearance()
     }
 
 #if LIGHTXT_RUNTIME_QA
@@ -159,7 +226,61 @@ final class PrettifiedViewportView: NSView {
     var qaIsEditable: Bool { textView.isEditable }
     var qaIsSelectable: Bool { textView.isSelectable }
     var qaFontSize: CGFloat { fontSize }
+    var qaHighlightedSpanCount: Int { decorations.count }
+    var qaHighlightingInProgress: Bool { syntaxTask != nil }
     var qaAccessibilityLabel: String? { accessibilityLabel() }
     var qaTextAccessibilityLabel: String? { textView.accessibilityLabel() }
 #endif
+}
+
+/// Maps lexer byte ranges to AppKit's UTF-16 coordinates in one linear scan.
+/// This owns only the already bounded formatted viewport, never the document.
+private struct PrettifiedSyntaxDecoration: Sendable {
+    let range: NSRange
+    let kind: SyntaxSemanticKind
+
+    nonisolated static func build(_ text: String, fileType: SyntaxFileType, skippingPartialLine: Bool) -> [Self] {
+        let data = Data(text.utf8)
+        guard data.count <= ViewportPrettifier.defaultMaximumOutputBytes, !Task.isCancelled else { return [] }
+        // The formatter can preserve a leading fragment of a quoted value.
+        // Its lexical state is intentionally unknown; begin at the next line
+        // instead of allowing a dangling quote to invert all later colors.
+        let start: Int
+        if skippingPartialLine {
+            guard let newline = data.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) else { return [] }
+            start = newline + 1
+        } else {
+            start = 0
+        }
+        let highlighted = ViewportSyntaxHighlighter.highlight(
+            data.subdata(in: start..<data.count), as: fileType, baseByteOffset: start
+        )
+        let spans = highlighted.spans.sorted { $0.range.start < $1.range.start }
+        var result: [Self] = []
+        result.reserveCapacity(spans.count)
+        data.withUnsafeBytes { raw in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            var byteOffset = 0
+            var utf16Offset = 0
+            func advance(to requested: Int) -> Int {
+                let target = min(requested, bytes.count)
+                while byteOffset < target {
+                    let byte = bytes[byteOffset]
+                    if byte < 0x80 || byte >= 0xC0 { utf16Offset += byte >= 0xF0 ? 2 : 1 }
+                    byteOffset += 1
+                }
+                return utf16Offset
+            }
+            for span in spans {
+                if Task.isCancelled { return }
+                guard span.range.start >= byteOffset else { continue }
+                let lower = advance(to: span.range.start)
+                let upper = advance(to: span.range.end)
+                if upper > lower {
+                    result.append(Self(range: NSRange(location: lower, length: upper - lower), kind: span.kind))
+                }
+            }
+        }
+        return result
+    }
 }

@@ -3,6 +3,30 @@ import XCTest
 @testable import LighTxt
 
 final class CSVInMemoryQueryServiceTests: XCTestCase {
+    func testInspectorFetchesLargerBoundedValuesBySourceRow() async throws {
+        let directory = try Self.makeFixtureDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("inspector.csv")
+        let complete = String(repeating: "x", count: 5_000)
+        let oversized = String(repeating: "雪", count: 70_000)
+        try Data("id,note\n1,\(complete)\n2,\(oversized)\n".utf8).write(to: source)
+        let service = try CSVInMemoryQueryService(
+            url: source,
+            configuration: .init(columnNames: ["id", "note"], delimiter: .comma, firstRowIsHeader: true),
+            limits: .init(maximumCellCharacters: 64),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        defer { Task { await service.close() } }
+        let page = try await service.page(offset: 0, limit: 2, query: .init())
+        XCTAssertTrue(page.rows[0][1].isTruncated)
+        let first = try await service.cellDetail(sourceRowOrdinal: 0, column: 1)
+        XCTAssertEqual(first.value, complete)
+        XCTAssertFalse(first.isTruncated)
+        let second = try await service.cellDetail(sourceRowOrdinal: 1, column: 1)
+        XCTAssertEqual(second.value, String(repeating: "雪", count: 65_536))
+        XCTAssertTrue(second.isTruncated)
+    }
+
     func testHeaderedCSVSupportsResidentPagingFilteringSortingFacetsAndSummary() async throws {
         let directory = try Self.makeFixtureDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -58,9 +58,17 @@ struct PrettifyLifecycleRuntimeQA {
     static func main() throws {
         guard CommandLine.arguments.count == 2 else { throw QAError.usage }
         _ = NSApplication.shared
+        let preferenceKey = PrettifiedViewportView.readingFontPreferenceKey
+        let savedPreference = UserDefaults.standard.object(forKey: preferenceKey)
+        UserDefaults.standard.removeObject(forKey: preferenceKey)
+        defer {
+            if let savedPreference { UserDefaults.standard.set(savedPreference, forKey: preferenceKey) }
+            else { UserDefaults.standard.removeObject(forKey: preferenceKey) }
+        }
         let output = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
         try assertHeaderAtMinimumWidth()
+        try assertSyntaxAndRememberedReadingSize()
         try assertNonDestructiveDetachRestore(
             lightCapture: output.appendingPathComponent("prettify-light.png"),
             darkCapture: output.appendingPathComponent("prettify-dark.png")
@@ -70,6 +78,54 @@ struct PrettifyLifecycleRuntimeQA {
                 + "read-only light/dark preview; Cmd +/-/0; exact revision/dirty/undo, "
                 + "caret, and visible byte range survive toggle on/off."
         )
+    }
+
+    private static func assertSyntaxAndRememberedReadingSize() throws {
+        let preview = PrettifiedViewportView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+        let window = host(preview, size: preview.frame.size, appearance: .aqua)
+        defer { window.close() }
+        let source = Data(#"{"emoji":"🟦 café","after":42,"enabled":true}"#.utf8)
+        let formatted = try ViewportPrettifier.prettify(
+            source, as: .json, viewportRange: 0..<Int64(source.count), documentByteCount: Int64(source.count)
+        )
+        preview.show(formatted)
+        try wait { !preview.qaHighlightingInProgress }
+        guard preview.qaHighlightedSpanCount > 0,
+              let textView = descendant(of: preview, as: NSTextView.self),
+              let storage = textView.textStorage else {
+            throw QAError.failed("Prettified JSON did not receive bounded syntax highlighting")
+        }
+        func assertToken(_ token: String, kind: SyntaxSemanticKind) throws {
+            let range = (storage.string as NSString).range(of: token)
+            guard range.location != NSNotFound,
+                  let actual = storage.attribute(.foregroundColor, at: range.location, effectiveRange: nil) as? NSColor,
+                  actual.isEqual(LighTxtTheme.resolved(SyntaxPalette.color(for: kind), for: preview.effectiveAppearance)) else {
+                throw QAError.failed("Prettify lost the \(kind.rawValue) color after Unicode or appearance change")
+            }
+        }
+        try assertToken("\"after\"", kind: .key)
+        try assertToken("42", kind: .number)
+        try assertToken("true", kind: .boolean)
+        preview.changeFontSize(by: 3)
+        let recreated = PrettifiedViewportView(frame: .zero)
+        guard recreated.qaFontSize == 18 else { throw QAError.failed("Prettify reading size was not remembered") }
+        let numberRange = (storage.string as NSString).range(of: "42")
+        guard let font = storage.attribute(.font, at: numberRange.location, effectiveRange: nil) as? NSFont,
+              font.pointSize == 18 else { throw QAError.failed("Syntax highlighting overrode the reading size") }
+        preview.appearance = NSAppearance(named: .darkAqua)
+        settle(window)
+        try assertToken("\"after\"", kind: .key)
+        try assertToken("42", kind: .number)
+
+        // Loading a new region must discard obsolete color work and content.
+        preview.show(formatted)
+        preview.showLoading(fileType: .json, byteRange: 100..<200)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        guard preview.qaText.isEmpty, preview.qaHighlightedSpanCount == 0,
+              !preview.qaHighlightingInProgress else {
+            throw QAError.failed("Obsolete syntax work painted over a new loading state")
+        }
+        preview.resetFontSize()
     }
 
     private static func assertHeaderAtMinimumWidth() throws {
@@ -172,6 +228,17 @@ struct PrettifyLifecycleRuntimeQA {
         let preview = PrettifiedViewportView(frame: hostView.bounds)
         install(preview, in: hostView)
         preview.show(formatted)
+        try wait { !preview.qaHighlightingInProgress }
+        guard let previewText = descendant(of: preview, as: NSTextView.self),
+              let previewStorage = previewText.textStorage else {
+            throw QAError.failed("Missing prettified text storage")
+        }
+        let keyRange = (previewStorage.string as NSString).range(of: "\"marker\"")
+        guard keyRange.location != NSNotFound,
+              let keyColor = previewStorage.attribute(.foregroundColor, at: keyRange.location, effectiveRange: nil) as? NSColor,
+              keyColor.isEqual(LighTxtTheme.resolved(SyntaxPalette.color(for: .key), for: preview.effectiveAppearance)) else {
+            throw QAError.failed("Leading partial JSON line corrupted the syntax colors of subsequent keys")
+        }
         settle(window)
         try assertHostSize(hostView, window: window, expected: pinnedHostSize, stage: "preview")
         guard !preview.qaIsEditable,
@@ -184,7 +251,7 @@ struct PrettifyLifecycleRuntimeQA {
         for _ in 0..<30 { preview.changeFontSize(by: 1) }
         guard preview.qaFontSize == 30 else { throw QAError.failed("Prettify maximum zoom changed") }
         preview.resetFontSize()
-        guard preview.qaFontSize == 13 else { throw QAError.failed("Prettify reset zoom changed") }
+        guard preview.qaFontSize == 15 else { throw QAError.failed("Prettify reset zoom changed") }
         try capture(hostView, to: lightCapture)
         hostView.appearance = NSAppearance(named: .darkAqua)
         settle(window)

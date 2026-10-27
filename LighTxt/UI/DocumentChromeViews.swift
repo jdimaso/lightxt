@@ -30,7 +30,7 @@ final class DocumentHeaderView: NSView {
     private let editedDot = NSView()
     private let typeBadge = FileTypeBadgeView()
     private let modeControl = NSSegmentedControl(
-        labels: ["View", "Edit"],
+        labels: ["Preview", "Source"],
         trackingMode: .selectOne,
         target: nil,
         action: nil
@@ -57,6 +57,12 @@ final class DocumentHeaderView: NSView {
     private var isPrettifyAvailable = false
     private var isExportVisible = false
     private var isReloadVisible = false
+    private var presentationChoicesVisible = true
+    private var documentTypeName = "Plain Text"
+    private var documentByteCount: Int64 = 0
+    private var documentEdited = false
+    private var presentationEditable = true
+    private var presentationEditingReason: String?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -98,7 +104,10 @@ final class DocumentHeaderView: NSView {
         pathControl.setAccessibilityValue(currentFileURL?.path ?? "")
         pathControl.isHidden = currentFileURL == nil
         titleLabel.isHidden = currentFileURL != nil
-        detailLabel.stringValue = "\(typeName)  ·  \(ByteCountFormatter.lighTxt.string(fromByteCount: byteCount))"
+        documentTypeName = typeName
+        documentByteCount = byteCount
+        documentEdited = edited
+        updateDetailLabel()
         typeBadge.text = typeAbbreviation.uppercased()
         editedDot.isHidden = !edited
         setStructureAvailable(structureAvailable)
@@ -108,7 +117,40 @@ final class DocumentHeaderView: NSView {
 
     var presentationMode: DocumentPresentationMode {
         get { DocumentPresentationMode(rawValue: modeControl.selectedSegment) ?? .edit }
-        set { modeControl.selectedSegment = newValue.rawValue }
+        set {
+            modeControl.selectedSegment = newValue.rawValue
+            modeControl.setAccessibilityValue(modeControl.label(forSegment: newValue.rawValue))
+        }
+    }
+
+    /// Presentation names describe the content, independently of whether the
+    /// current presentation permits changes (CSV tables can be editable).
+    func setPresentationLabels(view: String, source: String = "Source") {
+        modeControl.setLabel(view, forSegment: DocumentPresentationMode.view.rawValue)
+        modeControl.setLabel(source, forSegment: DocumentPresentationMode.edit.rawValue)
+        modeControl.setAccessibilityLabel("Document presentation")
+        modeControl.setAccessibilityValue(presentationMode == .view ? view : source)
+    }
+
+    func setPresentationChoicesVisible(_ visible: Bool) {
+        presentationChoicesVisible = visible
+        modeControl.isHidden = !visible
+        updateTrailingWidth()
+    }
+
+    func setPresentationEditable(_ editable: Bool, reason: String? = nil) {
+        presentationEditable = editable
+        presentationEditingReason = reason
+        updateDetailLabel()
+    }
+
+    private func updateDetailLabel() {
+        let access = presentationEditable ? "Editable" : "Read-only"
+        var parts = [documentTypeName, ByteCountFormatter.lighTxt.string(fromByteCount: documentByteCount), access]
+        if documentEdited { parts.append("Unsaved changes") }
+        detailLabel.stringValue = parts.joined(separator: "  ·  ")
+        detailLabel.toolTip = presentationEditingReason ?? detailLabel.stringValue
+        detailLabel.setAccessibilityLabel(detailLabel.stringValue)
     }
 
     func setStructureVisible(_ visible: Bool) {
@@ -130,11 +172,11 @@ final class DocumentHeaderView: NSView {
     func setEditingAvailable(_ available: Bool, unavailableReason: String? = nil) {
         modeControl.setEnabled(available, forSegment: DocumentPresentationMode.edit.rawValue)
         if !available {
-            modeControl.selectedSegment = DocumentPresentationMode.view.rawValue
+            presentationMode = .view
         }
         modeControl.toolTip = available
-            ? "Switch between a rendered view and byte-window editing"
-            : (unavailableReason ?? "This document is available in read-only View mode")
+            ? "Choose how to display this document. Editing availability is shown beside the file details."
+            : (unavailableReason ?? "Source editing is unavailable for this document")
         modeControl.setAccessibilityHelp(modeControl.toolTip)
     }
 
@@ -273,10 +315,10 @@ final class DocumentHeaderView: NSView {
         modeControl.segmentStyle = .capsule
         modeControl.controlSize = .small
         modeControl.selectedSegment = DocumentPresentationMode.edit.rawValue
-        modeControl.setWidth(58, forSegment: 0)
-        modeControl.setWidth(58, forSegment: 1)
-        modeControl.toolTip = "Switch between a rendered view and byte-window editing"
-        modeControl.setAccessibilityLabel("Document mode")
+        modeControl.setWidth(68, forSegment: 0)
+        modeControl.setWidth(68, forSegment: 1)
+        modeControl.toolTip = "Choose how to display this document. Editing availability is shown beside the file details."
+        modeControl.setAccessibilityLabel("Document presentation")
         modeControl.setContentHuggingPriority(.required, for: .horizontal)
 
         prettifyButton.target = self
@@ -321,7 +363,7 @@ final class DocumentHeaderView: NSView {
             addSubview($0)
         }
 
-        let trailingWidthConstraint = trailing.widthAnchor.constraint(equalToConstant: 197)
+        let trailingWidthConstraint = trailing.widthAnchor.constraint(equalToConstant: 217)
         self.trailingWidthConstraint = trailingWidthConstraint
         NSLayoutConstraint.activate([
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 82),
@@ -352,7 +394,7 @@ final class DocumentHeaderView: NSView {
         // The fixed width prevents the path and type badge from nudging the
         // trailing controls as contextual actions appear. Each icon adds its
         // 32pt hit target plus the stack's 8pt spacing; Prettify adds 84pt.
-        trailingWidthConstraint?.constant = CGFloat(197)
+        trailingWidthConstraint?.constant = (presentationChoicesVisible ? CGFloat(217) : CGFloat(73))
             + (isExportVisible ? CGFloat(40) : 0)
             + (isReloadVisible ? CGFloat(40) : 0)
             + (isPrettifyAvailable ? CGFloat(84) : 0)
@@ -377,6 +419,7 @@ final class DocumentHeaderView: NSView {
 
     @objc private func modeChanged(_ sender: NSSegmentedControl) {
         guard let mode = DocumentPresentationMode(rawValue: sender.selectedSegment) else { return }
+        sender.setAccessibilityValue(sender.label(forSegment: mode.rawValue))
         onPresentationModeChanged?(mode)
     }
 
@@ -387,6 +430,11 @@ final class DocumentHeaderView: NSView {
     }
 
 #if LIGHTXT_RUNTIME_QA
+    var qaPresentationLabels: [String] {
+        (0..<modeControl.segmentCount).map { modeControl.label(forSegment: $0) ?? "" }
+    }
+    var qaPresentationChoicesVisible: Bool { !modeControl.isHidden }
+    var qaDetailText: String { detailLabel.stringValue }
     var qaPrettifyIsVisible: Bool { !prettifyButton.isHidden }
     var qaPrettifyIsEnabled: Bool { prettifyButton.isEnabled }
     var qaPrettifyIsOn: Bool { prettifyButton.state == .on }
@@ -687,11 +735,29 @@ final class HeaderIconButton: NSView {
 
 @MainActor
 final class DocumentStatusBar: NSView {
-    private let positionLabel = NSTextField(labelWithString: "Ln 1, Col 1")
+    /// Return nil after a successful jump, or a message to keep the popover
+    /// open with an actionable inline error. Row navigation uses this callback
+    /// too; the owner knows which presentation is currently installed.
+    var onGoToLine: ((Int64, @escaping (String?) -> Void) -> Void)? {
+        didSet { updateNavigationAvailability() }
+    }
+
+    private let positionButton = NSButton(title: "Ln 1, Col 1", target: nil, action: nil)
+    private let documentStateLabel = NSTextField(labelWithString: "Saved")
     private let stateLabel = NSTextField(labelWithString: "Ready")
     private let progress = NSProgressIndicator()
-    private let memoryBadge = NSTextField(labelWithString: "BYTE WINDOW")
+    private let infoButton = NSButton()
     private var stateIsError = false
+    private var documentEdited = false
+    private var storageSummary = "BYTE WINDOW"
+    private var storageDetail = "Only the visible portion of the document is loaded for editing."
+    private var navigationUnit = "line"
+    private var navigationCurrent: Int64?
+    private var navigationTotal: Int64?
+    private var navigationEnabled = false
+    private var activePopover: NSPopover?
+    private var positionController: DocumentPositionPopoverController?
+    private var informationController: DocumentInformationPopoverController?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -716,12 +782,69 @@ final class DocumentStatusBar: NSView {
         applyResolvedAppearance()
     }
 
+    func setDocumentState(edited: Bool, readOnly: Bool = false) {
+        documentEdited = edited
+        documentStateLabel.stringValue = edited ? "Unsaved changes" : "Saved"
+        documentStateLabel.toolTip = readOnly
+            ? "This document is read-only. \(edited ? "It contains unsaved changes." : "There are no unsaved changes.")"
+            : (edited ? "Save to keep your changes on disk." : "There are no unsaved changes.")
+        documentStateLabel.setAccessibilityLabel(documentStateLabel.stringValue)
+        applyResolvedAppearance()
+    }
+
     func updatePosition(line: Int64, column: Int, selectionByteCount: Int64 = 0) {
+        navigationCurrent = line
         var text = "Ln \(line.formatted()), Col \(column.formatted())"
         if selectionByteCount > 0 {
             text += "  ·  \(ByteCountFormatter.lighTxt.string(fromByteCount: selectionByteCount)) selected"
         }
-        positionLabel.stringValue = text
+        positionButton.title = text
+        positionButton.setAccessibilityLabel(text)
+    }
+
+    func setPositionSummary(_ text: String) {
+        positionButton.title = text
+        positionButton.setAccessibilityLabel(text)
+    }
+
+    var canNavigatePosition: Bool { positionButton.isEnabled }
+
+    func updateTablePosition(row: Int64, selectedRowCount: Int, totalRows: Int) {
+        navigationCurrent = row > 0 ? row : nil
+        navigationTotal = Int64(max(0, totalRows))
+        var text = row > 0 ? "Row \(row.formatted()) of \(totalRows.formatted())" : "\(totalRows.formatted()) rows"
+        if selectedRowCount > 0 { text += "  ·  \(selectedRowCount.formatted()) selected" }
+        positionButton.title = text
+        positionButton.setAccessibilityLabel(text)
+        updateNavigationAvailability()
+    }
+
+    func configureLineNavigation(currentLine: Int64?, totalLines: Int64?, enabled: Bool) {
+        configureNavigation(unit: "line", current: currentLine, total: totalLines, enabled: enabled)
+    }
+
+    func configureRowNavigation(currentRow: Int64?, totalRows: Int64?, enabled: Bool) {
+        configureNavigation(unit: "row", current: currentRow, total: totalRows, enabled: enabled)
+    }
+
+    private func configureNavigation(unit: String, current: Int64?, total: Int64?, enabled: Bool) {
+        if positionController != nil, navigationUnit != unit || !enabled {
+            activePopover?.close()
+            positionController = nil
+        }
+        navigationUnit = unit
+        navigationCurrent = current
+        navigationTotal = total
+        navigationEnabled = enabled
+        updateNavigationAvailability()
+    }
+
+    private func updateNavigationAvailability() {
+        positionButton.isEnabled = navigationEnabled && onGoToLine != nil && navigationTotal != 0
+        positionButton.toolTip = positionButton.isEnabled
+            ? "Go to \(navigationUnit)…"
+            : "Current document position"
+        positionButton.setAccessibilityHelp(positionButton.toolTip)
     }
 
     func setState(_ text: String, busy: Bool = false, isError: Bool = false) {
@@ -732,60 +855,129 @@ final class DocumentStatusBar: NSView {
         applyResolvedAppearance()
         progress.isHidden = !busy
         busy ? progress.startAnimation(nil) : progress.stopAnimation(nil)
+        refreshInformation()
     }
 
     func updateByteWindow(_ range: Range<Int64>, totalByteCount: Int64) {
         let lower = min(max(0, range.lowerBound), totalByteCount)
         let upper = min(max(lower, range.upperBound), totalByteCount)
-        memoryBadge.stringValue = "BYTE WINDOW \(lower.formatted())–\(upper.formatted()) OF \(ByteCountFormatter.lighTxt.string(fromByteCount: totalByteCount))"
-        memoryBadge.toolTip = "Editing bytes \(lower.formatted()) through \(upper.formatted()) of \(totalByteCount.formatted()) total bytes"
+        storageSummary = "BYTE WINDOW \(lower.formatted())–\(upper.formatted()) OF \(ByteCountFormatter.lighTxt.string(fromByteCount: totalByteCount))"
+        storageDetail = "File size: \(ByteCountFormatter.lighTxt.string(fromByteCount: totalByteCount))\nVisible source: bytes \(lower.formatted())–\(upper.formatted())\nOnly the visible portion is loaded for editing."
+        refreshInformation()
     }
 
     func showFileBackedView(totalByteCount: Int64) {
-        memoryBadge.stringValue = "FILE-BACKED VIEW · \(ByteCountFormatter.lighTxt.string(fromByteCount: totalByteCount))"
-        memoryBadge.toolTip = "The document remains file-backed while this view is open"
+        storageSummary = "FILE-BACKED VIEW · \(ByteCountFormatter.lighTxt.string(fromByteCount: totalByteCount))"
+        storageDetail = "File size: \(ByteCountFormatter.lighTxt.string(fromByteCount: totalByteCount))\nContent is read from the file as needed."
+        refreshInformation()
     }
 
     func showMemoryBackedCSV(totalByteCount: Int64) {
-        memoryBadge.stringValue = "IN-MEMORY CSV · \(ByteCountFormatter.lighTxt.string(fromByteCount: totalByteCount))"
-        memoryBadge.toolTip = "The CSV is materialized in DuckDB memory for fast sorting and filtering"
+        storageSummary = "IN-MEMORY CSV · \(ByteCountFormatter.lighTxt.string(fromByteCount: totalByteCount))"
+        storageDetail = "File size: \(ByteCountFormatter.lighTxt.string(fromByteCount: totalByteCount))\nThis table is held in memory for faster sorting and filtering."
+        refreshInformation()
+    }
+
+    private var informationText: String {
+        "\(storageDetail)\n\nCurrent activity\n\(stateLabel.toolTip ?? stateLabel.stringValue)"
+    }
+
+    private func refreshInformation() {
+        informationController?.update(informationText)
+    }
+
+    @objc func showGoToLine(_ sender: Any? = nil) {
+        guard positionButton.isEnabled, window != nil else { return }
+        activePopover?.close()
+        let controller = makePositionController()
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = controller
+        activePopover = popover
+        informationController = nil
+        controller.onClose = { [weak popover] in popover?.close() }
+        popover.show(relativeTo: positionButton.bounds, of: positionButton, preferredEdge: .maxY)
+    }
+
+    private func makePositionController() -> DocumentPositionPopoverController {
+        let controller = DocumentPositionPopoverController(
+            unit: navigationUnit, current: navigationCurrent, total: navigationTotal
+        )
+        controller.onSubmit = { [weak self] value, completion in
+            guard let self, self.positionButton.isEnabled, let action = self.onGoToLine else {
+                completion("Navigation is unavailable in this presentation.")
+                return
+            }
+            action(value, completion)
+        }
+        positionController = controller
+        return controller
+    }
+
+    @objc private func showInformation(_ sender: Any?) {
+        guard window != nil else { return }
+        activePopover?.close()
+        let controller = DocumentInformationPopoverController(text: informationText)
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = controller
+        activePopover = popover
+        positionController = nil
+        informationController = controller
+        popover.show(relativeTo: infoButton.bounds, of: infoButton, preferredEdge: .maxY)
     }
 
     private func configure() {
-        positionLabel.font = LighTxtTheme.detailFont
-        positionLabel.textColor = LighTxtTheme.secondaryText
-        positionLabel.setContentHuggingPriority(.required, for: .horizontal)
+        positionButton.target = self
+        positionButton.action = #selector(showGoToLine(_:))
+        positionButton.isBordered = false
+        positionButton.font = LighTxtTheme.detailFont
+        positionButton.setContentHuggingPriority(.required, for: .horizontal)
+        positionButton.setAccessibilityIdentifier("LighTxt.Status.Position")
+        updateNavigationAvailability()
+
+        documentStateLabel.font = LighTxtTheme.detailFont
+        documentStateLabel.setContentHuggingPriority(.required, for: .horizontal)
 
         stateLabel.font = LighTxtTheme.detailFont
-        stateLabel.textColor = LighTxtTheme.secondaryText
         stateLabel.alignment = .center
         stateLabel.lineBreakMode = .byTruncatingMiddle
         stateLabel.maximumNumberOfLines = 1
         stateLabel.cell?.wraps = false
         stateLabel.cell?.usesSingleLineMode = true
         stateLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        stateLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         progress.style = .spinning
         progress.controlSize = .small
         progress.isDisplayedWhenStopped = false
         progress.isHidden = true
 
-        memoryBadge.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold)
-        memoryBadge.textColor = LighTxtTheme.accent
-        memoryBadge.toolTip = "Only the displayed byte window is materialized for editing"
-        memoryBadge.setContentHuggingPriority(.required, for: .horizontal)
+        infoButton.image = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Document information")
+        infoButton.imagePosition = .imageOnly
+        infoButton.isBordered = false
+        infoButton.target = self
+        infoButton.action = #selector(showInformation(_:))
+        infoButton.toolTip = "Document information"
+        infoButton.setAccessibilityLabel("Document information")
+        infoButton.setAccessibilityHelp("Show file size, loading details, and the complete activity message.")
+        infoButton.setContentHuggingPriority(.required, for: .horizontal)
 
-        let row = NSStackView(views: [positionLabel, stateLabel, progress, memoryBadge])
+        let row = NSStackView(views: [positionButton, stateLabel, progress, documentStateLabel, infoButton])
         row.translatesAutoresizingMaskIntoConstraints = false
         row.orientation = .horizontal
+        row.distribution = .fill
         row.alignment = .centerY
-        row.spacing = 9
+        row.spacing = 12
         addSubview(row)
 
         NSLayoutConstraint.activate([
             row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 11),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -11),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
+            positionButton.heightAnchor.constraint(equalToConstant: 24),
+            infoButton.widthAnchor.constraint(equalToConstant: 24),
+            infoButton.heightAnchor.constraint(equalToConstant: 24),
             progress.widthAnchor.constraint(equalToConstant: 14),
             progress.heightAnchor.constraint(equalToConstant: 14)
         ])
@@ -800,23 +992,16 @@ final class DocumentStatusBar: NSView {
 
     private func applyResolvedAppearance() {
         let appearance = effectiveAppearance
-        layer?.backgroundColor = LighTxtTheme.resolved(
-            LighTxtTheme.chromeBackground,
-            for: appearance
-        ).cgColor
-        layer?.borderColor = LighTxtTheme.resolved(
-            LighTxtTheme.separator,
-            for: appearance
-        ).cgColor
-        positionLabel.textColor = LighTxtTheme.resolved(
-            LighTxtTheme.secondaryText,
-            for: appearance
+        layer?.backgroundColor = LighTxtTheme.resolved(LighTxtTheme.chromeBackground, for: appearance).cgColor
+        layer?.borderColor = LighTxtTheme.resolved(LighTxtTheme.separator, for: appearance).cgColor
+        positionButton.contentTintColor = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
+        documentStateLabel.textColor = LighTxtTheme.resolved(
+            documentEdited ? LighTxtTheme.accent : LighTxtTheme.secondaryText, for: appearance
         )
         stateLabel.textColor = LighTxtTheme.resolved(
-            stateIsError ? LighTxtTheme.error : LighTxtTheme.secondaryText,
-            for: appearance
+            stateIsError ? LighTxtTheme.error : LighTxtTheme.secondaryText, for: appearance
         )
-        memoryBadge.textColor = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
+        infoButton.contentTintColor = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
     }
 
 #if LIGHTXT_RUNTIME_QA
@@ -829,6 +1014,196 @@ final class DocumentStatusBar: NSView {
             && stateLabel.cell?.usesSingleLineMode == true
             && stateLabel.lineBreakMode == .byTruncatingMiddle
     }
-    var qaMemoryBadgeText: String { memoryBadge.stringValue }
+    var qaMemoryBadgeText: String { storageSummary }
+    var qaDocumentStateText: String { documentStateLabel.stringValue }
+    var qaInformationText: String { informationText }
+    var qaPositionText: String { positionButton.title }
+    var qaPositionEnabled: Bool { positionButton.isEnabled }
+    var qaJumpError: String? { positionController?.validationText }
+    var qaJumpContentView: NSView? { positionController?.view }
+    func qaSubmitJump(_ value: String) {
+        let controller = makePositionController()
+        _ = controller.view
+        controller.submit(value)
+    }
 #endif
+}
+
+@MainActor
+private final class DocumentInformationPopoverController: NSViewController {
+    private let details = NSTextView(frame: NSRect(x: 0, y: 0, width: 308, height: 160))
+    private var text: String
+
+    init(text: String) {
+        self.text = text
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func loadView() {
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 230))
+        let title = NSTextField(labelWithString: "Document information")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        details.font = .systemFont(ofSize: 12)
+        details.isEditable = false
+        details.isSelectable = true
+        details.drawsBackground = false
+        details.isVerticallyResizable = true
+        details.isHorizontallyResizable = false
+        details.autoresizingMask = [.width]
+        details.textContainerInset = .zero
+        details.textContainer?.lineFragmentPadding = 0
+        details.textContainer?.widthTracksTextView = true
+        details.textContainer?.containerSize = NSSize(width: 308, height: CGFloat.greatestFiniteMagnitude)
+        details.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        details.string = text
+        details.setAccessibilityLabel("File details and current activity")
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.documentView = details
+        view.addSubview(title)
+        view.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            title.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            title.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            title.topAnchor.constraint(equalTo: view.topAnchor, constant: 16),
+            scrollView.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 12),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -16)
+        ])
+    }
+
+    func update(_ text: String) {
+        self.text = text
+        if isViewLoaded { details.string = text }
+    }
+}
+
+@MainActor
+private final class DocumentPositionPopoverController: NSViewController, NSTextFieldDelegate {
+    var onSubmit: ((Int64, @escaping (String?) -> Void) -> Void)?
+    var onClose: (() -> Void)?
+    private let unit: String
+    private let current: Int64?
+    private let total: Int64?
+    private let field = NSTextField(string: "")
+    private let validation = NSTextField(wrappingLabelWithString: "")
+    private let goButton = NSButton(title: "Go", target: nil, action: nil)
+    private var requestGeneration = 0
+
+    init(unit: String, current: Int64?, total: Int64?) {
+        self.unit = unit
+        self.current = current
+        self.total = total
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func loadView() {
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 290, height: 160))
+        let title = NSTextField(labelWithString: "Go to \(unit)")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        field.placeholderString = "\(unit.capitalized) number"
+        field.stringValue = current.map(String.init) ?? ""
+        field.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        field.delegate = self
+        field.target = self
+        field.action = #selector(submitField(_:))
+        field.setAccessibilityLabel("\(unit.capitalized) number")
+        validation.font = .systemFont(ofSize: 11)
+        validation.textColor = .secondaryLabelColor
+        validation.stringValue = total.map { "Enter a \(unit) from 1 to \($0.formatted())." }
+            ?? "Enter a positive \(unit) number."
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancel(_:)))
+        cancel.bezelStyle = .rounded
+        cancel.keyEquivalent = "\u{1b}"
+        goButton.target = self
+        goButton.action = #selector(submitField(_:))
+        goButton.bezelStyle = .rounded
+        goButton.keyEquivalent = "\r"
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let buttons = NSStackView(views: [spacer, cancel, goButton])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
+        let stack = NSStackView(views: [title, field, validation, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 16),
+            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -16),
+            field.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            validation.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            buttons.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            field.heightAnchor.constraint(equalToConstant: 24)
+        ])
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        view.window?.makeFirstResponder(field)
+        field.selectText(nil)
+    }
+
+    @objc private func submitField(_ sender: Any?) { submit(field.stringValue) }
+    @objc private func cancel(_ sender: Any?) {
+        requestGeneration += 1
+        onClose?()
+    }
+
+    func submit(_ text: String) {
+        guard goButton.isEnabled else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+              let value = Int64(trimmed), value > 0 else {
+            showValidation("Enter a positive whole \(unit) number.")
+            return
+        }
+        if let total, value > total {
+            showValidation("This document has \(total.formatted()) \(unit)\(total == 1 ? "" : "s").")
+            return
+        }
+        guard let onSubmit else {
+            showValidation("Navigation is unavailable in this presentation.")
+            return
+        }
+        requestGeneration += 1
+        let generation = requestGeneration
+        goButton.isEnabled = false
+        field.isEnabled = false
+        validation.textColor = .secondaryLabelColor
+        validation.stringValue = "Locating \(unit) \(value.formatted())…"
+        onSubmit(value) { [weak self] error in
+            guard let self, self.requestGeneration == generation else { return }
+            self.goButton.isEnabled = true
+            self.field.isEnabled = true
+            if let error { self.showValidation(error) }
+            else { self.onClose?() }
+        }
+    }
+
+    private func showValidation(_ message: String) {
+        validation.stringValue = message
+        validation.textColor = .systemRed
+        validation.setAccessibilityValue(message)
+        preferredContentSize = NSSize(width: 290, height: max(160, view.fittingSize.height))
+        NSAccessibility.post(element: validation, notification: .valueChanged)
+    }
+
+    var validationText: String { validation.stringValue }
 }

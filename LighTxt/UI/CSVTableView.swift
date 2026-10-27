@@ -125,6 +125,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         }
     }
     var onStatusChange: ((String, Bool) -> Void)?
+    var onPositionChange: ((Int64, Int, Int) -> Void)? { didSet { publishPosition() } }
     var onEditingRegistrationChange: ((Bool) -> Void)?
     var onLoadInMemoryRequest: ((DelimitedTextDelimiter, Bool, [String]) -> Void)?
 
@@ -192,6 +193,8 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         case filterChip(column: Int)
     }
     private var presentedPopover: NSPopover?
+    private var valueInspector: TabularValueInspector?
+    private var inspectorCancellation: CancellationToken?
     private var presentedPopoverAnchor: PopoverAnchor?
     private var uniqueValuesTask: Task<Void, Never>?
     private var pendingFilterQuery: DispatchWorkItem?
@@ -233,6 +236,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     deinit {
+        inspectorCancellation?.cancel()
         indexingCancellation?.cancel()
         queryCancellation?.cancel()
         summaryCancellation?.cancel()
@@ -248,6 +252,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     func reloadDocument() {
+        dismissValueInspector()
         isResidentPresentationPurged = false
         invalidateSearchNavigation()
         generation &+= 1
@@ -275,6 +280,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         columnCount = 0
         removeDataColumns()
         tableView.reloadData()
+        publishPosition()
 
         guard let delegate = editorDelegate else {
             setBusy(false, text: "No CSV document")
@@ -314,6 +320,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     func deactivate() {
         guard commitPendingEdit() else { return }
+        dismissValueInspector()
         isResidentPresentationPurged = false
         generation &+= 1
         indexingCancellation?.cancel()
@@ -343,6 +350,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         firstParsedRecord = nil
         pendingPages.removeAll(keepingCapacity: true)
         tableView.reloadData()
+        publishPosition()
         setBusy(false, text: "CSV table paused")
     }
 
@@ -452,6 +460,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         if let rowIndex {
             latestProgress = rowIndex.progress
             tableView.reloadData()
+            publishPosition()
         }
         return true
     }
@@ -733,6 +742,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         headerCheckbox.state = enabled ? .on : .off
         configureColumnsFromAvailableRecords()
         tableView.reloadData()
+        publishPosition()
         requestApplyQuery()
     }
 
@@ -760,6 +770,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         super.viewDidChangeEffectiveAppearance()
         applyAppearance()
         tableView.reloadData()
+        publishPosition()
     }
 
     private func configureControls() {
@@ -845,6 +856,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         tableView.headerView = headerView
         tableView.bodyMenuProvider = { [weak self] tableColumn, row in
             self?.rowMenu(forTableColumn: tableColumn, row: row)
+        }
+        tableView.inspectValueProvider = { [weak self] tableColumn, row in
+            guard let self else { return false }
+            let column = self.dataColumn(forTableColumnIndex: tableColumn) ?? self.focusedDataColumn
+            return self.inspectValue(displayedRow: row, column: column)
         }
         tableView.setAccessibilityLabel("CSV table")
 
@@ -1099,6 +1115,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         }
         configureColumns(sample: sample)
         tableView.reloadData()
+        publishPosition()
         restorePendingScrollIfPossible()
         if progress.isComplete,
            (!activeFilters.isEmpty || activeSort != nil),
@@ -1131,6 +1148,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             )
         }
         tableView.reloadData()
+        publishPosition()
         restorePendingScrollIfPossible()
         if progress.isComplete,
            (!activeFilters.isEmpty || activeSort != nil),
@@ -1321,7 +1339,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                     && !field.wasTruncated
                     && !isTableOperationInFlight
                 if field.wasTruncated {
-                    cell.toolTip = "This field is larger than the table preview limit. Edit it safely in text mode."
+                    cell.toolTip = "Value shortened in the table. Choose Inspect Value to read a longer preview, or Source to edit."
                 }
             }
         } else {
@@ -1371,8 +1389,34 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
-        guard let column = dataColumn(forTableColumnIndex: tableView.clickedColumn) else { return }
-        focusedDataColumn = column
+        if let column = dataColumn(forTableColumnIndex: tableView.clickedColumn) {
+            focusedDataColumn = column
+        }
+        publishPosition()
+    }
+
+    private func publishPosition() {
+        onPositionChange?(
+            Int64(max(0, tableView.selectedRow + 1)),
+            tableView.selectedRowIndexes.count,
+            tableView.numberOfRows
+        )
+    }
+
+    func jumpToDisplayedRow(_ row: Int64) -> String? {
+        guard !isTableOperationInFlight else { return "Wait for the current table operation to finish." }
+        let total = tableView.numberOfRows
+        guard row > 0, row <= Int64(total) else {
+            return total == 0 ? "There are no rows to jump to." : "Enter a row from 1 to \(total.formatted())."
+        }
+        guard commitPendingEdit() else { return "Finish editing the current cell before jumping to another row." }
+        let displayedRow = Int(row - 1)
+        tableView.selectRowIndexes(IndexSet(integer: displayedRow), byExtendingSelection: false)
+        tableView.scrollRowToVisible(displayedRow)
+        if let record = try? sourceRecord(forDisplayedRow: row - 1) { _ = recordForDisplay(record) }
+        window?.makeFirstResponder(tableView)
+        publishPosition()
+        return nil
     }
 
     func tableView(
@@ -1486,6 +1530,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     private func reloadTablePreservingSelection() {
         let selection = tableView.selectedRowIndexes
         tableView.reloadData()
+        publishPosition()
         let rowCount = numberOfRows(in: tableView)
         var validSelection = IndexSet()
         for row in selection where row >= 0 && row < rowCount {
@@ -1684,6 +1729,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         snapshot: DocumentSnapshot,
         editedRecord: Int64
     ) {
+        dismissValueInspector()
         let needsProjectionRefresh = !activeFilters.isEmpty || activeSort != nil
         if needsProjectionRefresh {
             // Never expose a row map computed from the pre-edit snapshot. The
@@ -1720,6 +1766,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             )
         }
         tableView.reloadData()
+        publishPosition()
         let pageStart = (editedRecord / Self.recordPageSize) * Self.recordPageSize
         schedulePageDecode(
             pageStart: pageStart,
@@ -1889,6 +1936,16 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         }
         let selectedRows = selectedVisibleRows()
         let menu = NSMenu(title: "CSV Row")
+        if let column = dataColumn(forTableColumnIndex: tableColumn) {
+            let inspect = menuItem("Inspect Value…", symbol: "text.magnifyingglass", action: #selector(inspectValueFromMenu(_:)))
+            inspect.representedObject = [row, column]
+            inspect.keyEquivalent = "i"
+            inspect.keyEquivalentModifierMask = [.command, .option]
+            inspect.isEnabled = !isTableOperationInFlight
+                && (try? sourceRecord(forDisplayedRow: Int64(row))).flatMap { cachedRecords[$0] } != nil
+            menu.addItem(inspect)
+            menu.addItem(.separator())
+        }
         let above = menuItem(
             "Add Row Above",
             symbol: "arrow.up.to.line.compact",
@@ -1915,6 +1972,70 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         deleteRows.isEnabled = canStartDatasetMutation && !selectedRows.isEmpty
         menu.addItem(deleteRows)
         return menu
+    }
+
+    @objc private func inspectValueFromMenu(_ sender: NSMenuItem) {
+        guard let location = sender.representedObject as? [Int], location.count == 2 else { return }
+        _ = inspectValue(displayedRow: location[0], column: location[1])
+    }
+
+    private func dismissValueInspector() {
+        inspectorCancellation?.cancel()
+        inspectorCancellation = nil
+        valueInspector?.dismiss()
+    }
+
+    @discardableResult
+    private func inspectValue(displayedRow: Int, column: Int) -> Bool {
+        guard commitPendingEdit(), !isTableOperationInFlight, displayedRow >= 0,
+              let record = try? sourceRecord(forDisplayedRow: Int64(displayedRow)),
+              let parsed = recordForDisplay(record),
+              let field = parsed.fields[safe: column],
+              let snapshot, let rowIndex else { return false }
+        inspectorCancellation?.cancel()
+        let cancellation = CancellationToken()
+        inspectorCancellation = cancellation
+        let inspector = valueInspector ?? TabularValueInspector()
+        valueInspector = inspector
+        inspector.onClose = { [weak self] in self?.inspectorCancellation?.cancel() }
+        inspector.show(
+            value: field.value,
+            columnTitle: tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column),
+            sourceRowNumber: record + 1,
+            isTruncated: field.wasTruncated,
+            parentWindow: window
+        )
+        guard field.wasTruncated else { return true }
+        inspector.setValue(field.value, isTruncated: true, loading: true)
+        let expectedGeneration = generation
+        Self.pageDecodingQueue.async { [weak self, weak inspector] in
+            do {
+                guard let location = try rowIndex.recordLocation(
+                    forRecord: record,
+                    cancellation: { cancellation.isCancelled }
+                ) else { return }
+                let fields = try CSVRecordParser.selectedFields(
+                    snapshot: snapshot,
+                    location: location,
+                    columns: [column],
+                    delimiter: rowIndex.delimiter,
+                    maximumValueBytesPerField: 256 << 10,
+                    maximumRetainedValueBytes: 256 << 10,
+                    cancellation: { cancellation.isCancelled }
+                )
+                guard let detail = fields.fields[column] else { return }
+                DispatchQueue.main.async {
+                    guard !cancellation.isCancelled, self?.generation == expectedGeneration else { return }
+                    inspector?.setValue(detail.value, isTruncated: detail.wasTruncated)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard !cancellation.isCancelled, self?.generation == expectedGeneration else { return }
+                    inspector?.setValue(field.value, isTruncated: true, error: error.localizedDescription)
+                }
+            }
+        }
+        return true
     }
 
     private func menuItem(_ title: String, symbol: String, action: Selector) -> NSMenuItem {
@@ -2495,6 +2616,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             publishedSort = activeSort
             tableView.deselectAll(nil)
             tableView.reloadData()
+            publishPosition()
             hideQueryLoadingOverlay()
             restoreTableStatus()
             return
@@ -2589,6 +2711,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                     self.publishedSort = self.activeSort
                     self.tableView.deselectAll(nil)
                     self.tableView.reloadData()
+                    self.publishPosition()
                     self.hideQueryLoadingOverlay()
                     self.restorePendingScrollIfPossible()
                     self.restoreTableStatus()
@@ -2611,6 +2734,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                     self.updateFilterChrome()
                     self.tableView.deselectAll(nil)
                     self.tableView.reloadData()
+                    self.publishPosition()
                     self.report(error)
                 }
             }
@@ -3023,6 +3147,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         updateFilterChrome()
         tableView.deselectAll(nil)
         tableView.reloadData()
+        publishPosition()
 
         mutationGeneration &+= 1
         let currentMutationGeneration = mutationGeneration
@@ -3398,6 +3523,15 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             .items.filter { !$0.isSeparatorItem }.map(\.title) ?? []
     }
 
+    @discardableResult
+    func qaInspectValue(row: Int, column: Int) -> Bool { inspectValue(displayedRow: row, column: column) }
+    var qaInspectorText: String? { valueInspector?.qaText }
+    var qaInspectorContext: String? { valueInspector?.qaContext }
+    var qaInspectorNotice: String? { valueInspector?.qaNotice }
+    var qaInspectorIsReadable: Bool { valueInspector?.qaIsReadOnlyAndWrapped == true }
+    var qaInspectorIsVisible: Bool { valueInspector?.window?.isVisible == true }
+    func qaCloseInspector() { valueInspector?.qaDismissWithEscape() }
+
     var qaEmptySpaceContextMenuTitles: [String] {
         rowMenu(forTableColumn: -1, row: -1)?
             .items.filter { !$0.isSeparatorItem }.map(\.title) ?? []
@@ -3605,6 +3739,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         pendingPages.removeAll(keepingCapacity: true)
         pageDecodeGeneration &+= 1
         tableView.reloadData()
+        publishPosition()
     }
 #endif
 
@@ -5807,6 +5942,22 @@ final class LighTxtCSVHeaderView: NSTableHeaderView, NSSearchFieldDelegate {
 @MainActor
 final class LighTxtCSVTableView: NSTableView {
     var bodyMenuProvider: ((Int, Int) -> NSMenu?)?
+    var inspectValueProvider: ((Int, Int) -> Bool)?
+    private var lastFocusedColumn = -1
+
+    override func mouseDown(with event: NSEvent) {
+        let column = self.column(at: convert(event.locationInWindow, from: nil))
+        if column >= 0 { lastFocusedColumn = column }
+        super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if TabularValueInspector.isInspectShortcut(event), selectedRow >= 0,
+           inspectValueProvider?(selectedColumn >= 0 ? selectedColumn : lastFocusedColumn, selectedRow) == true {
+            return
+        }
+        super.keyDown(with: event)
+    }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)

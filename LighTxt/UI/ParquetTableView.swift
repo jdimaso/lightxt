@@ -17,6 +17,7 @@ private nonisolated enum ParquetTableExportError: Error, LocalizedError, Sendabl
 @MainActor
 final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSPopoverDelegate {
     var onStatusChange: ((String, Bool, Bool) -> Void)?
+    var onPositionChange: ((Int64, Int, Int) -> Void)? { didSet { publishPosition() } }
     var onSourceChanged: (() -> Void)?
     var onReturnToFileBackedCSV: (() -> Void)?
     var onCSVInMemoryLoadFailure: ((Error) -> Void)?
@@ -55,6 +56,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
 
     private var sourceURL: URL?
     private var sourceKind: SourceKind = .parquet
+    private var sourceRowNumberOffset: Int64 = 1
     private var service: (any TabularQueryService)?
     private var returnButtonWidthConstraint: NSLayoutConstraint?
     private var metadata: ParquetMetadata?
@@ -112,6 +114,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private var exportID: UUID?
     private var generation: UInt64 = 0
     private var presentedPopover: NSPopover?
+    private var valueInspector: TabularValueInspector?
+    private var inspectorTask: Task<Void, Never>?
     private weak var presentedFilterController: CSVFilterPopoverViewController?
     private var presentedFilterColumn: Int?
     private var presentedUniqueValuesSearchText = ""
@@ -141,6 +145,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     deinit {
+        inspectorTask?.cancel()
         openTask?.cancel()
         uniqueValuesTask?.cancel()
         summaryTask?.cancel()
@@ -159,6 +164,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         super.viewDidChangeEffectiveAppearance()
         applyAppearance()
         tableView.reloadData()
+        publishPosition()
     }
 
     func load(url: URL) {
@@ -192,6 +198,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                 url: url,
                 kind: .csvInMemory
             )
+            sourceRowNumberOffset = firstRowIsHeader ? 2 : 1
         } catch {
             report(error)
             onCSVInMemoryLoadFailure?(error)
@@ -205,6 +212,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     ) throws {
         deactivate(showPausedStatus: false)
         sourceKind = kind
+        sourceRowNumberOffset = 1
         updateSourceModeControls()
         isResidentStatePurged = false
         generation &+= 1
@@ -234,6 +242,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                 self.configureColumns(metadata.columns)
                 self.updateFilterStrip()
                 self.tableView.reloadData()
+                self.publishPosition()
                 self.materializeHeaderFilterControls()
                 self.setBusy(
                     true,
@@ -368,6 +377,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     private func deactivate(showPausedStatus: Bool) {
+        inspectorTask?.cancel()
+        inspectorTask = nil
+        valueInspector?.dismiss()
         isResidentStatePurged = false
         requiresExplicitReload = false
         generation &+= 1
@@ -412,6 +424,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         tableView.sortDescriptors = []
         isSettingSortDescriptors = false
         tableView.reloadData()
+        publishPosition()
         hideQueryLoadingOverlay()
         updateFilterStrip()
         if showPausedStatus {
@@ -478,6 +491,12 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         headerView.filterEditingEnabledProvider = { [weak self] in self?.metadata != nil }
         tableView.headerView = headerView
         tableView.bodyMenuProvider = { [weak self] column, row in self?.bodyMenu(column: column, row: row) }
+        tableView.inspectValueProvider = { [weak self] column, row in
+            guard let self else { return false }
+            let dataColumn = self.tableView.tableColumns.indices.contains(column)
+                ? self.dataColumn(self.tableView.tableColumns[column]) : nil
+            return self.inspectValue(row: row, column: dataColumn ?? 0)
+        }
         tableView.activateProvider = { [weak self] column, row in
             self?.toggleStructuredCell(visualColumn: column, row: row) ?? false
         }
@@ -743,7 +762,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             field.placeholderString = nil
             if let value = cell.value {
                 field.stringValue = value
-                field.toolTip = cell.isTruncated ? "Value shortened for the bounded table preview" : value
+                field.toolTip = cell.isTruncated ? "Value shortened in the table. Choose Inspect Value to read a longer preview." : value
             } else {
                 field.stringValue = "NULL"
                 field.textColor = .tertiaryLabelColor
@@ -754,6 +773,31 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             requestPage(containing: Int64(row))
         }
         return field
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) { publishPosition() }
+
+    private func publishPosition() {
+        onPositionChange?(
+            Int64(max(0, tableView.selectedRow + 1)),
+            tableView.selectedRowIndexes.count,
+            tableView.numberOfRows
+        )
+    }
+
+    func jumpToDisplayedRow(_ row: Int64) -> String? {
+        guard !isProjectionQueryInFlight else { return "Wait for the current table operation to finish." }
+        let total = tableView.numberOfRows
+        guard row > 0, row <= Int64(total) else {
+            return total == 0 ? "There are no rows to jump to." : "Enter a row from 1 to \(total.formatted())."
+        }
+        let displayedRow = Int(row - 1)
+        tableView.selectRowIndexes(IndexSet(integer: displayedRow), byExtendingSelection: false)
+        tableView.scrollRowToVisible(displayedRow)
+        requestPage(containing: row - 1)
+        window?.makeFirstResponder(tableView)
+        publishPosition()
+        return nil
     }
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
@@ -828,6 +872,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private func reloadTablePreservingSelection() {
         let selection = tableView.selectedRowIndexes
         tableView.reloadData()
+        publishPosition()
         let rowCount = numberOfRows(in: tableView)
         var validSelection = IndexSet()
         for row in selection where row >= 0 && row < rowCount {
@@ -875,6 +920,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                     self.publishedSort = self.activeSort
                     self.tableView.deselectAll(nil)
                     self.tableView.reloadData()
+                    self.publishPosition()
                     self.hideQueryLoadingOverlay()
                 } else {
                     if rowCountChanged { self.tableView.noteNumberOfRowsChanged() }
@@ -1279,6 +1325,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             restorePublishedProjection()
             return
         }
+        inspectorTask?.cancel()
+        inspectorTask = nil
+        valueInspector?.dismiss()
         generation &+= 1
         cancelPageTasks()
         clearStructuredExpansionState(reload: false)
@@ -1733,6 +1782,13 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         let menu = NSMenu()
         if let column = dataColumn(tableView.tableColumns[tableColumnIndex]),
            let cell = cachedCell(row: row, column: column) {
+            let inspect = NSMenuItem(title: "Inspect Value…", action: #selector(inspectValueFromMenu(_:)), keyEquivalent: "i")
+            inspect.keyEquivalentModifierMask = [.command, .option]
+            inspect.target = self
+            inspect.representedObject = [row, column]
+            inspect.isEnabled = !isProjectionQueryInFlight && !requiresExplicitReload
+            menu.addItem(inspect)
+            menu.addItem(.separator())
             if metadata?.columns.indices.contains(column) == true,
                metadata?.columns[column].isStructured == true,
                cell.value != nil,
@@ -1764,6 +1820,51 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     @objc private func toggleStructuredCellFromMenu(_ sender: NSMenuItem) {
         guard let location = sender.representedObject as? [Int], location.count == 2 else { return }
         _ = toggleStructuredCell(dataColumn: location[1], row: location[0])
+    }
+
+    @objc private func inspectValueFromMenu(_ sender: NSMenuItem) {
+        guard let location = sender.representedObject as? [Int], location.count == 2 else { return }
+        _ = inspectValue(row: location[0], column: location[1])
+    }
+
+    @discardableResult
+    private func inspectValue(row: Int, column: Int) -> Bool {
+        guard !isProjectionQueryInFlight, !requiresExplicitReload,
+              let service, let metadata, metadata.columns.indices.contains(column),
+              let cell = cachedCell(row: row, column: column),
+              let ordinal = cachedSourceRowOrdinal(row: row) else { return false }
+        inspectorTask?.cancel()
+        inspectorTask = nil
+        let inspector = valueInspector ?? TabularValueInspector()
+        valueInspector = inspector
+        inspector.onClose = { [weak self] in
+            self?.inspectorTask?.cancel()
+            self?.inspectorTask = nil
+        }
+        inspector.show(
+            value: cell.value ?? "NULL",
+            columnTitle: metadata.columns[column].name,
+            sourceRowNumber: ordinal + sourceRowNumberOffset,
+            isTruncated: cell.isTruncated,
+            isNull: cell.value == nil,
+            parentWindow: window
+        )
+        guard cell.isTruncated else { return true }
+        inspector.setValue(cell.value ?? "NULL", isTruncated: true, loading: true)
+        let expectedGeneration = generation
+        inspectorTask = Task { [weak self, weak inspector] in
+            do {
+                let detail = try await service.cellDetail(sourceRowOrdinal: ordinal, column: column)
+                guard !Task.isCancelled, self?.generation == expectedGeneration else { return }
+                inspector?.setValue(detail.value ?? "NULL", isTruncated: detail.isTruncated, isNull: detail.value == nil)
+                self?.inspectorTask = nil
+            } catch {
+                guard !Task.isCancelled, self?.generation == expectedGeneration else { return }
+                inspector?.setValue(cell.value ?? "NULL", isTruncated: true, error: error.localizedDescription)
+                self?.inspectorTask = nil
+            }
+        }
+        return true
     }
 
     @objc private func copyCell(_ sender: NSMenuItem) {
@@ -2317,6 +2418,15 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     var qaHasPresentedPopover: Bool { presentedPopover?.isShown == true }
     var qaIsResidentStatePurged: Bool { isResidentStatePurged }
     var qaSelectedRows: IndexSet { tableView.selectedRowIndexes }
+    @discardableResult
+    func qaInspectValue(row: Int, column: Int) -> Bool { inspectValue(row: row, column: column) }
+    var qaInspectorText: String? { valueInspector?.qaText }
+    var qaInspectorContext: String? { valueInspector?.qaContext }
+    var qaInspectorNotice: String? { valueInspector?.qaNotice }
+    var qaInspectorCopyTitle: String? { valueInspector?.qaCopyTitle }
+    var qaInspectorIsReadable: Bool { valueInspector?.qaIsReadOnlyAndWrapped == true }
+    var qaInspectorIsVisible: Bool { valueInspector?.window?.isVisible == true }
+    func qaCloseInspector() { valueInspector?.qaDismissWithEscape() }
     func qaSelectRows(_ rows: IndexSet) {
         tableView.selectRowIndexes(rows, byExtendingSelection: false)
     }
@@ -2494,6 +2604,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         let height = max(scrollView.contentSize.height, max(Self.collapsedRowHeight, rowContentHeight))
         tableView.frame = NSRect(origin: .zero, size: NSSize(width: width, height: height))
         tableView.reloadData()
+        publishPosition()
         tableView.layoutSubtreeIfNeeded()
         for row in 0..<min(12, tableView.numberOfRows) {
             _ = tableView.rowView(atRow: row, makeIfNecessary: true)
@@ -2826,6 +2937,7 @@ private final class ParquetQueryLoadingIndicatorView: NSView {
 private final class ParquetReadOnlyTableView: NSTableView {
     var bodyMenuProvider: ((Int, Int) -> NSMenu?)?
     var activateProvider: ((Int, Int) -> Bool)?
+    var inspectValueProvider: ((Int, Int) -> Bool)?
     private var lastFocusedColumn = -1
 
     override func mouseDown(with event: NSEvent) {
@@ -2836,6 +2948,10 @@ private final class ParquetReadOnlyTableView: NSTableView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if TabularValueInspector.isInspectShortcut(event), selectedRow >= 0,
+           inspectValueProvider?(selectedColumn >= 0 ? selectedColumn : lastFocusedColumn, selectedRow) == true {
+            return
+        }
         let disallowedModifiers: NSEvent.ModifierFlags = [.command, .control, .option]
         let character = event.charactersIgnoringModifiers ?? ""
         let activates = character == " " || character == "\r" || character == "\n"

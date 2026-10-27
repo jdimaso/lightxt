@@ -11,6 +11,7 @@ import Foundation
 @MainActor
 struct DocumentChromeRuntimeQA {
     private static var failures: [String] = []
+    private static var assertionCount = 0
 
     static func main() {
         _ = NSApplication.shared
@@ -37,6 +38,29 @@ struct DocumentChromeRuntimeQA {
 
         expect(!header.qaExportIsVisible, "Export is hidden outside table View mode")
         expect(!header.qaReloadIsVisible, "Reload is hidden outside Parquet View mode")
+
+        header.setPresentationLabels(view: "Table")
+        header.presentationMode = .view
+        header.update(
+            fileURL: nil, title: "Untitled", typeName: "CSV", typeAbbreviation: "CSV",
+            byteCount: 4_294_967_296, edited: true, structureAvailable: false
+        )
+        header.setPresentationEditable(true)
+        expect(header.qaPresentationLabels == ["Table", "Source"], "Table and source are named as presentations")
+        expect(header.qaDetailText.contains("Editable"), "Table presentation can explicitly remain editable")
+        expect(header.qaDetailText.contains("Unsaved changes"), "Unsaved changes have a visible text label")
+        header.setPresentationLabels(view: "Tree")
+        header.setPresentationEditable(false, reason: "Use Source to edit JSON.")
+        expect(header.qaPresentationLabels == ["Tree", "Source"], "Tree representation is named contextually")
+        expect(header.presentationMode == .view, "Renaming representations preserves the selected presentation")
+        expect(header.qaDetailText.contains("Read-only"), "Read-only presentation is explicit")
+        expect(header.qaDetailText.contains("Unsaved changes"), "Read-only presentation does not imply saved changes")
+        header.setPresentationLabels(view: "Preview")
+        expect(header.qaPresentationLabels == ["Preview", "Source"], "Preview representation is named contextually")
+        header.setPresentationChoicesVisible(false)
+        expect(!header.qaPresentationChoicesVisible, "Text formats without a distinct renderer hide redundant presentation choices")
+        header.setPresentationChoicesVisible(true)
+        expect(header.qaPresentationChoicesVisible, "Structured documents restore their presentation choices")
 
         header.setExportAvailable(
             false,
@@ -198,6 +222,57 @@ struct DocumentChromeRuntimeQA {
         )
         statusBar.setState("Ready")
         expect(!statusBar.qaStateIsError, "Ordinary status clears the prior error state")
+        statusBar.setDocumentState(edited: true)
+        statusBar.setState("Searching…", busy: true)
+        expect(statusBar.qaDocumentStateText == "Unsaved changes", "Activity does not overwrite the save state")
+        statusBar.setDocumentState(edited: false, readOnly: true)
+        expect(statusBar.qaDocumentStateText == "Saved", "Clean documents show their saved state")
+        statusBar.updateByteWindow(1_024..<2_048, totalByteCount: 8_589_934_592)
+        expect(statusBar.qaInformationText.contains("1,024–2,048"), "Precise byte-window details remain in document information")
+        expect(
+            !allSubviews(of: statusBar).compactMap { ($0 as? NSTextField)?.stringValue }.contains(where: { $0.contains("BYTE WINDOW") }),
+            "Storage implementation details do not compete with activity in the status bar"
+        )
+        statusBar.showMemoryBackedCSV(totalByteCount: 128)
+        expect(statusBar.qaInformationText.contains("held in memory"), "Information explains table storage in plain language")
+
+        var requestedPositions: [Int64] = []
+        statusBar.onGoToLine = { value, completion in
+            requestedPositions.append(value)
+            completion(nil)
+        }
+        statusBar.configureLineNavigation(currentLine: 12, totalLines: 100, enabled: true)
+        statusBar.updatePosition(line: 12, column: 3, selectionByteCount: 20)
+        expect(statusBar.qaPositionEnabled, "Line position is actionable when navigation is available")
+        expect(statusBar.qaPositionText.contains("Ln 12, Col 3"), "Source position names its line and column")
+        expect(statusBar.qaPositionText.contains("selected"), "Source position retains selection feedback")
+        for invalid in ["", "0", "-4", "1.5", "abc", "9223372036854775808"] {
+            statusBar.qaSubmitJump(invalid)
+            expect(statusBar.qaJumpError?.contains("positive whole line") == true, "Invalid line '\(invalid)' receives an inline explanation")
+        }
+        expect(requestedPositions.isEmpty, "Invalid input never invokes document navigation")
+        statusBar.qaSubmitJump("101")
+        expect(statusBar.qaJumpError == "This document has 100 lines.", "Out-of-range input states the available range")
+        expect(requestedPositions.isEmpty, "Out-of-range input never invokes document navigation")
+        statusBar.qaSubmitJump("42")
+        expect(requestedPositions == [42], "A valid line reaches the document callback once")
+        statusBar.configureLineNavigation(currentLine: nil, totalLines: nil, enabled: true)
+        statusBar.qaSubmitJump("5000000000")
+        expect(requestedPositions.last == 5_000_000_000, "Navigation preserves 64-bit positions before indexing completes")
+        statusBar.onGoToLine = { _, completion in completion("That line no longer exists. Try a smaller number.") }
+        statusBar.qaSubmitJump("42")
+        expect(statusBar.qaJumpError == "That line no longer exists. Try a smaller number.", "Asynchronous lookup failures remain visible inline")
+        statusBar.configureRowNavigation(currentRow: 2, totalRows: 4, enabled: true)
+        statusBar.updateTablePosition(row: 2, selectedRowCount: 2, totalRows: 4)
+        expect(statusBar.qaPositionText == "Row 2 of 4  ·  2 selected", "Table position reflects displayed rows and selection")
+        statusBar.qaSubmitJump("5")
+        expect(statusBar.qaJumpError == "This document has 4 rows.", "Table navigation validates against displayed rows")
+        statusBar.updateTablePosition(row: 0, selectedRowCount: 0, totalRows: 0)
+        expect(!statusBar.qaPositionEnabled, "Empty tables cannot offer a row jump")
+        statusBar.configureLineNavigation(currentLine: nil, totalLines: nil, enabled: false)
+        statusBar.setPositionSummary("JSON tree")
+        expect(statusBar.qaPositionText == "JSON tree", "Structured presentations do not retain a stale source position")
+        expect(!statusBar.qaPositionEnabled, "Structured presentation summaries are not misleading navigation actions")
 
         let diskState = ExternalFileState(
             identity: .init(device: 1, inode: 2),
@@ -232,7 +307,7 @@ struct DocumentChromeRuntimeQA {
         expect(keepActivations == 1, "Don’t Reload invokes its callback exactly once")
 
         if failures.isEmpty {
-            print("Document chrome QA passed: 43 assertions")
+            print("Document chrome QA passed: \(assertionCount) assertions")
             Darwin.exit(EXIT_SUCCESS)
         }
         failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }
@@ -243,6 +318,7 @@ struct DocumentChromeRuntimeQA {
         _ condition: @autoclosure () -> Bool,
         _ message: String
     ) {
+        assertionCount += 1
         if !condition() { fail(message) }
     }
 

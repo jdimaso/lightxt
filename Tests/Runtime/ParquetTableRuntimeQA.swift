@@ -149,9 +149,32 @@ struct ParquetTableRuntimeQA {
                     + "\(view.qaMaterializedHeaderFilterControlColumns.sorted())"
             )
         }
-        guard view.qaBodyMenuTitles(row: 0, visualColumn: 1) == ["Copy Cell", "Copy Row"] else {
+        guard view.qaBodyMenuTitles(row: 0, visualColumn: 1).filter({ !$0.isEmpty }) == ["Inspect Value…", "Copy Cell", "Copy Row"] else {
             throw QAError.failed("Parquet body exposed a mutation action")
         }
+        view.qaSelectRows(IndexSet([1, 3]))
+        let inspectorSelection = view.qaSelectedRows
+        guard view.qaInspectValue(row: 3, column: 2),
+              view.qaInspectorText == "O'Brien",
+              view.qaInspectorContext == "Source row 4 · Read-only",
+              view.qaInspectorIsReadable else {
+            throw QAError.failed("Parquet inspector did not expose a readable value with source-row context")
+        }
+        view.qaCloseInspector()
+        guard !view.qaInspectorIsVisible, view.qaSelectedRows == inspectorSelection,
+              view.jumpToDisplayedRow(0) != nil, view.qaSelectedRows == inspectorSelection,
+              view.jumpToDisplayedRow(5) == nil, view.qaSelectedRows == IndexSet(integer: 4) else {
+            throw QAError.failed("Parquet inspector dismissal or row navigation changed the wrong selection")
+        }
+        guard view.qaInspectValue(row: 0, column: 2),
+              view.qaInspectorNotice?.hasPrefix("Null value") == true,
+              view.qaInspectValue(row: 2, column: 2),
+              view.qaInspectorText == "NULL",
+              view.qaInspectorNotice?.contains("Complete value") == true else {
+            throw QAError.failed("Parquet inspector confused database NULL with literal NULL text")
+        }
+        view.qaCloseInspector()
+        view.qaSelectRows([])
         guard view.qaCacheAndRequestLimits == (4, 2),
               view.qaCachedPageCount <= 4,
               view.qaPendingPageCount <= 2 else {
@@ -427,6 +450,18 @@ struct ParquetTableRuntimeQA {
                     + "\(structuredView.qaMaterializedHeaderFilterControlColumns.sorted())"
             )
         }
+        guard structuredView.qaInspectValue(row: 17, column: 1) else {
+            throw QAError.failed("Long Parquet value was not inspectable")
+        }
+        try wait(until: {
+            structuredView.qaInspectorText?.count == 65_536
+                && structuredView.qaInspectorNotice?.contains("not the complete value") == true
+        }, failure: "Parquet inspector did not fetch a larger bounded detail")
+        guard structuredView.qaInspectorCopyTitle == "Copy Visible Text",
+              structuredView.qaInspectorContext == "Source row 18 · Read-only" else {
+            throw QAError.failed("Parquet inspector did not disclose partial-copy behavior or source identity")
+        }
+        structuredView.qaCloseInspector()
         let emptyObject = structuredView.qaPrettyFormattedJSON("{}")
         let emptyArray = structuredView.qaPrettyFormattedJSON("[]")
         guard emptyObject == ("{}", 1), emptyArray == ("[]", 1) else {

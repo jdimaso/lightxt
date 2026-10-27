@@ -99,6 +99,12 @@ final class ParquetQueryServiceTests: XCTestCase {
         let longValuePage = try await service.page(offset: 4, limit: 1)
         XCTAssertEqual(longValuePage.rows[0][2].value?.count, 65)
         XCTAssertTrue(longValuePage.rows[0][2].isTruncated)
+        let scalarDetail = try await service.cellDetail(sourceRowOrdinal: 4, column: 2)
+        XCTAssertEqual(scalarDetail.value, String(repeating: "x", count: 500))
+        XCTAssertFalse(scalarDetail.isTruncated)
+        let nullScalarDetail = try await service.cellDetail(sourceRowOrdinal: 0, column: 2)
+        XCTAssertNil(nullScalarDetail.value)
+        XCTAssertFalse(nullScalarDetail.isTruncated)
 
         let binaryStringPage = try await service.page(offset: 6, limit: 2)
         XCTAssertEqual(binaryStringPage.rows[0][2].value, "before\0after")
@@ -549,6 +555,9 @@ final class ParquetQueryServiceTests: XCTestCase {
             ParquetQueryService.Limits.maximumStructuredDetailCharacters
         )
         XCTAssertTrue(longDetail.json?.hasPrefix(#"{"message":"xxxx"#) == true)
+        let inspectorDetail = try await service.cellDetail(sourceRowOrdinal: 17, column: 1)
+        XCTAssertEqual(inspectorDetail.value?.count, 65_536)
+        XCTAssertTrue(inspectorDetail.isTruncated)
 
         do {
             _ = try await service.structuredCellDetail(sourceRowOrdinal: 0, column: 4)

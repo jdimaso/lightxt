@@ -181,6 +181,16 @@ public nonisolated struct ParquetPage: Sendable, Equatable {
     }
 }
 
+public nonisolated struct TabularCellDetail: Sendable, Equatable {
+    public let value: String?
+    public let isTruncated: Bool
+
+    public init(value: String?, isTruncated: Bool) {
+        self.value = value
+        self.isTruncated = isTruncated
+    }
+}
+
 public nonisolated struct ParquetStructuredCellDetail: Sendable, Equatable {
     public let sourceRowOrdinal: Int64
     public let column: Int
@@ -310,6 +320,10 @@ public protocol TabularQueryService: Actor {
         sourceRowOrdinal: Int64,
         column columnIndex: Int
     ) async throws -> ParquetStructuredCellDetail
+    func cellDetail(
+        sourceRowOrdinal: Int64,
+        column columnIndex: Int
+    ) async throws -> TabularCellDetail
     func close() async
     nonisolated func cancelCurrentQuery()
 }
@@ -691,6 +705,44 @@ public actor ParquetQueryService: TabularQueryService {
             sourceRowOrdinal: sourceRowOrdinal,
             column: columnIndex,
             json: result.hexDecodedString(column: 0, row: 0),
+            isTruncated: (result.int64(column: 1, row: 0) ?? 0) != 0
+        )
+    }
+
+    /// A larger, still bounded value for the read-only cell inspector. The
+    /// physical row identity remains valid under filtering and sorting.
+    public func cellDetail(
+        sourceRowOrdinal: Int64,
+        column columnIndex: Int
+    ) async throws -> TabularCellDetail {
+        let metadata = try await open()
+        guard sourceRowOrdinal >= 0 else {
+            throw ParquetQueryError.queryFailed("The Parquet source row is invalid.")
+        }
+        guard metadata.columns.indices.contains(columnIndex) else {
+            throw ParquetQueryError.invalidColumn(columnIndex)
+        }
+        let identifier = internalIdentifier(for: columnIndex)
+        let value = metadata.columns[columnIndex].isStructured
+            ? "TRY_CAST(to_json(\(identifier)) AS VARCHAR)"
+            : "TRY_CAST(\(identifier) AS VARCHAR)"
+        let limit = Limits.maximumStructuredDetailCharacters
+        let sql = """
+            SELECT hex(encode(left(\(value), \(limit)))) AS cell_value,
+                   CASE WHEN length(\(value)) > \(limit) THEN 1::BIGINT ELSE 0::BIGINT END
+            \(sourceClause())
+            WHERE \(Self.quoteIdentifier(Self.rowOrdinalAlias)) = ?
+            LIMIT 1
+            """
+        let result = try await execute(
+            sql: sql,
+            bindings: [.text(pinnedSource.queryPath), .int64(sourceRowOrdinal)]
+        )
+        guard result.rowCount == 1 else {
+            throw ParquetQueryError.queryFailed("The Parquet source row is no longer available.")
+        }
+        return TabularCellDetail(
+            value: result.hexDecodedString(column: 0, row: 0),
             isTruncated: (result.int64(column: 1, row: 0) ?? 0) != 0
         )
     }

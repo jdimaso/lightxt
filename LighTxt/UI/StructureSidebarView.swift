@@ -53,6 +53,10 @@ final class StructureSidebarNode: NSObject {
     let identifier: String
     let title: String
     let subtitle: String
+    /// A readable value and a quiet type badge for structured data. The full
+    /// subtitle remains available to accessibility and source-context tools.
+    let valueText: String?
+    let valueType: String?
     let range: Range<Int64>
     let kind: SyntaxFoldKind?
     let role: StructureSidebarNodeRole
@@ -65,6 +69,8 @@ final class StructureSidebarNode: NSObject {
         identifier: String? = nil,
         title: String,
         subtitle: String,
+        valueText: String? = nil,
+        valueType: String? = nil,
         range: Range<Int64>,
         kind: SyntaxFoldKind?,
         role: StructureSidebarNodeRole = .content,
@@ -76,6 +82,8 @@ final class StructureSidebarNode: NSObject {
         self.identifier = identifier ?? "\(range.lowerBound):\(range.upperBound):\(title)"
         self.title = title
         self.subtitle = subtitle
+        self.valueText = valueText
+        self.valueType = valueType
         self.range = range
         self.kind = kind
         self.role = role
@@ -173,6 +181,14 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         symbolName: "chevron.right",
         accessibilityLabel: "Close structure sidebar"
     )
+    private let smallerTextButton = HeaderIconButton(
+        symbolName: "textformat.size.smaller",
+        accessibilityLabel: "Smaller JSON text"
+    )
+    private let largerTextButton = HeaderIconButton(
+        symbolName: "textformat.size.larger",
+        accessibilityLabel: "Larger JSON text"
+    )
 
     private let emptyIcon = NSImageView()
     private let emptyTitle = NSTextField(labelWithString: "No structure yet")
@@ -192,7 +208,12 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
     private var headingTrailingConstraint: NSLayoutConstraint!
     private var roots: [StructureSidebarNode] = []
     private var currentLoadingState: StructureSidebarLoadingState?
-    private var fullWorkspaceFontSize: CGFloat = 15
+    static let readingFontPreferenceKey = "LighTxt.jsonReadingFontSize"
+    private static let readingFontDidChange = Notification.Name("LighTxt.JSONReadingFontSizeDidChange")
+    private var fullWorkspaceFontSize: CGFloat = {
+        let saved = UserDefaults.standard.double(forKey: StructureSidebarView.readingFontPreferenceKey)
+        return saved.isFinite && saved >= 11 && saved <= 28 ? CGFloat(saved) : 15
+    }()
     /// Authoritative size for a whole-document snapshot. Bounded viewport and
     /// search trees leave this nil so their selected offsets are never shown
     /// against a misleading partial-range denominator.
@@ -205,7 +226,15 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         configure()
         applyPresentation()
         applyResolvedAppearance(reloadOutline: false)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(receiveReadingFontSize(_:)),
+            name: Self.readingFontDidChange,
+            object: nil
+        )
     }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
@@ -499,7 +528,26 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
     private func setFullWorkspaceFontSize(_ size: CGFloat) {
         let bounded = min(28, max(11, size))
         guard bounded != fullWorkspaceFontSize else { return }
-        fullWorkspaceFontSize = bounded
+        applyReadingFontSize(bounded)
+        UserDefaults.standard.set(Double(bounded), forKey: Self.readingFontPreferenceKey)
+        NotificationCenter.default.post(
+            name: Self.readingFontDidChange,
+            object: self,
+            userInfo: ["size": Double(bounded)]
+        )
+    }
+
+    @objc private func receiveReadingFontSize(_ notification: Notification) {
+        guard let size = notification.userInfo?["size"] as? Double,
+              size.isFinite, (11...28).contains(size),
+              CGFloat(size) != fullWorkspaceFontSize else { return }
+        // Passive recipients only redraw; one user action writes preferences
+        // once and never creates a defaults-notification feedback loop.
+        applyReadingFontSize(CGFloat(size))
+    }
+
+    private func applyReadingFontSize(_ size: CGFloat) {
+        fullWorkspaceFontSize = size
         if presentation == .fullWorkspace {
             outline.rowHeight = fullWorkspaceRowHeight
             outline.reloadData()
@@ -507,8 +555,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
     }
 
     private var fullWorkspaceRowHeight: CGFloat {
-        let subtitleSize = max(11.5, fullWorkspaceFontSize - 2.5)
-        return max(40, ceil(fullWorkspaceFontSize + subtitleSize + 13))
+        return max(44, ceil(fullWorkspaceFontSize * 2 + 16))
     }
 
     // MARK: - NSOutlineView
@@ -606,7 +653,12 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
             self.delegate?.structureSidebarDidRequestClose(self)
         }
 
-        let headingActions = NSStackView(views: [collapseAllButton, closeButton])
+        smallerTextButton.toolTip = "Smaller JSON text (Command−)"
+        smallerTextButton.onActivate = { [weak self] in self?.changeFullWorkspaceFontSize(by: -1) }
+        largerTextButton.toolTip = "Larger JSON text (Command+)"
+        largerTextButton.onActivate = { [weak self] in self?.changeFullWorkspaceFontSize(by: 1) }
+
+        let headingActions = NSStackView(views: [smallerTextButton, largerTextButton, collapseAllButton, closeButton])
         headingActions.orientation = .horizontal
         headingActions.alignment = .centerY
         headingActions.spacing = 2
@@ -630,7 +682,7 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         outline.outlineTableColumn = column
         outline.headerView = nil
         outline.rowHeight = 34
-        outline.intercellSpacing = NSSize(width: 0, height: 1)
+        outline.intercellSpacing = NSSize(width: 0, height: 3)
         outline.indentationPerLevel = 15
         outline.indentationMarkerFollowsCell = true
         outline.backgroundColor = .clear
@@ -748,9 +800,11 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
         let full = presentation == .fullWorkspace
         titleLabel.font = NSFont.systemFont(ofSize: full ? 18 : 15, weight: .semibold)
         scopeLabel.font = NSFont.systemFont(ofSize: full ? 12.5 : 11.5, weight: .regular)
-        outline.rowHeight = full ? fullWorkspaceRowHeight : 34
-        outline.indentationPerLevel = full ? 17 : 15
+        outline.rowHeight = full ? fullWorkspaceRowHeight : 40
+        outline.indentationPerLevel = full ? 22 : 18
         closeButton.isHidden = full
+        smallerTextButton.isHidden = !full
+        largerTextButton.isHidden = !full
         headingLeadingConstraint?.constant = full ? 24 : 16
         headingTrailingConstraint?.constant = full ? -18 : -10
         outline.reloadData()
@@ -914,6 +968,16 @@ final class StructureSidebarView: NSView, NSOutlineViewDataSource, NSOutlineView
               let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: true)
                 as? StructureRowView else { return nil }
         return cell.qaAttributedTitle
+    }
+
+    func qaValuePresentation(identifier: String) -> (text: String, type: String, keySize: CGFloat, valueSize: CGFloat, usesPrimaryColor: Bool)? {
+        guard let node = node(withIdentifier: identifier, in: roots),
+              let row = (0..<outline.numberOfRows).first(where: {
+                  (outline.item(atRow: $0) as? StructureSidebarNode) === node
+              }),
+              let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: true)
+                as? StructureRowView else { return nil }
+        return cell.qaValuePresentation
     }
 
     func qaToolTip(identifier: String) -> String? {
@@ -1254,6 +1318,7 @@ private final class StructureRowView: NSTableCellView {
     private let kindIcon = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let subtitleLabel = NSTextField(labelWithString: "")
+    private let typeBadge = StructureTypeBadge(labelWithString: "")
 
     init(identifier: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
@@ -1276,11 +1341,23 @@ private final class StructureRowView: NSTableCellView {
         subtitleLabel.cell?.wraps = false
         subtitleLabel.cell?.truncatesLastVisibleLine = true
         subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let labels = NSStackView(views: [titleLabel, subtitleLabel])
+        typeBadge.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        typeBadge.alignment = .center
+        typeBadge.wantsLayer = true
+        typeBadge.layer?.cornerRadius = 4
+        typeBadge.setContentHuggingPriority(.required, for: .horizontal)
+        typeBadge.setContentCompressionResistancePriority(.required, for: .horizontal)
+        typeBadge.setAccessibilityHidden(true)
+        let titleRow = NSStackView(views: [titleLabel, typeBadge])
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 8
+        titleRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let labels = NSStackView(views: [titleRow, subtitleLabel])
         labels.translatesAutoresizingMaskIntoConstraints = false
         labels.orientation = .vertical
         labels.alignment = .leading
-        labels.spacing = 2
+        labels.spacing = 3
         addSubview(labels)
 
         NSLayoutConstraint.activate([
@@ -1302,14 +1379,15 @@ private final class StructureRowView: NSTableCellView {
         fullWorkspaceFontSize: CGFloat,
         appearance: NSAppearance
     ) {
-        subtitleLabel.stringValue = node.childState == .loading ? "Loading children…" : node.subtitle
+        subtitleLabel.stringValue = node.childState == .loading
+            ? "Loading children…" : (node.valueText ?? node.subtitle)
         let titleFontSize = presentation == .fullWorkspace ? fullWorkspaceFontSize : 13
-        let titleFont = NSFont.systemFont(ofSize: titleFontSize, weight: .medium)
+        let titleFont = NSFont.systemFont(ofSize: titleFontSize, weight: .semibold)
         titleLabel.font = titleFont
-        subtitleLabel.font = NSFont.systemFont(
-            ofSize: presentation == .fullWorkspace ? max(11.5, titleFontSize - 2.5) : 10.5,
-            weight: .regular
-        )
+        let valueSize = presentation == .fullWorkspace ? titleFontSize : 13
+        subtitleLabel.font = node.valueText == nil
+            ? NSFont.systemFont(ofSize: max(12, valueSize - 1.5), weight: .regular)
+            : NSFont.monospacedSystemFont(ofSize: valueSize, weight: .regular)
         let primary = LighTxtTheme.resolved(LighTxtTheme.primaryText, for: appearance)
         let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
         let accent = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
@@ -1344,7 +1422,13 @@ private final class StructureRowView: NSTableCellView {
             titleLabel.stringValue = node.title
             titleLabel.textColor = titleColor
         }
-        subtitleLabel.textColor = secondary
+        subtitleLabel.textColor = node.valueText == nil ? secondary : primary
+        typeBadge.stringValue = node.valueType ?? ""
+        typeBadge.isHidden = node.valueType == nil
+        typeBadge.textColor = secondary
+        typeBadge.layer?.backgroundColor = secondary.withAlphaComponent(0.09).cgColor
+        typeBadge.layer?.borderColor = secondary.withAlphaComponent(0.18).cgColor
+        typeBadge.layer?.borderWidth = 0.5
         kindIcon.contentTintColor = accent.withAlphaComponent(node.role == .loadMore ? 1 : 0.78)
         kindIcon.image = NSImage(
             systemSymbolName: symbolName(for: node),
@@ -1373,6 +1457,15 @@ private final class StructureRowView: NSTableCellView {
 
 #if LIGHTXT_STANDALONE_STRUCTURE_QA
     var qaAttributedTitle: NSAttributedString { titleLabel.attributedStringValue }
+    var qaValuePresentation: (text: String, type: String, keySize: CGFloat, valueSize: CGFloat, usesPrimaryColor: Bool) {
+        (
+            subtitleLabel.stringValue,
+            typeBadge.stringValue,
+            titleLabel.font?.pointSize ?? 0,
+            subtitleLabel.font?.pointSize ?? 0,
+            subtitleLabel.textColor?.isEqual(LighTxtTheme.resolved(LighTxtTheme.primaryText, for: effectiveAppearance)) == true
+        )
+    }
     var qaLayout: (
         bounds: NSRect,
         title: NSRect,
@@ -1394,6 +1487,14 @@ private final class StructureRowView: NSTableCellView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+}
+
+/// Small metadata badge; the value itself keeps the strongest text contrast.
+private final class StructureTypeBadge: NSTextField {
+    override var intrinsicContentSize: NSSize {
+        let size = super.intrinsicContentSize
+        return NSSize(width: size.width + 10, height: size.height + 2)
     }
 }
 
