@@ -9,6 +9,25 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Secure LighTxt application updates</description>
         <language>en</language>
         <item>
+            <title>1.9</title>
+            <pubDate>Tue, 27 Oct 2026 16:55:58 -0400</pubDate>
+            <link>https://github.com/jdimaso/lightxt</link>
+            <sparkle:version>16</sparkle:version>
+            <sparkle:shortVersionString>1.9</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[# LighTxt 1.9
+
+Five improvements make everyday reading and navigation clearer:
+
+- **Clearer document controls.** Tree, Table, Preview, and Source labels reflect the current file type, with separate read-only and unsaved indicators. Plain-text files use one straightforward editing surface.
+- **Keep your place while searching.** Outline and Results have their own tabs and retain their state. JSON matches show their surrounding structure without replacing the outline or search results.
+- **A simpler status bar.** Position, activity, and save state stay visible, while storage details move into an information popover. Jump directly to a line or table row with inline validation.
+- **More readable JSON.** Keys and values share a readable text size, with clearer spacing, indentation, and value-type badges. Visible zoom controls remember your reading size, and prettified JSON/YAML previews now include syntax colors.
+- **Room to read long table values.** Use Inspect Value in a CSV or Parquet cell's context menu, or press Command-Option-I, to open a resizable, wrapped, read-only view with copy controls and clear preview limits.
+]]></description>
+            <enclosure url="https://github.com/jdimaso/lightxt/releases/download/v1.9/LighTxt-1.9-macOS-universal.zip" length="39923359" type="application/octet-stream" sparkle:edSignature="IeCmx13fMieojJsBsJhyvD0yO++pIm1b/CSo2lD3w1ZFowG2xnI+CXbhnL0BYTjW0esQgDKWyVc3hZpnIK68CA=="/>
+        </item>
+        <item>
             <title>1.8</title>
             <pubDate>Mon, 07 Sep 2026 20:35:24 -0400</pubDate>
             <link>https://github.com/jdimaso/lightxt</link>
@@ -203,6 +222,6 @@ This release also includes the large-file JSON, CSV, Markdown, navigation, and p
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: lTnwzJ8e/LIW+fzgLmdyJXb8IA5IjNPj4wQm5hzNR8dTGxZ34JNBWoV6FnpXDHc9rbzjCm8MQBY0m+85JdipAg==
-length: 16140
+edSignature: qG3R58sZz5lZRXVX9W4u9nFFBMO6uZ/eYODiWPrgGzpR5xkRb/321O9x077eENQ2M8CxBpuF/L2G9zCKOyFbAA==
+length: 18021
 -->
