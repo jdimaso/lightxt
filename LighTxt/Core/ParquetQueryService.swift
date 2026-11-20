@@ -1,3 +1,4 @@
+import CDuckDB
 import Darwin
 import Foundation
 
@@ -68,7 +69,10 @@ public nonisolated struct ParquetColumn: Sendable, Equatable, Hashable {
 }
 
 public nonisolated struct ParquetMetadata: Sendable, Equatable {
+    /// The default bounded page projection, in file order.
     public let columns: [ParquetColumn]
+    /// The physical schema, indexed independently of the displayed projection.
+    public let allColumns: [ParquetColumn]
     public let totalColumnCount: Int
     public let rowCount: Int64
     public let fileSize: Int64
@@ -79,9 +83,11 @@ public nonisolated struct ParquetMetadata: Sendable, Equatable {
         totalColumnCount: Int,
         rowCount: Int64,
         fileSize: Int64,
-        engineVersion: String
+        engineVersion: String,
+        allColumns: [ParquetColumn]? = nil
     ) {
         self.columns = columns
+        self.allColumns = allColumns ?? columns
         self.totalColumnCount = totalColumnCount
         self.rowCount = rowCount
         self.fileSize = fileSize
@@ -141,9 +147,31 @@ public nonisolated struct ParquetTableQuery: Sendable, Equatable, Hashable {
     public let filters: [ParquetColumnFilter]
     public let sort: ParquetSortDescriptor?
 
-    public init(filters: [ParquetColumnFilter] = [], sort: ParquetSortDescriptor? = nil) {
+    /// Ordered physical column indexes. A nil selection uses the default page projection.
+    public let projectedColumnIndexes: [Int]?
+
+    public init(
+        filters: [ParquetColumnFilter] = [],
+        sort: ParquetSortDescriptor? = nil,
+        projectedColumnIndexes: [Int]? = nil
+    ) {
         self.filters = filters.filter { !$0.isEmpty }.sorted { $0.column < $1.column }
         self.sort = sort
+        self.projectedColumnIndexes = projectedColumnIndexes
+    }
+
+    func projectedColumns(in metadata: ParquetMetadata) throws -> [ParquetColumn] {
+        guard let indexes = projectedColumnIndexes else { return metadata.columns }
+        guard !indexes.isEmpty, indexes.count <= metadata.columns.count,
+              Set(indexes).count == indexes.count else {
+            throw ParquetQueryError.queryFailed("Choose between one and \(metadata.columns.count) distinct columns.")
+        }
+        return try indexes.map { index in
+            guard metadata.allColumns.indices.contains(index) else {
+                throw ParquetQueryError.invalidColumn(index)
+            }
+            return metadata.allColumns[index]
+        }
     }
 }
 
@@ -304,6 +332,11 @@ public protocol TabularQueryService: Actor {
         limit: Int,
         query: ParquetTableQuery
     ) async throws -> ParquetPage
+    func forEachExportRow(
+        query: ParquetTableQuery,
+        selectedRows: IndexSet?,
+        consume: @escaping @Sendable (Int64, [String?]) throws -> Void
+    ) async throws -> Int64
     func uniqueValues(
         forColumn columnIndex: Int,
         query: ParquetTableQuery,
@@ -542,11 +575,41 @@ public actor ParquetQueryService: TabularQueryService {
             totalColumnCount: schema.count,
             rowCount: rowCount,
             fileSize: pinnedSource.revision.fileSize,
-            engineVersion: runtime.version
+            engineVersion: runtime.version,
+            allColumns: schema
         )
         metadataStorage = metadata
         countCache[ParquetTableQuery()] = rowCount
         return metadata
+    }
+
+    public func forEachExportRow(
+        query: ParquetTableQuery,
+        selectedRows: IndexSet?,
+        consume: @escaping @Sendable (Int64, [String?]) throws -> Void
+    ) async throws -> Int64 {
+        let metadata = try await open()
+        try validate(query: query, columns: metadata.allColumns)
+        let columns = try query.projectedColumns(in: metadata)
+        let projection = columns.map { "CAST(\(internalIdentifier(for: $0.index)) AS VARCHAR)" }.joined(separator: ", ")
+        var bindings: [DuckDBBinding] = [.text(pinnedSource.queryPath)]
+        let predicates = buildWhereClause(query.filters, columns: metadata.allColumns, bindings: &bindings)
+        let order = buildOrderClause(query.sort, columns: metadata.allColumns)
+        var sql = "SELECT \(projection) \(sourceClause()) \(predicates) \(order)"
+        if let selectedRows {
+            guard let first = selectedRows.first, let last = selectedRows.last else { return 0 }
+            sql += " LIMIT ? OFFSET ?"
+            bindings.append(.int64(Int64(last - first) + 1))
+            bindings.append(.int64(Int64(first)))
+        }
+        let statement = sql
+        let parameters = bindings
+        return try await performQuery(sql: statement) { runtime, connection, cancelled in
+            try runtime.streamRows(
+                connection: connection, sql: statement, bindings: parameters,
+                selectedRows: selectedRows, cancelled: cancelled, consume: consume
+            )
+        }
     }
 
     public func page(
@@ -558,7 +621,8 @@ public actor ParquetQueryService: TabularQueryService {
         guard offset >= 0, limit > 0, limit <= limits.maximumPageRows else {
             throw ParquetQueryError.invalidPage(offset: offset, limit: limit)
         }
-        try validate(query: query, columns: metadata.columns)
+        let columns = try query.projectedColumns(in: metadata)
+        try validate(query: query, columns: metadata.allColumns)
         // Sort never changes the count, so all sort variants share the same
         // filter-count entry. Keep counting separate from paging: attaching a
         // global COUNT(*) OVER() to the first filtered page turns DuckDB's
@@ -582,7 +646,6 @@ public actor ParquetQueryService: TabularQueryService {
             )
         }
 
-        let columns = metadata.columns
         let boundedLimit = min(limit, limits.maximumPageRows)
         let cellBudgetDivisor = max(1, boundedLimit * max(1, columns.count))
         let cellCharacterLimit = min(
@@ -597,10 +660,10 @@ public actor ParquetQueryService: TabularQueryService {
         var bindings: [DuckDBBinding] = [.text(pinnedSource.queryPath)]
         let whereClause = buildWhereClause(
             query.filters,
-            columns: columns,
+            columns: metadata.allColumns,
             bindings: &bindings
         )
-        let orderClause = buildOrderClause(query.sort, columns: columns)
+        let orderClause = buildOrderClause(query.sort, columns: metadata.allColumns)
         let sql: String
         if query.filters.isEmpty && query.sort == nil {
             bindings.append(.int64(offset))
@@ -670,10 +733,10 @@ public actor ParquetQueryService: TabularQueryService {
         guard sourceRowOrdinal >= 0 else {
             throw ParquetQueryError.queryFailed("The Parquet source row is invalid.")
         }
-        guard metadata.columns.indices.contains(columnIndex) else {
+        guard metadata.allColumns.indices.contains(columnIndex) else {
             throw ParquetQueryError.invalidColumn(columnIndex)
         }
-        let column = metadata.columns[columnIndex]
+        let column = metadata.allColumns[columnIndex]
         guard column.isStructured else {
             throw ParquetQueryError.queryFailed("The selected Parquet value is not structured.")
         }
@@ -719,11 +782,11 @@ public actor ParquetQueryService: TabularQueryService {
         guard sourceRowOrdinal >= 0 else {
             throw ParquetQueryError.queryFailed("The Parquet source row is invalid.")
         }
-        guard metadata.columns.indices.contains(columnIndex) else {
+        guard metadata.allColumns.indices.contains(columnIndex) else {
             throw ParquetQueryError.invalidColumn(columnIndex)
         }
         let identifier = internalIdentifier(for: columnIndex)
-        let value = metadata.columns[columnIndex].isStructured
+        let value = metadata.allColumns[columnIndex].isStructured
             ? "TRY_CAST(to_json(\(identifier)) AS VARCHAR)"
             : "TRY_CAST(\(identifier) AS VARCHAR)"
         let limit = Limits.maximumStructuredDetailCharacters
@@ -756,7 +819,7 @@ public actor ParquetQueryService: TabularQueryService {
         limit requestedLimit: Int? = nil
     ) async throws -> ParquetUniqueValues {
         let metadata = try await open()
-        guard metadata.columns.indices.contains(columnIndex) else {
+        guard metadata.allColumns.indices.contains(columnIndex) else {
             throw ParquetQueryError.invalidColumn(columnIndex)
         }
         let limit = requestedLimit ?? limits.maximumUniqueValues
@@ -770,7 +833,7 @@ public actor ParquetQueryService: TabularQueryService {
         // under every other active filter, never narrowed by their own current
         // checkbox/contains state.
         let remainingFilters = query.filters.filter { $0.column != columnIndex }
-        try validate(query: ParquetTableQuery(filters: remainingFilters), columns: metadata.columns)
+        try validate(query: ParquetTableQuery(filters: remainingFilters), columns: metadata.allColumns)
         let key = UniqueValuesCacheKey(
             sourceRevision: pinnedSource.revision,
             column: columnIndex,
@@ -793,7 +856,7 @@ public actor ParquetQueryService: TabularQueryService {
         let result = try await queryUniqueValues(
             forColumn: columnIndex,
             filters: remainingFilters,
-            columns: metadata.columns,
+            columns: metadata.allColumns,
             searchText: searchText,
             searchIsCaseSensitive: searchIsCaseSensitive,
             offset: offset,
@@ -923,11 +986,11 @@ public actor ParquetQueryService: TabularQueryService {
         query: ParquetTableQuery = ParquetTableQuery()
     ) async throws -> ParquetColumnSummary {
         let metadata = try await open()
-        guard metadata.columns.indices.contains(columnIndex) else {
+        guard metadata.allColumns.indices.contains(columnIndex) else {
             throw ParquetQueryError.invalidColumn(columnIndex)
         }
-        try validate(query: query, columns: metadata.columns)
-        let column = metadata.columns[columnIndex]
+        try validate(query: query, columns: metadata.allColumns)
+        let column = metadata.allColumns[columnIndex]
         let identifier = internalIdentifier(for: columnIndex)
         let text = "TRY_CAST(\(identifier) AS VARCHAR)"
         let extrema: String
@@ -942,7 +1005,7 @@ public actor ParquetQueryService: TabularQueryService {
         var bindings: [DuckDBBinding] = [.text(pinnedSource.queryPath)]
         let whereClause = buildWhereClause(
             query.filters,
-            columns: metadata.columns,
+            columns: metadata.allColumns,
             bindings: &bindings
         )
         let sql = """
@@ -957,7 +1020,7 @@ public actor ParquetQueryService: TabularQueryService {
         let unique = try await queryUniqueValues(
             forColumn: columnIndex,
             filters: query.filters,
-            columns: metadata.columns,
+            columns: metadata.allColumns,
             limit: min(5, limits.maximumUniqueValues)
         )
         return ParquetColumnSummary(
@@ -1300,7 +1363,7 @@ public actor ParquetQueryService: TabularQueryService {
     }
 
     private func countRows(query: ParquetTableQuery) async throws -> Int64 {
-        let columns = metadataStorage?.columns ?? Array(allColumnsStorage.prefix(limits.maximumPresentedColumns))
+        let columns = allColumnsStorage
         try validate(query: query, columns: columns)
         var bindings: [DuckDBBinding] = [.text(pinnedSource.queryPath)]
         let whereClause = buildWhereClause(query.filters, columns: columns, bindings: &bindings)
@@ -1465,6 +1528,15 @@ public actor ParquetQueryService: TabularQueryService {
     }
 
     private func execute(sql: String, bindings: [DuckDBBinding]) async throws -> DuckDBResult {
+        try await performQuery(sql: sql) { runtime, connection, _ in
+            try runtime.execute(connection: connection, sql: sql, bindings: bindings)
+        }
+    }
+
+    private func performQuery<T: Sendable>(
+        sql: String,
+        operation: @escaping @Sendable (DuckDBDynamicAPI, OpaquePointer, () -> Bool) throws -> T
+    ) async throws -> T {
         try ensureOpen()
         #if DEBUG || LIGHTXT_PACKAGE_TESTING
         executedQueryCount += 1
@@ -1494,7 +1566,7 @@ public actor ParquetQueryService: TabularQueryService {
                 guard pinnedSource.matchesOriginalRevision() else {
                     throw ParquetQueryError.sourceChanged
                 }
-                let result = try runtime.execute(connection: connection, sql: sql, bindings: bindings)
+                let result = try operation(runtime, connection) { interruptHandle.isCancelled(requestID) }
                 guard pinnedSource.matchesOriginalRevision() else {
                     throw ParquetQueryError.sourceChanged
                 }
@@ -1840,6 +1912,13 @@ nonisolated final class ParquetInterruptHandle: @unchecked Sendable {
         }
     }
 
+    func isCancelled(_ id: UUID) -> Bool {
+        lock.withLock {
+            if case .active = requestStates[id] { return false }
+            return true
+        }
+    }
+
     func interrupt() {
         lock.withLock {
             if let activeRequestID {
@@ -1932,6 +2011,17 @@ nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
     private let bindVarcharLength: BindVarcharLength
     private let bindInt64: BindInt64
     private let executePrepared: ExecutePrepared
+    // DuckDB passes result and string descriptors by value. The vendored C
+    // header supplies their actual layouts for both supported architectures.
+    private let executeStreaming: ExecutePrepared
+    private let fetchChunk: @convention(c) (duckdb_result) -> duckdb_data_chunk?
+    private let destroyChunk: @convention(c) (UnsafeMutablePointer<duckdb_data_chunk?>?) -> Void
+    private let chunkSize: @convention(c) (duckdb_data_chunk?) -> UInt64
+    private let chunkVector: @convention(c) (duckdb_data_chunk?, UInt64) -> duckdb_vector?
+    private let vectorData: @convention(c) (duckdb_vector?) -> UnsafeMutableRawPointer?
+    private let vectorValidity: @convention(c) (duckdb_vector?) -> UnsafeMutablePointer<UInt64>?
+    private let stringData: @convention(c) (UnsafeMutablePointer<duckdb_string_t>?) -> UnsafePointer<CChar>?
+    private let stringLength: @convention(c) (duckdb_string_t) -> UInt32
     private let destroyResult: DestroyResult
     private let resultError: ResultError
     private let columnCount: ColumnCount
@@ -1964,6 +2054,15 @@ nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
             self.bindVarcharLength = try Self.symbol("duckdb_bind_varchar_length", in: handle)
             self.bindInt64 = try Self.symbol("duckdb_bind_int64", in: handle)
             self.executePrepared = try Self.symbol("duckdb_execute_prepared", in: handle)
+            self.executeStreaming = try Self.symbol("duckdb_execute_prepared_streaming", in: handle)
+            self.fetchChunk = try Self.symbol("duckdb_fetch_chunk", in: handle)
+            self.destroyChunk = try Self.symbol("duckdb_destroy_data_chunk", in: handle)
+            self.chunkSize = try Self.symbol("duckdb_data_chunk_get_size", in: handle)
+            self.chunkVector = try Self.symbol("duckdb_data_chunk_get_vector", in: handle)
+            self.vectorData = try Self.symbol("duckdb_vector_get_data", in: handle)
+            self.vectorValidity = try Self.symbol("duckdb_vector_get_validity", in: handle)
+            self.stringData = try Self.symbol("duckdb_string_t_data", in: handle)
+            self.stringLength = try Self.symbol("duckdb_string_t_length", in: handle)
             self.destroyResult = try Self.symbol("duckdb_destroy_result", in: handle)
             self.resultError = try Self.symbol("duckdb_result_error", in: handle)
             self.columnCount = try Self.symbol("duckdb_column_count", in: handle)
@@ -2042,6 +2141,15 @@ nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
         sql: String,
         bindings: [DuckDBBinding]
     ) throws -> DuckDBResult {
+        try withPreparedStatement(connection: connection, sql: sql, bindings: bindings) { statement in
+            try materialize(statement)
+        }
+    }
+
+    private func withPreparedStatement<T>(
+        connection: OpaquePointer, sql: String, bindings: [DuckDBBinding],
+        perform: (OpaquePointer) throws -> T
+    ) throws -> T {
         if Task.isCancelled { throw ParquetQueryError.cancelled }
         var statement: OpaquePointer?
         let prepareState = sql.withCString { prepareQuery(connection, $0, &statement) }
@@ -2071,6 +2179,10 @@ nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
             }
         }
 
+        return try perform(statement)
+    }
+
+    private func materialize(_ statement: OpaquePointer) throws -> DuckDBResult {
         let storage = UnsafeMutableRawPointer.allocate(
             byteCount: DuckDBResult.storageByteCount,
             alignment: MemoryLayout<UInt64>.alignment
@@ -2096,6 +2208,59 @@ nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
             freeValue: freeValue,
             destroy: destroyResult
         )
+    }
+
+    func streamRows(
+        connection: OpaquePointer, sql: String, bindings: [DuckDBBinding], selectedRows: IndexSet?,
+        cancelled: () -> Bool, consume: (Int64, [String?]) throws -> Void
+    ) throws -> Int64 {
+        try withPreparedStatement(connection: connection, sql: sql, bindings: bindings) { statement in
+            var result = duckdb_result()
+            defer { destroyResult(&result) }
+            guard executeStreaming(statement, &result) == 0 else {
+                if cancelled() { throw ParquetQueryError.cancelled }
+                throw Self.queryError(resultError(&result).map(String.init(cString:)) ?? "Export query failed.")
+            }
+            let count = Int(columnCount(&result))
+            var displayedRow = selectedRows?.first ?? 0
+            var completed: Int64 = 0
+            while let next = fetchChunk(result) {
+                var chunk: duckdb_data_chunk? = next
+                defer { destroyChunk(&chunk) }
+                if cancelled() { throw ParquetQueryError.cancelled }
+                let vectors = try (0..<count).map { column in
+                    guard let vector = chunkVector(next, UInt64(column)),
+                          let data = vectorData(vector) else {
+                        throw ParquetQueryError.queryFailed("DuckDB returned an incomplete export chunk.")
+                    }
+                    return (data.assumingMemoryBound(to: duckdb_string_t.self), vectorValidity(vector))
+                }
+                for row in 0..<Int(chunkSize(next)) {
+                    defer { displayedRow += 1 }
+                    if let selectedRows, !selectedRows.contains(displayedRow) { continue }
+                    if row.isMultiple(of: 64), cancelled() { throw ParquetQueryError.cancelled }
+                    let values: [String?] = try vectors.map { values, validity in
+                        if let validity, validity[row / 64] & (UInt64(1) << (row % 64)) == 0 { return nil }
+                        let value = values.advanced(by: row)
+                        let length = Int(stringLength(value.pointee))
+                        guard length > 0 else { return "" }
+                        guard let bytes = stringData(value) else {
+                            throw ParquetQueryError.queryFailed("DuckDB returned an invalid export value.")
+                        }
+                        let buffer = UnsafeRawBufferPointer(start: bytes, count: length)
+                        return String(decoding: buffer, as: UTF8.self)
+                    }
+                    completed += 1
+                    try consume(completed, values)
+                }
+            }
+            if cancelled() { throw ParquetQueryError.cancelled }
+            if let message = resultError(&result) { throw Self.queryError(String(cString: message)) }
+            if let selectedRows, completed != Int64(selectedRows.count) {
+                throw ParquetQueryError.queryFailed("Some selected rows are no longer available.")
+            }
+            return completed
+        }
     }
 
     /// DuckDB diagnostics can contain several lines of implementation advice
@@ -2172,7 +2337,7 @@ nonisolated final class DuckDBDynamicAPI: @unchecked Sendable {
 nonisolated final class DuckDBResult: @unchecked Sendable {
     /// DuckDB 1.4.5's public `duckdb_result` contains three `idx_t` values and
     /// three pointers on every supported 64-bit macOS architecture.
-    static let storageByteCount = 6 * MemoryLayout<UInt64>.size
+    static let storageByteCount = MemoryLayout<duckdb_result>.stride
 
     fileprivate typealias IsNull = @convention(c) (UnsafeMutableRawPointer?, UInt64, UInt64) -> Bool
     fileprivate typealias Varchar = @convention(c) (

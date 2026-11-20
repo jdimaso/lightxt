@@ -1,16 +1,5 @@
 import AppKit
 
-private nonisolated enum ParquetTableExportError: Error, LocalizedError, Sendable {
-    case truncatedCell(row: Int64, column: Int)
-
-    var errorDescription: String? {
-        switch self {
-        case let .truncatedCell(row, column):
-            "Row \(row + 1), column \(column + 1) exceeds the table reader's exact export limit. No partial file was written."
-        }
-    }
-}
-
 /// Read-only, bounded Parquet table presentation. The selected file remains on
 /// disk; DuckDB returns only the visible 64-row pages and bounded facet/summary
 /// results. No text editor or mutable document snapshot is installed.
@@ -50,9 +39,27 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         target: self,
         action: #selector(returnToFileBackedCSV(_:))
     )
+    private lazy var columnsButton = NSButton(
+        title: "Columns…", target: self, action: #selector(chooseColumns)
+    )
     private let scrollView = NSScrollView()
     private let tableView = ParquetReadOnlyTableView()
-    private let queryLoadingOverlay = ParquetQueryLoadingOverlayView()
+    // A PivotViz window can outlive or detach from its source grid. Only the last
+    // reader closes the shared materialized table, on the service's own executor.
+    private final class ResidentCSVSource: Sendable {
+        let service: CSVInMemoryQueryService
+        init(_ service: CSVInMemoryQueryService) { self.service = service }
+        deinit {
+            let service = service
+            Task { await service.close() }
+        }
+    }
+    private var residentCSV: ResidentCSVSource?
+    private let analysisBar = CSVAnalysisBar()
+    private var analysisHeight: NSLayoutConstraint?
+    private let queryLoadingOverlay = TabularQueryLoadingOverlayView(
+        title: "Loading Parquet data", accessibilityLabel: "Updating Parquet table results", preferredWidth: 450
+    )
 
     private var sourceURL: URL?
     private var sourceKind: SourceKind = .parquet
@@ -60,6 +67,18 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private var service: (any TabularQueryService)?
     private var returnButtonWidthConstraint: NSLayoutConstraint?
     private var metadata: ParquetMetadata?
+    private var requestedColumns: [Int] = []
+    private var publishedColumns: [Int] = []
+    private var cellOffsets: [Int: Int] = [:]
+
+    /// Current visual order, including column drags. Cells use stable physical indexes.
+    private var visibleColumns: [ParquetColumn] {
+        guard let metadata else { return [] }
+        return tableView.tableColumns.compactMap { tableColumn in
+            dataColumn(tableColumn).map { metadata.allColumns[$0] }
+        }
+    }
+
     private var totalRowCount: Int64 = 0
     private var activeFilters: [Int: CSVFilterDraft] = [:]
     private var activeSort: (column: Int, ascending: Bool)?
@@ -68,6 +87,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     /// this projection before the retained rows become interactive again.
     private var publishedFilters: [Int: CSVFilterDraft] = [:]
     private var publishedSort: (column: Int, ascending: Bool)?
+    private var hasPublishedPage = false
     private var cachedPages: [Int64: ParquetPage] = [:]
     private var cacheOrder: [Int64] = []
     private struct PageRequest {
@@ -137,6 +157,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         super.init(frame: frameRect)
         configureControls()
         configureTable()
+        configureAnalysis()
         configureLayout()
         applyAppearance()
     }
@@ -152,7 +173,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         exportTask?.cancel()
         pageTasks.values.forEach { $0.task.cancel() }
         structuredDetailTasks.values.forEach { $0.task.cancel() }
-        service?.cancelCurrentQuery()
+        if residentCSV == nil { service?.cancelCurrentQuery() }
     }
 
     override func layout() {
@@ -219,6 +240,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         let currentGeneration = generation
         sourceURL = url.standardizedFileURL
         self.service = service
+        residentCSV = (service as? CSVInMemoryQueryService).map(ResidentCSVSource.init)
         showQueryLoadingOverlay(
             title: kind == .parquet ? "Loading Parquet data" : "Loading CSV into memory",
             detail: kind == .parquet
@@ -239,7 +261,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                 self.openTask = nil
                 self.metadata = metadata
                 self.totalRowCount = metadata.rowCount
-                self.configureColumns(metadata.columns)
+                self.requestedColumns = metadata.columns.map(\.index)
+                self.installColumnProjection(self.requestedColumns)
+                self.columnsButton.isEnabled = true
                 self.updateFilterStrip()
                 self.tableView.reloadData()
                 self.publishPosition()
@@ -272,7 +296,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     var canExportCurrentView: Bool {
         metadata != nil
             && service != nil
-            && cachedPages[0] != nil
+            && hasPublishedPage
             && exportTask == nil
             && !isResidentStatePurged
             && !isProjectionQueryInFlight
@@ -289,7 +313,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     /// ordinary path used by its parallel Parquet reader.
     var runtimeQAIsReady: Bool {
         metadata != nil
-            && cachedPages[0] != nil
+            && hasPublishedPage
             && pageTasks.isEmpty
             && openTask == nil
             && !isProjectionQueryInFlight
@@ -377,6 +401,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     private func deactivate(showPausedStatus: Bool) {
+        analysisBar.reset()
         inspectorTask?.cancel()
         inspectorTask = nil
         valueInspector?.dismiss()
@@ -406,17 +431,24 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         loadedUniqueValuesSearchText = ""
         loadedUniqueValuesFacetFilters = []
         hasLoadedUniqueValuesPage = false
-        let closingService = service
-        closingService?.cancelCurrentQuery()
+        if residentCSV == nil, let closingService = service {
+            closingService.cancelCurrentQuery()
+            Task { await closingService.close() }
+        }
         service = nil
-        if let closingService { Task { await closingService.close() } }
+        residentCSV = nil
         sourceURL = nil
         metadata = nil
+        columnsButton.isEnabled = false
+        requestedColumns.removeAll()
+        publishedColumns.removeAll()
+        cellOffsets.removeAll()
         totalRowCount = 0
         activeFilters.removeAll(keepingCapacity: false)
         activeSort = nil
         publishedFilters.removeAll(keepingCapacity: false)
         publishedSort = nil
+        hasPublishedPage = false
         cachedPages.removeAll(keepingCapacity: false)
         cacheOrder.removeAll(keepingCapacity: false)
         removeDataColumns()
@@ -439,6 +471,10 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
 
     private func configureControls() {
         controls.wantsLayer = true
+        columnsButton.controlSize = .small
+        columnsButton.bezelStyle = .rounded
+        columnsButton.isEnabled = false
+        columnsButton.toolTip = "Choose the columns to display and export"
         returnToFileBackedCSVButton.bezelStyle = .rounded
         returnToFileBackedCSVButton.controlSize = .small
         returnToFileBackedCSVButton.font = .systemFont(ofSize: 11, weight: .medium)
@@ -529,6 +565,34 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         scrollView.borderType = .noBorder
     }
 
+    private func configureAnalysis() {
+        analysisBar.physicalColumn = { [weak self] visual in
+            guard let self, self.tableView.tableColumns.indices.contains(visual) else { return nil }
+            return self.dataColumn(self.tableView.tableColumns[visual])
+        }
+        analysisBar.connect(tableView)
+        tableView.cellFocusChanged = { [weak self] in self?.publishPosition() }
+        analysisBar.source = { [weak self] _ in
+            guard let self, let resident = self.residentCSV,
+                  let metadata = self.metadata, !self.isProjectionQueryInFlight,
+                  !self.isQueryLoadingOverlayVisible, !self.requiresExplicitReload else {
+                throw CSVAnalysisError("Wait for the in-memory CSV query to finish.")
+            }
+            let fields = self.visibleColumns.map { CSVAnalysisField(id: $0.index, name: $0.name) }
+            guard let first = metadata.columns.first?.index, !fields.isEmpty else {
+                throw CSVAnalysisError("There are no CSV columns to analyze.")
+            }
+            let base = self.serviceQuery()
+            return CSVAnalysisBar.Source(title: self.window?.title ?? "CSV", fields: fields, rowCount: self.totalRowCount) { columns, rows, visit in
+                let query = ParquetTableQuery(filters: base.filters, sort: rows == nil ? nil : base.sort,
+                    projectedColumnIndexes: columns.isEmpty ? [first] : columns)
+                _ = try await resident.service.forEachExportRow(query: query, selectedRows: rows) {
+                    _, values in try visit(columns.isEmpty ? [] : values)
+                }
+            }
+        }
+    }
+
     private func configureLayout() {
         [
             controls,
@@ -537,6 +601,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             statusLabel,
             progress,
             returnToFileBackedCSVButton,
+            columnsButton,
             scrollView,
             queryLoadingOverlay,
         ].forEach {
@@ -544,11 +609,17 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         }
         addSubview(controls)
         controls.addSubview(returnToFileBackedCSVButton)
+        controls.addSubview(columnsButton)
         controls.addSubview(filterStrip)
         controls.addSubview(statusLabel)
         controls.addSubview(progress)
         addSubview(scrollView)
         addSubview(queryLoadingOverlay)
+        analysisBar.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(analysisBar)
+        analysisHeight = analysisBar.heightAnchor.constraint(equalToConstant: sourceKind == .csvInMemory ? 34 : 0)
+        analysisHeight?.isActive = true
+        analysisBar.isHidden = sourceKind != .csvInMemory
         queryLoadingOverlay.isHidden = true
         let returnButtonWidth = returnToFileBackedCSVButton.widthAnchor.constraint(equalToConstant: 0)
         returnButtonWidthConstraint = returnButtonWidth
@@ -560,7 +631,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             returnToFileBackedCSVButton.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 10),
             returnToFileBackedCSVButton.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
             returnButtonWidth,
-            filterStrip.leadingAnchor.constraint(equalTo: returnToFileBackedCSVButton.trailingAnchor, constant: 8),
+            columnsButton.leadingAnchor.constraint(equalTo: returnToFileBackedCSVButton.trailingAnchor, constant: 6),
+            columnsButton.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
+            filterStrip.leadingAnchor.constraint(equalTo: columnsButton.trailingAnchor, constant: 8),
             filterStrip.centerYAnchor.constraint(equalTo: controls.centerYAnchor),
             filterStrip.heightAnchor.constraint(equalToConstant: 32),
             filterStrip.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
@@ -572,7 +645,10 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: controls.bottomAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: analysisBar.topAnchor),
+            analysisBar.leadingAnchor.constraint(equalTo: leadingAnchor),
+            analysisBar.trailingAnchor.constraint(equalTo: trailingAnchor),
+            analysisBar.bottomAnchor.constraint(equalTo: bottomAnchor),
             queryLoadingOverlay.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
             queryLoadingOverlay.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
             queryLoadingOverlay.topAnchor.constraint(equalTo: scrollView.topAnchor),
@@ -589,6 +665,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
 
     private func updateSourceModeControls() {
         let isCSVInMemory = sourceKind == .csvInMemory
+        analysisBar.isHidden = !isCSVInMemory
+        analysisHeight?.constant = isCSVInMemory ? 34 : 0
+        tableView.cellMode = isCSVInMemory
         returnToFileBackedCSVButton.isHidden = !isCSVInMemory
         returnButtonWidthConstraint?.constant = isCSVInMemory ? 154 : 0
         progress.setAccessibilityLabel(
@@ -646,7 +725,42 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         header.needsDisplay = true
     }
 
+    @objc private func chooseColumns() {
+        guard let metadata, !isQueryLoadingOverlayVisible, !requiresExplicitReload,
+              exportTask == nil else { return }
+        replacePresentedPopover()
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.delegate = self
+        popover.contentViewController = ParquetColumnChooser(metadata: metadata, visible: visibleColumns) { [weak self] indexes in
+            guard let self else { return }
+            self.replacePresentedPopover()
+            self.applyColumnSelection(indexes)
+        }
+        presentedPopover = popover
+        popover.show(relativeTo: columnsButton.bounds, of: columnsButton, preferredEdge: .maxY)
+    }
+
+    private func applyColumnSelection(_ indexes: [Int]) {
+        guard indexes != visibleColumns.map(\.index) else { return }
+        requestedColumns = indexes
+        resetQuery()
+    }
+
+    private func installColumnProjection(_ indexes: [Int]) {
+        analysisBar.reset()
+        guard let metadata, indexes != publishedColumns else { return }
+        publishedColumns = indexes
+        cellOffsets = Dictionary(uniqueKeysWithValues: indexes.enumerated().map { ($0.element, $0.offset) })
+        configureColumns(indexes.map { metadata.allColumns[$0] })
+    }
+
     private func configureColumns(_ columns: [ParquetColumn]) {
+        let widths = Dictionary(uniqueKeysWithValues: tableView.tableColumns.compactMap { tableColumn in
+            dataColumn(tableColumn).map { ($0, tableColumn.width) }
+        })
+        isSettingSortDescriptors = true
+        defer { isSettingSortDescriptors = false }
         removeDataColumns()
         for column in columns {
             let tableColumn = NSTableColumn(
@@ -662,11 +776,16 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                 ascending: true
             )
             let contentMinimum: CGFloat = column.isStructured ? 240 : 120
-            tableColumn.width = min(320, max(contentMinimum, CGFloat(column.name.count * 8 + 44)))
+            tableColumn.width = widths[column.index] ?? min(320, max(contentMinimum, CGFloat(column.name.count * 8 + 44)))
             tableColumn.minWidth = 72
             tableColumn.maxWidth = 800
             tableColumn.resizingMask = .userResizingMask
             tableView.addTableColumn(tableColumn)
+        }
+        if let sort = activeSort, let column = tableColumn(dataColumn: sort.column) {
+            tableView.sortDescriptors = [NSSortDescriptor(key: column.identifier.rawValue, ascending: sort.ascending)]
+        } else {
+            tableView.sortDescriptors = []
         }
         materializeHeaderFilterControls()
     }
@@ -714,7 +833,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             return field
         }
         guard let column = dataColumn(tableColumn) else { return nil }
-        if let columns = metadata?.columns,
+        if let columns = metadata?.allColumns,
            columns.indices.contains(column),
            columns[column].isStructured {
             let cellView = reusableStructuredCell()
@@ -775,11 +894,18 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         return field
     }
 
-    func tableViewSelectionDidChange(_ notification: Notification) { publishPosition() }
+    func tableView(_ tableView: NSTableView, shouldReorderColumn columnIndex: Int, toColumn newColumnIndex: Int) -> Bool {
+        sourceKind != .csvInMemory || (columnIndex != 0 && newColumnIndex != 0)
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        tableView.synchronizeRowSelection()
+        publishPosition()
+    }
 
     private func publishPosition() {
         onPositionChange?(
-            Int64(max(0, tableView.selectedRow + 1)),
+            Int64(max(0, (tableView.focusCell?.row ?? tableView.selectedRow) + 1)),
             tableView.selectedRowIndexes.count,
             tableView.numberOfRows
         )
@@ -850,8 +976,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         let offset = Int64(row / Self.pageSize * Self.pageSize)
         guard let page = cachedPages[offset] else { return nil }
         let local = row - Int(offset)
-        guard page.rows.indices.contains(local), page.rows[local].indices.contains(column) else { return nil }
-        return page.rows[local][column]
+        guard let position = cellOffsets[column], page.rows.indices.contains(local),
+              page.rows[local].indices.contains(position) else { return nil }
+        return page.rows[local][position]
     }
 
     private func cachedSourceRowOrdinal(row: Int) -> Int64? {
@@ -890,7 +1017,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
               row >= 0,
               let service else { return }
         let offset = row / Int64(Self.pageSize) * Int64(Self.pageSize)
-        guard (replacingCurrentProjection || cachedPages[offset] == nil),
+        guard (replacingCurrentProjection || !isProjectionQueryInFlight && cachedPages[offset] == nil),
               pageTasks[offset] == nil else { return }
         if replacingCurrentProjection { isProjectionQueryInFlight = true }
         if pageTasks.count >= 2,
@@ -914,7 +1041,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                 let rowCountChanged = self.totalRowCount != page.totalRowCount
                 self.totalRowCount = page.totalRowCount
                 self.cache(page)
+                self.hasPublishedPage = true
                 if replacingCurrentProjection {
+                    self.installColumnProjection(self.requestedColumns)
                     self.isProjectionQueryInFlight = false
                     self.publishedFilters = self.activeFilters
                     self.publishedSort = self.activeSort
@@ -1040,8 +1169,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     private func toggleStructuredCell(dataColumn column: Int, row: Int) -> Bool {
         guard row >= 0,
               let metadata,
-              metadata.columns.indices.contains(column),
-              metadata.columns[column].isStructured,
+              metadata.allColumns.indices.contains(column),
+              metadata.allColumns[column].isStructured,
               cachedCell(row: row, column: column)?.value != nil,
               let sourceRowOrdinal = cachedSourceRowOrdinal(row: row) else { return false }
         let key = StructuredCellKey(sourceRowOrdinal: sourceRowOrdinal, column: column)
@@ -1320,6 +1449,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     private func resetQuery() {
+        analysisBar.reset()
         guard !isResidentStatePurged else { return }
         guard !requiresExplicitReload else {
             restorePublishedProjection()
@@ -1376,6 +1506,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         // it prevents that draft from continuing to advertise values that the
         // restored rows/export query do not represent.
         if presentedPopover != nil { replacePresentedPopover() }
+        requestedColumns = publishedColumns
         activeFilters = publishedFilters
         activeSort = publishedSort
         isSettingSortDescriptors = true
@@ -1399,18 +1530,18 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             return ParquetColumnFilter(
                 column: column,
                 containsText: draft.value,
-                containsCaseSensitive: draft.isCaseSensitive,
+                containsCaseSensitive: false,
                 selectedValues: Set(draft.selectedValues.compactMap(Self.decodePickerValue))
             )
         }
         let sort = activeSort.map {
             ParquetSortDescriptor(column: $0.column, order: $0.ascending ? .ascending : .descending)
         }
-        return ParquetTableQuery(filters: filters, sort: sort)
+        return ParquetTableQuery(filters: filters, sort: sort, projectedColumnIndexes: requestedColumns)
     }
 
     private func commitContains(_ value: String, column: Int) {
-        var draft = activeFilters[column] ?? CSVFilterDraft(predicate: .contains, value: "", isCaseSensitive: false)
+        var draft = activeFilters[column] ?? CSVFilterDraft(value: "")
         draft.value = value
         if draft.isEmpty { activeFilters.removeValue(forKey: column) } else { activeFilters[column] = draft }
         resetQuery()
@@ -1421,9 +1552,9 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         anchor: NSView? = nil,
         anchorRect: NSRect? = nil
     ) {
-        guard let metadata, metadata.columns.indices.contains(column), let service else { return }
+        guard let metadata, metadata.allColumns.indices.contains(column), let service else { return }
         replacePresentedPopover()
-        let title = metadata.columns[column].name
+        let title = metadata.allColumns[column].name
         let controller = CSVFilterPopoverViewController(
             columnTitle: title,
             filter: activeFilters[column],
@@ -1623,10 +1754,10 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     private func showSummary(column: Int, anchor: NSView? = nil) {
-        guard let metadata, metadata.columns.indices.contains(column), let service else { return }
+        guard let metadata, metadata.allColumns.indices.contains(column), let service else { return }
         guard !requiresExplicitReload else { return }
         replacePresentedPopover()
-        let controller = CSVColumnSummaryPopoverViewController(columnTitle: metadata.columns[column].name)
+        let controller = CSVColumnSummaryPopoverViewController(columnTitle: metadata.allColumns[column].name)
         let popover = NSPopover()
         popover.behavior = .transient
         popover.contentViewController = controller
@@ -1667,7 +1798,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         filterContainer.subviews.forEach { $0.removeFromSuperview() }
         var x: CGFloat = 0
         for (column, draft) in activeFilters.sorted(by: { $0.key < $1.key }) {
-            guard let columns = metadata?.columns, columns.indices.contains(column) else { continue }
+            guard let columns = metadata?.allColumns, columns.indices.contains(column) else { continue }
             let title = columns[column].name
             let summary = filterSummary(draft)
             let chip = CSVFilterChipView(
@@ -1789,8 +1920,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             inspect.isEnabled = !isProjectionQueryInFlight && !requiresExplicitReload
             menu.addItem(inspect)
             menu.addItem(.separator())
-            if metadata?.columns.indices.contains(column) == true,
-               metadata?.columns[column].isStructured == true,
+            if metadata?.allColumns.indices.contains(column) == true,
+               metadata?.allColumns[column].isStructured == true,
                cell.value != nil,
                let ordinal = cachedSourceRowOrdinal(row: row) {
                 let key = StructuredCellKey(sourceRowOrdinal: ordinal, column: column)
@@ -1830,7 +1961,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     @discardableResult
     private func inspectValue(row: Int, column: Int) -> Bool {
         guard !isProjectionQueryInFlight, !requiresExplicitReload,
-              let service, let metadata, metadata.columns.indices.contains(column),
+              let service, let metadata, metadata.allColumns.indices.contains(column),
               let cell = cachedCell(row: row, column: column),
               let ordinal = cachedSourceRowOrdinal(row: row) else { return false }
         inspectorTask?.cancel()
@@ -1843,7 +1974,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         }
         inspector.show(
             value: cell.value ?? "NULL",
-            columnTitle: metadata.columns[column].name,
+            columnTitle: metadata.allColumns[column].name,
             sourceRowNumber: ordinal + sourceRowNumberOffset,
             isTruncated: cell.isTruncated,
             isNull: cell.value == nil,
@@ -1874,8 +2005,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     @objc private func copyRow(_ sender: NSMenuItem) {
-        guard let row = sender.representedObject as? Int, let metadata else { return }
-        let values = metadata.columns.indices.map { cachedCell(row: row, column: $0)?.value ?? "NULL" }
+        guard let row = sender.representedObject as? Int else { return }
+        let values = visibleColumns.map { cachedCell(row: row, column: $0.index)?.value ?? "NULL" }
         writePasteboard(values.joined(separator: "\t"))
     }
 
@@ -1916,7 +2047,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     private func beginExport(to url: URL, request: TabularExportRequest) {
-        guard let service, let metadata, exportTask == nil else {
+        guard let service, metadata != nil, exportTask == nil else {
             NSSound.beep()
             return
         }
@@ -1944,16 +2075,20 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             selectedRows = nil
         }
 
-        let query = serviceQuery()
-        let headers = request.includesHeaders ? metadata.columns.map(\.name) : nil
+        let active = serviceQuery()
+        let columns = visibleColumns
+        let query = ParquetTableQuery(
+            filters: active.filters, sort: active.sort, projectedColumnIndexes: columns.map(\.index)
+        )
+        let headers = request.includesHeaders ? columns.map(\.name) : nil
         let format = request.format
-        let pageSize = Self.pageSize
+        let total = selectedRows.map { Int64($0.count) } ?? totalRowCount
         let identifier = UUID()
         exportID = identifier
         setBusy(true, text: "Exporting table…")
 
-        let onProgress: @Sendable (TabularExportProgress) async -> Void = { [weak self] update in
-            await MainActor.run { [weak self] in
+        let onProgress: @Sendable (TabularExportProgress) -> Void = { [weak self] update in
+            Task { @MainActor [weak self] in
                 guard let self, self.exportID == identifier else { return }
                 if let total = update.totalRows,
                    let fraction = update.fractionCompleted {
@@ -1982,7 +2117,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
                     query: query,
                     selectedRows: selectedRows,
                     expectedDestination: expectedDestination,
-                    pageSize: pageSize,
+                    expectedRows: total,
                     onProgress: onProgress
                 )
                 result = .success(rows)
@@ -2019,8 +2154,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         query: ParquetTableQuery,
         selectedRows: IndexSet?,
         expectedDestination: FileFingerprint?,
-        pageSize: Int,
-        onProgress: @escaping @Sendable (TabularExportProgress) async -> Void
+        expectedRows: Int64,
+        onProgress: @escaping @Sendable (TabularExportProgress) -> Void
     ) async throws -> Int64 {
         if Task.isCancelled { throw CancellationError() }
         let accessStarted = url.startAccessingSecurityScopedResource()
@@ -2035,115 +2170,22 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
             expectedDestination: expectedDestination
         )
         do {
-            var completed: Int64 = 0
-            var progressTotal = selectedRows.map { Int64($0.count) }
-            var lastProgress = ContinuousClock.now
-
-            if let selectedRows {
-                var iterator = selectedRows.makeIterator()
-                var nextSelectedRow = iterator.next()
-                selectedRowsLoop: while let selectedRow = nextSelectedRow {
-                    if Task.isCancelled { throw CancellationError() }
-                    let displayedRow = Int64(selectedRow)
-                    let pageOffset = displayedRow / Int64(pageSize) * Int64(pageSize)
-                    let page = try await service.page(
-                        offset: pageOffset,
-                        limit: pageSize,
-                        query: query
-                    )
-                    guard displayedRow < page.totalRowCount, !page.rows.isEmpty else { break }
-                    let pageEnd = pageOffset + Int64(page.rows.count)
-                    guard displayedRow < pageEnd else { break }
-
-                    while let candidate = nextSelectedRow {
-                        let candidateRow = Int64(candidate)
-                        guard candidateRow < pageEnd else { break }
-                        if candidateRow >= pageOffset {
-                            let localRow = Int(candidateRow - pageOffset)
-                            try appendExactExportRow(
-                                page.rows[localRow],
-                                displayedRow: candidateRow,
-                                to: sink
-                            )
-                            completed += 1
-                        }
-                        nextSelectedRow = iterator.next()
-                    }
-
-                    let now = ContinuousClock.now
-                    if now - lastProgress >= .milliseconds(120) {
-                        lastProgress = now
-                        await onProgress(TabularExportProgress(
-                            rowsWritten: completed,
-                            totalRows: progressTotal
-                        ))
-                    }
-
-                    if page.rows.count < pageSize, nextSelectedRow != nil {
-                        break selectedRowsLoop
-                    }
-                }
-            } else {
-                var offset: Int64 = 0
-                while true {
-                    if Task.isCancelled { throw CancellationError() }
-                    let page = try await service.page(
-                        offset: offset,
-                        limit: pageSize,
-                        query: query
-                    )
-                    progressTotal = page.totalRowCount
-                    guard !page.rows.isEmpty else { break }
-                    for (localRow, cells) in page.rows.enumerated() {
-                        if Task.isCancelled { throw CancellationError() }
-                        try appendExactExportRow(
-                            cells,
-                            displayedRow: offset + Int64(localRow),
-                            to: sink
-                        )
-                        completed += 1
-                    }
-                    offset += Int64(page.rows.count)
-
-                    let now = ContinuousClock.now
-                    if now - lastProgress >= .milliseconds(120) {
-                        lastProgress = now
-                        await onProgress(TabularExportProgress(
-                            rowsWritten: completed,
-                            totalRows: progressTotal
-                        ))
-                    }
-                    if offset >= page.totalRowCount { break }
+            let completed = try await service.forEachExportRow(query: query, selectedRows: selectedRows) { number, values in
+                try sink.append(row: values)
+                if number.isMultiple(of: 4_096) {
+                    onProgress(TabularExportProgress(rowsWritten: number, totalRows: expectedRows))
                 }
             }
-
-            if Task.isCancelled { throw CancellationError() }
+            try Task.checkCancellation()
+            guard completed == expectedRows else {
+                throw ParquetQueryError.queryFailed("The table row count changed during export.")
+            }
             try sink.finish()
-            await onProgress(TabularExportProgress(
-                rowsWritten: completed,
-                totalRows: progressTotal
-            ))
             return completed
         } catch {
             sink.cancel()
             throw error
         }
-    }
-
-    private nonisolated static func appendExactExportRow(
-        _ cells: [ParquetCell],
-        displayedRow: Int64,
-        to sink: TabularExportSink
-    ) throws {
-        if let column = cells.firstIndex(where: \.isTruncated) {
-            throw ParquetTableExportError.truncatedCell(
-                row: displayedRow,
-                column: column
-            )
-        }
-        // Preserve Parquet NULL as nil so delimited formats emit an empty field
-        // and JSON Lines emits a real JSON null rather than the text "NULL".
-        try sink.append(row: cells.map(\.value))
     }
 
     private func updateStatus() {
@@ -2154,8 +2196,8 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         var description = "\(totalRowCount.formatted()) row\(totalRowCount == 1 ? "" : "s")"
         if filtered { description += " filtered" }
         if sorted { description += " · sorted" }
-        if metadata.totalColumnCount > metadata.columns.count {
-            description += " · first \(metadata.columns.count) of \(metadata.totalColumnCount) columns"
+        if metadata.totalColumnCount > publishedColumns.count {
+            description += " · \(publishedColumns.count) of \(metadata.totalColumnCount) columns"
         }
         setBusy(false, text: description)
     }
@@ -2314,14 +2356,23 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
     /// table operations in the shipping application.
     var qaIsReady: Bool {
         metadata != nil
-            && cachedPages[0] != nil
+            && hasPublishedPage
             && pageTasks.isEmpty
             && openTask == nil
             && !isProjectionQueryInFlight
             && !isQueryLoadingOverlayVisible
     }
     var qaRowCount: Int { tableView.numberOfRows }
-    var qaColumnNames: [String] { metadata?.columns.map(\.name) ?? [] }
+    var qaColumnNames: [String] { visibleColumns.map(\.name) }
+    func qaExportVisibleColumns(to url: URL) {
+        guard canExportCurrentView else { return }
+        beginExport(to: url, request: .init(format: .csv, scope: .currentView, includesHeaders: true))
+    }
+    func qaChooseColumns(named names: [String]) -> Bool {
+        chooseColumns()
+        return (presentedPopover?.contentViewController as? ParquetColumnChooser)?
+            .qaSelectMatchingColumns(names) == true
+    }
     var qaCachedPageCount: Int { cachedPages.count }
     var qaPendingPageCount: Int { pageTasks.count }
     var qaCacheAndRequestLimits: (cache: Int, requests: Int) { (Self.maximumCachedPages, 2) }
@@ -2489,7 +2540,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
         guard let header = tableView.headerView as? LighTxtCSVHeaderView,
               let metadata else { return [] }
         let visible = header.visibleRect.isEmpty ? header.bounds : header.visibleRect
-        return Set(metadata.columns.compactMap { column in
+        return Set(metadata.allColumns.compactMap { column in
             guard let presentation = header.qaFilterPresentationRects(column: column.index),
                   presentation.input.width > 8,
                   presentation.funnel.width > 8,
@@ -2668,273 +2719,7 @@ final class ParquetTableView: NSView, NSTableViewDataSource, NSTableViewDelegate
 }
 
 @MainActor
-private final class ParquetQueryLoadingOverlayView: NSView {
-    var blocksInteraction = false
-
-    private let card = NSVisualEffectView()
-    private let indicator = ParquetQueryLoadingIndicatorView()
-    private let titleLabel = NSTextField(labelWithString: "Loading Parquet data")
-    private let detailLabel = NSTextField(labelWithString: "")
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        setAccessibilityElement(true)
-        setAccessibilityRole(.progressIndicator)
-        setAccessibilityLabel("Updating Parquet table results")
-
-        card.material = .popover
-        card.blendingMode = .withinWindow
-        card.state = .active
-        card.wantsLayer = true
-        card.layer?.cornerRadius = 16
-        card.layer?.masksToBounds = true
-
-        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        titleLabel.lineBreakMode = .byTruncatingTail
-        detailLabel.font = .systemFont(ofSize: 12.5, weight: .regular)
-        detailLabel.lineBreakMode = .byTruncatingTail
-        detailLabel.maximumNumberOfLines = 2
-
-        addSubview(card)
-        [indicator, titleLabel, detailLabel].forEach { card.addSubview($0) }
-        [card, indicator, titleLabel, detailLabel].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-        }
-
-        let preferredWidth = card.widthAnchor.constraint(equalToConstant: 450)
-        preferredWidth.priority = .defaultHigh
-        NSLayoutConstraint.activate([
-            card.centerXAnchor.constraint(equalTo: centerXAnchor),
-            card.centerYAnchor.constraint(equalTo: centerYAnchor),
-            card.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 24),
-            card.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -24),
-            card.widthAnchor.constraint(greaterThanOrEqualToConstant: 340),
-            preferredWidth,
-            card.heightAnchor.constraint(equalToConstant: 112),
-
-            indicator.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 24),
-            indicator.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            indicator.widthAnchor.constraint(equalToConstant: 104),
-            indicator.heightAnchor.constraint(equalToConstant: 64),
-
-            titleLabel.leadingAnchor.constraint(equalTo: indicator.trailingAnchor, constant: 20),
-            titleLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -24),
-            titleLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 27),
-            detailLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            detailLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-            detailLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 7),
-            detailLabel.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor, constant: -22),
-        ])
-        applyResolvedAppearance()
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyResolvedAppearance()
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        blocksInteraction ? super.hitTest(point) : nil
-    }
-
-    func update(title: String, detail: String) {
-        titleLabel.stringValue = title
-        detailLabel.stringValue = detail
-        setAccessibilityLabel(title)
-        setAccessibilityHelp(detail)
-    }
-
-    func startAnimating() { indicator.startAnimating() }
-    func stopAnimating() { indicator.stopAnimating() }
-
-    private func applyResolvedAppearance() {
-        let appearance = effectiveAppearance
-        let background = LighTxtTheme.resolved(LighTxtTheme.editorBackground, for: appearance)
-        let primary = LighTxtTheme.resolved(LighTxtTheme.primaryText, for: appearance)
-        let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
-        let separator = LighTxtTheme.resolved(LighTxtTheme.separator, for: appearance)
-        layer?.backgroundColor = background.withAlphaComponent(0.46).cgColor
-        card.layer?.borderColor = separator.withAlphaComponent(0.48).cgColor
-        card.layer?.borderWidth = 1
-        titleLabel.textColor = primary
-        detailLabel.textColor = secondary
-        indicator.applyResolvedAppearance()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-}
-
-/// A small table grid with a moving scanner makes the asynchronous DuckDB
-/// operation legible without implying that the complete file is resident.
-@MainActor
-private final class ParquetQueryLoadingIndicatorView: NSView {
-    private let viewportLayer = CALayer()
-    private let outlineLayer = CAShapeLayer()
-    private let scannerLayer = CAGradientLayer()
-    private var cellLayers: [CALayer] = []
-    private let highlightedCells: Set<Int> = [2, 6, 13, 17]
-    private var isAnimating = false
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        setAccessibilityElement(false)
-
-        viewportLayer.masksToBounds = true
-        viewportLayer.cornerRadius = 8
-        layer?.addSublayer(viewportLayer)
-
-        outlineLayer.fillColor = NSColor.clear.cgColor
-        outlineLayer.lineWidth = 1
-        viewportLayer.addSublayer(outlineLayer)
-
-        for _ in 0..<20 {
-            let cell = CALayer()
-            cell.cornerRadius = 2.5
-            cellLayers.append(cell)
-            viewportLayer.addSublayer(cell)
-        }
-
-        scannerLayer.startPoint = CGPoint(x: 0, y: 0.5)
-        scannerLayer.endPoint = CGPoint(x: 1, y: 0.5)
-        scannerLayer.locations = [0, 0.48, 0.52, 1]
-        viewportLayer.addSublayer(scannerLayer)
-        applyResolvedAppearance()
-    }
-
-    override func layout() {
-        super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        viewportLayer.frame = bounds.insetBy(dx: 2, dy: 4)
-        outlineLayer.frame = viewportLayer.bounds
-        outlineLayer.path = CGPath(
-            roundedRect: viewportLayer.bounds.insetBy(dx: 0.5, dy: 0.5),
-            cornerWidth: 8,
-            cornerHeight: 8,
-            transform: nil
-        )
-
-        let horizontalInset: CGFloat = 8
-        let verticalInset: CGFloat = 7
-        let columnGap: CGFloat = 4
-        let rowGap: CGFloat = 6
-        let columns: CGFloat = 5
-        let rows: CGFloat = 4
-        let cellWidth = max(
-            4,
-            (viewportLayer.bounds.width - horizontalInset * 2 - columnGap * (columns - 1)) / columns
-        )
-        let cellHeight = max(
-            4,
-            (viewportLayer.bounds.height - verticalInset * 2 - rowGap * (rows - 1)) / rows
-        )
-        for (index, cell) in cellLayers.enumerated() {
-            let row = CGFloat(index / 5)
-            let column = CGFloat(index % 5)
-            cell.frame = CGRect(
-                x: horizontalInset + column * (cellWidth + columnGap),
-                y: verticalInset + row * (cellHeight + rowGap),
-                width: cellWidth,
-                height: cellHeight
-            )
-        }
-        scannerLayer.frame = CGRect(
-            x: -34,
-            y: 1,
-            width: 34,
-            height: max(0, viewportLayer.bounds.height - 2)
-        )
-        CATransaction.commit()
-        if isAnimating, NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            positionStaticScanner()
-        }
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyResolvedAppearance()
-    }
-
-    func applyResolvedAppearance() {
-        let appearance = effectiveAppearance
-        let accent = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
-        let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
-        viewportLayer.backgroundColor = secondary.withAlphaComponent(0.055).cgColor
-        outlineLayer.strokeColor = secondary.withAlphaComponent(0.24).cgColor
-        for (index, cell) in cellLayers.enumerated() {
-            cell.backgroundColor = (highlightedCells.contains(index) ? accent : secondary)
-                .withAlphaComponent(highlightedCells.contains(index) ? 0.92 : 0.25)
-                .cgColor
-        }
-        scannerLayer.colors = [
-            accent.withAlphaComponent(0).cgColor,
-            accent.withAlphaComponent(0.08).cgColor,
-            accent.withAlphaComponent(0.72).cgColor,
-            accent.withAlphaComponent(0).cgColor,
-        ]
-    }
-
-    func startAnimating() {
-        guard !isAnimating else { return }
-        isAnimating = true
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
-            positionStaticScanner()
-            return
-        }
-        layoutSubtreeIfNeeded()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        scannerLayer.setAffineTransform(.identity)
-        CATransaction.commit()
-
-        let scan = CABasicAnimation(keyPath: "transform.translation.x")
-        scan.fromValue = 0
-        scan.toValue = viewportLayer.bounds.width + 68
-        scan.duration = 1.18
-        scan.repeatCount = .infinity
-        scan.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        scannerLayer.add(scan, forKey: "parquet.queryScan")
-
-        for (order, index) in highlightedCells.sorted().enumerated() {
-            let pulse = CAKeyframeAnimation(keyPath: "opacity")
-            pulse.values = [0.42, 1, 0.42]
-            pulse.keyTimes = [0, 0.48, 1]
-            pulse.duration = 1.25
-            pulse.beginTime = CACurrentMediaTime() + Double(order) * 0.14
-            pulse.repeatCount = .infinity
-            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            cellLayers[index].add(pulse, forKey: "parquet.matchPulse")
-        }
-    }
-
-    func stopAnimating() {
-        isAnimating = false
-        scannerLayer.removeAllAnimations()
-        cellLayers.forEach { $0.removeAllAnimations() }
-    }
-
-    private func positionStaticScanner() {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        scannerLayer.setAffineTransform(
-            CGAffineTransform(translationX: viewportLayer.bounds.width * 0.5 + 17, y: 0)
-        )
-        CATransaction.commit()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-}
-
-@MainActor
-private final class ParquetReadOnlyTableView: NSTableView {
+private final class ParquetReadOnlyTableView: CSVRangeTableView {
     var bodyMenuProvider: ((Int, Int) -> NSMenu?)?
     var activateProvider: ((Int, Int) -> Bool)?
     var inspectValueProvider: ((Int, Int) -> Bool)?
@@ -2948,18 +2733,19 @@ private final class ParquetReadOnlyTableView: NSTableView {
     }
 
     override func keyDown(with event: NSEvent) {
-        if TabularValueInspector.isInspectShortcut(event), selectedRow >= 0,
-           inspectValueProvider?(selectedColumn >= 0 ? selectedColumn : lastFocusedColumn, selectedRow) == true {
+        let row = focusCell?.row ?? selectedRow
+        let column = focusCell?.column ?? (selectedColumn >= 0 ? selectedColumn : lastFocusedColumn)
+        if TabularValueInspector.isInspectShortcut(event), row >= 0,
+           inspectValueProvider?(column, row) == true {
             return
         }
         let disallowedModifiers: NSEvent.ModifierFlags = [.command, .control, .option]
         let character = event.charactersIgnoringModifiers ?? ""
         let activates = character == " " || character == "\r" || character == "\n"
-        let column = selectedColumn >= 0 ? selectedColumn : lastFocusedColumn
         if activates,
            event.modifierFlags.intersection(disallowedModifiers).isEmpty,
-           selectedRow >= 0,
-           activateProvider?(column, selectedRow) == true {
+           row >= 0,
+           activateProvider?(column, row) == true {
             return
         }
         super.keyDown(with: event)

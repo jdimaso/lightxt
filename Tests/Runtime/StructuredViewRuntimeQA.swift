@@ -4,7 +4,7 @@ import Foundation
 
 // Minimal declarations used only when the production structured-view sources
 // are compiled as this standalone AppKit QA executable.
-enum SyntaxFileType { case plainText, json, markdown, sql, xml, csv, yaml, parquet }
+enum SyntaxFileType { case plainText, json, jsonLines, markdown, sql, xml, csv, yaml, parquet }
 enum SyntaxFoldKind: String { case object, array, element, mapping, sequence, scalar, comment }
 struct SyntaxByteRange: Hashable {
     let start: Int
@@ -66,32 +66,6 @@ final class DocumentSnapshot: @unchecked Sendable {
     }
 }
 
-enum LighTxtTheme {
-    static let primaryText = NSColor.labelColor
-    static let secondaryText = NSColor.secondaryLabelColor
-    static let separator = NSColor.separatorColor
-    static let chromeBackground = NSColor.windowBackgroundColor
-    static let accent = NSColor.systemTeal
-    static let selection = NSColor.selectedContentBackgroundColor
-    static let error = NSColor.systemRed
-
-    static func resolved(_ color: NSColor, for appearance: NSAppearance) -> NSColor {
-        var result = color
-        appearance.performAsCurrentDrawingAppearance {
-            result = color.usingColorSpace(.deviceRGB) ?? color
-        }
-        return result
-    }
-}
-
-extension ByteCountFormatter {
-    static let lighTxt: ByteCountFormatter = {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        return formatter
-    }()
-}
-
 @MainActor
 final class HeaderIconButton: NSView {
     var onActivate: (() -> Void)?
@@ -142,7 +116,7 @@ struct StructuredViewRuntimeQA {
         print(
             "Structured View runtime QA passed: find-only 1000pt layout, exact Unicode source highlight, "
                 + "bounded/cancellable previews, single-expand/double-collapse, 15–28pt zoom with fitting rows, "
-                + "YAML off-viewport search navigation, light/dark rendering, and accessibility labels."
+                + "YAML off-viewport search navigation, JSON row layout and contrast in both appearances, and accessibility labels."
         )
     }
 
@@ -561,14 +535,121 @@ struct StructuredViewRuntimeQA {
         tree.applyTreeSnapshot([root], title: "JSON Explorer", preservingExpansion: false)
         tree.revealNode(withIdentifier: "name")
         settle(window)
-        let labels = recursiveSubviews(of: tree).compactMap { $0 as? NSTextField }
-        guard let value = labels.first(where: { $0.stringValue == "“Ada Lovelace”" }),
-              let key = labels.first(where: { $0.stringValue == "display_name" }),
-              value.font?.pointSize == key.font?.pointSize,
-              (value.font?.pointSize ?? 0) >= 15 else {
-            throw QAError.failed("JSON values are still smaller than their keys")
-        }
         try capture(navigation, to: url)
+        guard let outline = recursiveSubviews(of: tree).compactMap({ $0 as? NSOutlineView }).first,
+              tree.qaSelectedRange == nodes[0].range else {
+            throw QAError.failed("Could not inspect the selected JSON member")
+        }
+
+        // Sample the empty end of the physical rows, clear of text and badges.
+        func rowSurface(_ row: Int) throws -> NSColor {
+            let rect = outline.rect(ofRow: row)
+            let sample = outline.convert(NSRect(x: rect.maxX - 25, y: rect.midY, width: 2, height: 2), to: navigation)
+            guard let bitmap = navigation.bitmapImageRepForCachingDisplay(in: sample) else {
+                throw QAError.failed("Could not allocate JSON row sample")
+            }
+            navigation.cacheDisplay(in: sample, to: bitmap)
+            guard let color = bitmap.colorAt(x: 0, y: 0)?.usingColorSpace(.sRGB), color.alphaComponent > 0.99 else {
+                throw QAError.failed("Could not read an opaque JSON row surface in \(appearance.rawValue)")
+            }
+            return color
+        }
+        let canvas = try rowSurface(outline.row(forItem: nodes[1]))
+        let selected = try rowSurface(outline.selectedRow)
+        let isLight = appearance == .aqua
+        guard isLight ? canvas.brightnessComponent >= 0.99 : canvas.brightnessComponent <= 0.22,
+              canvas.saturationComponent <= 0.06 else {
+            throw QAError.failed("Unexpected JSON canvas \(canvas) in \(appearance.rawValue)")
+        }
+        let selectionDifference = max(abs(canvas.redComponent - selected.redComponent),
+                                      abs(canvas.greenComponent - selected.greenComponent),
+                                      abs(canvas.blueComponent - selected.blueComponent))
+        guard selectionDifference > 0.04 else {
+            throw QAError.failed("JSON selection was indistinguishable from its canvas in \(appearance.rawValue)")
+        }
+
+        for node in nodes {
+            let row = outline.row(forItem: node)
+            let fields = try jsonFields(for: node, in: outline)
+            let rowRect = outline.rect(ofRow: row)
+            let keyRect = fields.key.convert(fields.key.bounds, to: outline)
+            let valueRect = fields.value.convert(fields.value.bounds, to: outline)
+            guard let keyFont = fields.key.font, fields.value.font?.pointSize == keyFont.pointSize,
+                  keyFont.pointSize >= 15, rowRect.height <= keyFont.pointSize * 2.2,
+                  abs(keyRect.midY - valueRect.midY) < 4, keyRect.maxX <= valueRect.minX + 1,
+                  rowRect.contains(keyRect), rowRect.contains(valueRect) else {
+                throw QAError.failed("Wide JSON row \(node.title) did not fit its key and value side by side: \(rowRect), \(keyRect), \(valueRect)")
+            }
+            guard let keyColor = fields.key.textColor?.usingColorSpace(.sRGB),
+                  let valueColor = fields.value.textColor?.usingColorSpace(.sRGB) else {
+                throw QAError.failed("Missing JSON foreground colors for \(node.title)")
+            }
+            let surface = row == outline.selectedRow ? selected : canvas
+            let keyContrast = contrast(keyColor, on: surface)
+            let valueContrast = contrast(valueColor, on: surface)
+            guard keyColor.saturationComponent <= 0.12, keyContrast >= 4.5,
+                  valueContrast >= keyContrast + 1 else {
+                throw QAError.failed("JSON \(node.title) contrast for key/value: \(keyContrast)/\(valueContrast), key \(keyColor), on \(surface) in \(appearance.rawValue)")
+            }
+        }
+        window.setContentSize(NSSize(width: 460, height: 520))
+        settle(window)
+        let fields = try jsonFields(for: nodes[0], in: outline)
+        let keyRect = fields.key.convert(fields.key.bounds, to: outline)
+        let valueRect = fields.value.convert(fields.value.bounds, to: outline)
+        let rowRect = outline.rect(ofRow: outline.row(forItem: nodes[0]))
+        guard outline.isItemExpanded(root), tree.qaSelectedRange == nodes[0].range,
+              abs(keyRect.midY - valueRect.midY) >= keyRect.height * 0.75,
+              rowRect.contains(keyRect), rowRect.contains(valueRect) else {
+            throw QAError.failed("Narrow JSON row: selection \(String(describing: tree.qaSelectedRange)), expanded \(outline.isItemExpanded(root)), row/key/value \(rowRect) / \(keyRect) / \(valueRect)")
+        }
+        window.setContentSize(NSSize(width: 900, height: 520))
+        tree.changeFullWorkspaceFontSize(by: 13)
+        defer { tree.resetFullWorkspaceFontSize() }
+        settle(window)
+        let zoomed = try jsonFields(for: nodes[0], in: outline)
+        let zoomedRow = outline.rect(ofRow: outline.row(forItem: nodes[0]))
+        let zoomedKey = zoomed.key.convert(zoomed.key.bounds, to: outline)
+        let zoomedValue = zoomed.value.convert(zoomed.value.bounds, to: outline)
+        guard outline.isItemExpanded(root), tree.qaSelectedRange == nodes[0].range,
+              zoomed.key.font?.pointSize == 28, zoomed.value.font?.pointSize == 28,
+              abs(zoomedKey.midY - zoomedValue.midY) < 4,
+              zoomedRow.contains(zoomedKey), zoomedRow.contains(zoomedValue) else {
+            throw QAError.failed("Zoomed inline JSON row lost its selection, expansion, or fitting layout")
+        }
+    }
+
+    private static func jsonFields(
+        for node: StructureSidebarNode, in outline: NSOutlineView
+    ) throws -> (key: NSTextField, value: NSTextField) {
+        let row = outline.row(forItem: node)
+        guard row >= 0, let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: true) else {
+            throw QAError.failed("Could not locate JSON row for \(node.title)")
+        }
+        let fields = recursiveSubviews(of: cell).compactMap { $0 as? NSTextField }
+        guard let key = fields.first(where: { $0.stringValue == node.title || $0.stringValue == node.title + ":" }),
+              let value = fields.first(where: { $0.stringValue == node.valueText }) else {
+            throw QAError.failed("Could not locate key and value labels for \(node.title)")
+        }
+        return (key, value)
+    }
+
+    /// Relative luminance contrast after compositing the text onto its actual AppKit row.
+    private static func contrast(_ text: NSColor, on surface: NSColor) -> CGFloat {
+        func linear(_ channel: CGFloat) -> CGFloat {
+            channel <= 0.04045 ? channel / 12.92 : pow((channel + 0.055) / 1.055, 2.4)
+        }
+        func luminance(_ red: CGFloat, _ green: CGFloat, _ blue: CGFloat) -> CGFloat {
+            0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+        }
+        let alpha = text.alphaComponent
+        let foreground = luminance(
+            alpha * text.redComponent + (1 - alpha) * surface.redComponent,
+            alpha * text.greenComponent + (1 - alpha) * surface.greenComponent,
+            alpha * text.blueComponent + (1 - alpha) * surface.blueComponent
+        )
+        let background = luminance(surface.redComponent, surface.greenComponent, surface.blueComponent)
+        return (max(foreground, background) + 0.05) / (min(foreground, background) + 0.05)
     }
 
     private static func renderSearchResults(

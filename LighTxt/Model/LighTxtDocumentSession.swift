@@ -3,9 +3,16 @@ import Foundation
 
 @MainActor
 final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditorDelegate {
-    private struct RecoveryTransaction {
+    private nonisolated struct RecoveryTransaction: Sendable {
+        static let maximumHistoryBytes = 8 << 20
+        static let maximumHistoryReferences = 4_096
+        static let maximumHistoryTransactions = 512
+
         let forward: [RecoveryPendingEdit]
         let inverse: [RecoveryPendingEdit]?
+        let payloadBytes: Int
+
+        var referenceCount: Int { forward.count + (inverse?.count ?? 0) }
     }
 
     struct Callbacks {
@@ -72,130 +79,121 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     private(set) var restoredRecoveryMetadata: RecoveryMetadata?
     private lazy var searchController = DocumentSearchController { [unowned self] in self.engine }
 
-    init(
+    /// Preparation is independent of AppKit. The selected source descriptor
+    /// and any completed conversion remain owned by this value until installation.
+    nonisolated struct PreparedOpen: Sendable {
+        let url: URL
+        let options: DocumentOpenOptions
+        let engine: FileBackedPieceTable
+        let snapshot: DocumentSnapshot
+        let scratch: UnicodeScratchFile?
+        let detection: SampledDocumentDetection
+        let sourceEncoding: DocumentTextEncoding
+        let syntaxFileType: SyntaxFileType
+        let unresolvedEncoding: Bool
+        let needsValidation: Bool
+
+        init(
+            url: URL,
+            options: DocumentOpenOptions,
+            cancellation: CancellationToken? = nil,
+            progress: ((UnicodeTranscodingProgress) -> Void)? = nil
+        ) throws {
+            if cancellation?.isCancelled == true { throw CancellationError() }
+            self.url = url
+            self.options = options
+            let source = try FileBackedPieceTable(opening: url)
+            let original = try source.snapshot()
+            let sampleEnd = min(original.byteCount, Int64(SampledDocumentDetector.maximumSampleByteCount))
+            let sample = try original.data(in: 0..<sampleEnd)
+            var unresolved = false
+            let convert: Bool
+            let sourceDetection: SampledDocumentDetection?
+            switch options.encoding {
+            case .automatic:
+                let classified = SampledDocumentDetector.detect(sample: sample, fileName: url.lastPathComponent)
+                sourceDetection = classified
+                let inferred = classified.textEncoding.encoding
+                sourceEncoding = inferred ?? .utf8
+                unresolved = inferred == nil
+                convert = sourceEncoding != .utf8
+            case .fileBackedUTF8:
+                sourceDetection = nil
+                sourceEncoding = .utf8
+                convert = false
+            case .explicit(let encoding):
+                sourceDetection = nil
+                sourceEncoding = encoding
+                convert = true
+            }
+            let openedSample: Data
+            if convert {
+                let converted = try StreamingUnicodeTranscoder.transcodeFileToUTF8(
+                    at: url, sourceEncoding: sourceEncoding, cancellation: cancellation, progress: progress
+                )
+                scratch = converted
+                engine = try FileBackedPieceTable(opening: converted.fileURL)
+                snapshot = try engine.snapshot()
+                let end = min(snapshot.byteCount, Int64(SampledDocumentDetector.maximumSampleByteCount))
+                openedSample = try snapshot.data(in: 0..<end)
+                detection = SampledDocumentDetector.detect(
+                    sample: openedSample, fileName: url.lastPathComponent, assuming: .utf8
+                )
+            } else {
+                engine = source
+                snapshot = original
+                scratch = nil
+                openedSample = sample
+                detection = sourceDetection ?? SampledDocumentDetector.detect(
+                    sample: sample, fileName: url.lastPathComponent, assuming: .utf8
+                )
+                if !unresolved, sampleEnd == original.byteCount {
+                    unresolved = String(data: sample, encoding: .utf8) == nil
+                }
+            }
+            syntaxFileType = options.format.syntaxFileType ?? detection.resolvedSyntaxFileType(
+                forPathExtension: url.pathExtension,
+                parquetMagicDetected: sourceEncoding == .utf8 && openedSample.starts(with: "PAR1".utf8)
+            )
+            unresolvedEncoding = syntaxFileType != .parquet && unresolved
+            needsValidation = syntaxFileType != .parquet && !convert && !unresolved
+                && sampleEnd < original.byteCount
+            if cancellation?.isCancelled == true { throw CancellationError() }
+        }
+    }
+
+    convenience init(
         opening url: URL,
         isScratch: Bool = false,
         openOptions: DocumentOpenOptions = DocumentOpenOptions()
     ) throws {
-        let sourceEngine = try FileBackedPieceTable(opening: url)
-        let sourceSnapshot = try sourceEngine.snapshot()
-        let sourceSampleEnd = min(sourceSnapshot.byteCount, 64 << 10)
-        let sourceSample = try sourceSnapshot.data(in: 0..<sourceSampleEnd)
-        let sourceDetection = SampledDocumentDetector.detect(
-            sample: sourceSample,
-            fileName: url.lastPathComponent
-        )
-        var sourceEncodingWasUnresolved: Bool
-        let selectedEncoding: DocumentTextEncoding
-        switch openOptions.encoding {
-        case .automatic:
-            sourceEncodingWasUnresolved = sourceDetection.textEncoding.encoding == nil
-            selectedEncoding = sourceDetection.textEncoding.encoding ?? .utf8
-        case .explicit(let encoding):
-            sourceEncodingWasUnresolved = false
-            selectedEncoding = encoding
-        }
-        if case .automatic = openOptions.encoding,
-           selectedEncoding == .utf8,
-           !sourceEncodingWasUnresolved,
-           sourceSnapshot.byteCount <= sourceSampleEnd {
-            do {
-                try StreamingUnicodeTranscoder.validateUTF8(snapshot: sourceSnapshot)
-            } catch {
-                sourceEncodingWasUnresolved = true
-            }
-        }
+        try self.init(prepared: PreparedOpen(url: url, options: openOptions), isScratch: isScratch)
+    }
 
-        let openedEngine: FileBackedPieceTable
-        let scratch: UnicodeScratchFile?
-        let snapshot: DocumentSnapshot
-        let canUseSourceBytesDirectly: Bool
-        if case .automatic = openOptions.encoding {
-            canUseSourceBytesDirectly = selectedEncoding == .utf8
+    init(prepared: PreparedOpen, isScratch: Bool = false) throws {
+        let snapshot = prepared.snapshot
+        engine = prepared.engine
+        originalSourceURL = prepared.url
+        sourceURL = prepared.scratch == nil ? prepared.url : nil
+        isScratchDocument = isScratch || prepared.scratch != nil
+        scratchBackingURL = isScratch && prepared.scratch == nil ? prepared.url : nil
+        transcodedScratchFile = prepared.scratch
+        requiresDestinationSave = prepared.scratch != nil
+        hasUnresolvedSourceEncoding = prepared.unresolvedEncoding
+        isSourceEncodingValidationPending = prepared.needsValidation
+        sampledDetection = prepared.detection
+        sourceTextEncoding = prepared.sourceEncoding
+        textEncoding = .utf8
+        reopenOptions = prepared.options
+        syntaxFileType = prepared.syntaxFileType
+        if case .delimitedText(let delimiter) = prepared.options.format {
+            delimitedTextDelimiter = delimiter
         } else {
-            // An explicit encoding is a strict conversion request. Even
-            // explicit UTF-8 validates the complete file in private scratch
-            // storage instead of blessing malformed bytes.
-            canUseSourceBytesDirectly = false
-        }
-        if canUseSourceBytesDirectly {
-            openedEngine = sourceEngine
-            scratch = nil
-            snapshot = sourceSnapshot
-        } else {
-            sourceEngine.close()
-            let converted = try StreamingUnicodeTranscoder.transcodeFileToUTF8(
-                at: url,
-                sourceEncoding: selectedEncoding
-            )
-            do {
-                openedEngine = try FileBackedPieceTable(opening: converted.fileURL)
-                snapshot = try openedEngine.snapshot()
-            } catch {
-                converted.discard()
-                throw error
-            }
-            scratch = converted
-        }
-        let sampleEnd = min(snapshot.byteCount, 64 << 10)
-        let sample = try snapshot.data(in: 0..<sampleEnd)
-        let detection: SampledDocumentDetection
-        if selectedEncoding != .utf8 {
-            detection = SampledDocumentDetector.detect(
-                sample: sample,
-                fileName: url.lastPathComponent
-            )
-        } else if case .explicit = openOptions.encoding {
-            detection = SampledDocumentDetector.detect(
-                sample: sample,
-                fileName: url.lastPathComponent,
-                assuming: .utf8
-            )
-        } else {
-            detection = sourceDetection
-        }
-
-        self.engine = openedEngine
-        self.originalSourceURL = url
-        self.sourceURL = scratch == nil ? url : nil
-        self.isScratchDocument = isScratch || scratch != nil
-        self.scratchBackingURL = isScratch && scratch == nil ? url : nil
-        self.transcodedScratchFile = scratch
-        self.requiresDestinationSave = scratch != nil
-        self.hasUnresolvedSourceEncoding = false
-        self.isSourceEncodingValidationPending = false
-        self.sampledDetection = detection
-        self.sourceTextEncoding = selectedEncoding
-        self.textEncoding = .utf8
-        self.reopenOptions = openOptions
-        switch openOptions.format {
-        case .automatic:
-            let parquetByMagic = selectedEncoding == .utf8
-                && SyntaxFileTypeDetector.sniff(sample) == .parquet
-            // A supported filename extension is the user's strongest ordinary
-            // open signal. Sampling still supplies encoding and CSV dialect,
-            // while extensionless/unknown files retain content inference.
-            self.syntaxFileType = detection.resolvedSyntaxFileType(
-                forPathExtension: url.pathExtension,
-                parquetMagicDetected: parquetByMagic
-            )
-        default:
-            self.syntaxFileType = openOptions.format.syntaxFileType ?? .plainText
-        }
-        self.hasUnresolvedSourceEncoding = syntaxFileType != .parquet
-            && sourceEncodingWasUnresolved
-        self.isSourceEncodingValidationPending = syntaxFileType != .parquet
-            && !sourceEncodingWasUnresolved
-            && openOptions.encoding == .automatic
-            && sourceSampleEnd < sourceSnapshot.byteCount
-        if case .delimitedText(let explicitDelimiter) = openOptions.format {
-            self.delimitedTextDelimiter = explicitDelimiter
-        } else {
-            self.delimitedTextDelimiter = detection.resolvedDelimitedTextDelimiter(
-                forPathExtension: url.pathExtension
+            delimitedTextDelimiter = prepared.detection.resolvedDelimitedTextDelimiter(
+                forPathExtension: prepared.url.pathExtension
             )
         }
-        self.lineIndex = try SparseUTF8LineIndex(
+        lineIndex = try SparseUTF8LineIndex(
             byteCount: snapshot.byteCount,
             sourceRevision: snapshot.revision,
             reader: { range in try snapshot.data(in: range) }
@@ -204,9 +202,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
             startBackgroundLineScan(maximumWarmupChunks: 8)
         }
         if isSourceEncodingValidationPending {
-            startSourceEncodingValidation(
-                snapshots: [snapshot]
-            )
+            startSourceEncodingValidation(snapshots: [snapshot])
         } else {
             configureRecoveryCoordinator(isUntitled: requiresDestinationSave)
         }
@@ -235,7 +231,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         configureRecoveryCoordinator(isUntitled: true)
     }
 
-    init(recovering recovered: RecoveredDocument) throws {
+    init(recovering recovered: RecoveredDocument, asCopy: Bool = false) throws {
         let engine = recovered.engine
         let snapshot = try engine.snapshot()
         let sample = try snapshot.data(in: 0..<min(snapshot.byteCount, 64 << 10))
@@ -297,11 +293,11 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
                 for: recoveredSyntax,
                 delimiter: recoveredDelimiter
             ),
-            encoding: .explicit(.utf8)
+            encoding: isUntitled || asCopy ? .explicit(.utf8) : .fileBackedUTF8
         )
-        self.sourceURL = isUntitled ? nil : recovered.entry.baseURL
-        self.originalSourceURL = isUntitled ? nil : recovered.entry.baseURL
-        self.isScratchDocument = isUntitled
+        self.sourceURL = isUntitled || asCopy ? nil : recovered.entry.baseURL
+        self.originalSourceURL = isUntitled || asCopy ? nil : recovered.entry.baseURL
+        self.isScratchDocument = isUntitled || asCopy
         self.scratchBackingURL = nil
         self.transcodedScratchFile = nil
         let baseEncodingIsUnresolved = baseDetection.map {
@@ -318,7 +314,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         self.isSourceEncodingValidationPending = recoveredSyntax != .parquet
             && !hasUnresolvedSourceEncoding
             && (snapshot.byteCount > Int64(sample.count) || baseNeedsValidation)
-        self.requiresDestinationSave = isUntitled
+        self.requiresDestinationSave = isUntitled || asCopy
         self.infersUntitledSaveFormat = isUntitled
         self.lineIndex = try SparseUTF8LineIndex(
             byteCount: snapshot.byteCount,
@@ -352,6 +348,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     }
 
     var editorDocumentByteCount: Int64 { engine.byteCount }
+    var editorAllowsTextMutation: Bool { !isReadOnly && !isMutationSuspended && !isBulkEditing }
     var editorSyntaxFileType: SyntaxFileType { syntaxFileType }
     var editorCSVDelimiter: UInt8 { delimitedTextDelimiter.rawValue }
     var byteCount: Int64 { engine.byteCount }
@@ -484,10 +481,6 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
             completion(.success(()))
             return
         }
-        let recoveryTransaction = Self.makeRecoveryTransaction(
-            edits: meaningfulEdits,
-            snapshot: snapshot
-        )
         let token: CancellationToken
         do {
             token = try beginCSVMutation(status: "Updating CSV rows…")
@@ -498,7 +491,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         let engine = self.engine
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result: Result<Void, Error>
+            let result: Result<RecoveryTransaction?, Error>
             do {
                 if token.isCancelled { throw CancellationError() }
                 try engine.replaceAtomically(
@@ -506,7 +499,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
                     replacing: snapshot,
                     cancellation: { token.isCancelled }
                 )
-                result = .success(())
+                result = .success(Self.makeRecoveryTransaction(edits: meaningfulEdits, snapshot: snapshot))
             } catch {
                 result = .failure(error)
             }
@@ -516,7 +509,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
                 self.bulkCancellation = nil
                 self.isBulkEditing = false
                 switch result {
-                case .success:
+                case .success(let recoveryTransaction):
                     self.recordRecoveryTransaction(recoveryTransaction)
                     self.finishSuccessfulCSVMutation(
                         status: meaningfulEdits.count == 1
@@ -584,7 +577,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
                 switch result {
                 case let .success(summary):
                     if summary.didChange {
-                        self.pauseRecoveryUntilSave()
+                        self.checkpointRecovery()
                         self.finishSuccessfulCSVMutation(
                             status: "Updated \(summary.changedRecordCount.formatted()) CSV rows"
                         )
@@ -629,7 +622,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     func editorDidCommitEdit(replaced range: Range<Int64>, insertedByteCount: Int64) {
         invalidateSearchResults()
         lineLookupCancellation?.cancel()
-        rebuildLineIndexAfterEdit()
+        rebuildLineIndexAfterEdit(unchangedPrefixByteCount: range.lowerBound)
         callbacks.documentChanged?(engine.byteCount, isEdited)
         callbacks.statusChanged?("Edited", false, false)
     }
@@ -739,24 +732,16 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     func findNext(backwards: Bool, from selection: Range<Int64>? = nil) {
         guard !searchQuery.isEmpty else { return }
         let selection = selection ?? lastSelection
-        var origin = backwards ? selection.lowerBound : selection.upperBound
-        if searchUsesRegularExpression,
-           let currentMatch,
-           currentMatch.byteRange.isEmpty,
-           selection.lowerBound == currentMatch.byteRange.lowerBound {
-            // A zero-width regex must make progress between Find Next calls.
-            // The streaming regex layer repairs UTF-8 context at its bounded
-            // window edge, so a one-byte coordinate advance is sufficient.
-            origin = backwards
-                ? max(0, origin - 1)
-                : min(engine.byteCount, origin + 1)
-        }
+        let origin = backwards ? selection.lowerBound : selection.upperBound
+        let continuingEmptyMatch = searchUsesRegularExpression
+            && currentMatch?.byteRange == origin..<origin
         callbacks.statusChanged?("Searching…", true, false)
         searchController.findOne(
             query: searchQuery,
             regularExpression: searchUsesRegularExpression,
             from: origin,
             backwards: backwards,
+            skippingEmptyMatchAtOrigin: continuingEmptyMatch,
             options: currentSearchOptions
         ) { [weak self] result in
             guard let self else { return }
@@ -860,7 +845,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         )
         let replacementRange = match.byteRange.lowerBound..<(match.byteRange.lowerBound + Int64(replacement.count))
         currentMatch = SearchMatch(byteRange: replacementRange)
-        rebuildLineIndexAfterEdit()
+        rebuildLineIndexAfterEdit(unchangedPrefixByteCount: match.byteRange.lowerBound)
         callbacks.documentChanged?(engine.byteCount, isEdited)
         callbacks.matchChanged?(currentMatch)
         return currentMatch
@@ -950,7 +935,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
                 switch result {
                 case let .success(summary):
                     if summary.replacementCount > 0 {
-                        self.pauseRecoveryUntilSave()
+                        self.checkpointRecovery()
                     }
                     self.currentMatch = nil
                     self.rebuildLineIndexAfterEdit()
@@ -991,15 +976,13 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     func undo() -> Bool {
         guard !isReadOnly, !isMutationSuspended, !isBulkEditing else { return false }
         guard engine.undo() else { return false }
-        if let transaction = recoveryUndoTransactions.popLast() {
-            if let inverse = transaction.inverse, !recoveryPausedUntilSave {
-                recoveryCoordinator?.record(inverse)
+        if !recoveryPausedUntilSave {
+            if let transaction = recoveryUndoTransactions.popLast(), let inverse = transaction.inverse {
+                recoveryCoordinator?.record(inverse, resultingByteCount: engine.byteCount)
                 recoveryRedoTransactions.append(transaction)
             } else {
-                pauseRecoveryUntilSave()
+                checkpointRecovery()
             }
-        } else if !recoveryPausedUntilSave {
-            pauseRecoveryUntilSave()
         }
         invalidateSearchResults()
         lineLookupCancellation?.cancel()
@@ -1013,11 +996,13 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     func redo() -> Bool {
         guard !isReadOnly, !isMutationSuspended, !isBulkEditing else { return false }
         guard engine.redo() else { return false }
-        if let transaction = recoveryRedoTransactions.popLast(), !recoveryPausedUntilSave {
-            recoveryCoordinator?.record(transaction.forward)
-            recoveryUndoTransactions.append(transaction)
-        } else if !recoveryPausedUntilSave {
-            pauseRecoveryUntilSave()
+        if !recoveryPausedUntilSave {
+            if let transaction = recoveryRedoTransactions.popLast() {
+                recoveryCoordinator?.record(transaction.forward, resultingByteCount: engine.byteCount)
+                recoveryUndoTransactions.append(transaction)
+            } else {
+                checkpointRecovery()
+            }
         }
         invalidateSearchResults()
         lineLookupCancellation?.cancel()
@@ -1085,7 +1070,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
                 for: syntaxFileType,
                 delimiter: delimitedTextDelimiter
             ),
-            encoding: .explicit(.utf8)
+            encoding: .fileBackedUTF8
         )
         callbacks.documentChanged?(engine.byteCount, isEdited)
         resetRecoveryAfterSave(baseURL: url)
@@ -1136,7 +1121,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     }
 
     func updateRecoveryMetadata(_ metadata: RecoveryMetadata) {
-        recoveryCoordinator?.updateMetadata(metadata)
+        recoveryCoordinator?.updateMetadata(metadata, byteCount: engine.byteCount)
     }
 
     /// Recovery UI state is a one-shot input for the first window created for
@@ -1147,11 +1132,21 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         return restoredRecoveryMetadata
     }
 
-    private static func makeRecoveryTransaction(
+    private nonisolated static func makeRecoveryTransaction(
         edits: [ByteEdit],
         snapshot: DocumentSnapshot
-    ) -> RecoveryTransaction {
-        let ordered = edits.enumerated().sorted { lhs, rhs in
+    ) -> RecoveryTransaction? {
+        guard edits.count <= RecoveryTransaction.maximumHistoryReferences else { return nil }
+        let journalBatchBudget = RecoveryJournalConfiguration.default.maximumInsertedBytesPerOperation
+        var forwardBytes = 0
+        for edit in edits {
+            guard edit.replacement.count <= journalBatchBudget - forwardBytes,
+                  edit.byteRange.lowerBound >= 0, edit.byteRange.upperBound <= snapshot.byteCount else { return nil }
+            forwardBytes += edit.replacement.count
+        }
+        let ordered = edits.enumerated().filter {
+            !$0.element.byteRange.isEmpty || !$0.element.replacement.isEmpty
+        }.sorted { lhs, rhs in
             if lhs.element.byteRange.lowerBound != rhs.element.byteRange.lowerBound {
                 return lhs.element.byteRange.lowerBound > rhs.element.byteRange.lowerBound
             }
@@ -1160,51 +1155,88 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
             }
             return lhs.offset > rhs.offset
         }.map(\.element)
-        let forward = ordered.map {
-            RecoveryPendingEdit(byteRange: $0.byteRange, replacement: $0.replacement)
+        // A small Data slice can retain its caller's much larger allocation.
+        // Own exactly the bytes charged to the journal and its history.
+        let forward = ordered.map { edit in
+            RecoveryPendingEdit(byteRange: edit.byteRange, replacement: edit.replacement.withUnsafeBytes { Data($0) })
         }
+        let forwardOnly = RecoveryTransaction(forward: forward, inverse: nil, payloadBytes: forwardBytes)
+        guard forwardBytes <= RecoveryTransaction.maximumHistoryBytes,
+              ordered.count <= RecoveryTransaction.maximumHistoryReferences / 2 else { return forwardOnly }
 
-        let maximumInversePayload = 1 << 20
-        var inverseInForwardOrder: [RecoveryPendingEdit] = []
-        inverseInForwardOrder.reserveCapacity(ordered.count)
+        // Check the full transaction before reading the first inverse byte.
+        var payloadBytes = forwardBytes
         for edit in ordered {
-            guard edit.byteRange.count <= maximumInversePayload,
-                  let previous = try? snapshot.data(in: edit.byteRange) else {
-                return RecoveryTransaction(forward: forward, inverse: nil)
-            }
+            guard edit.byteRange.count <= 1 << 20,
+                  edit.byteRange.count <= RecoveryTransaction.maximumHistoryBytes - payloadBytes else { return forwardOnly }
+            payloadBytes += edit.byteRange.count
+        }
+        var inverse: [RecoveryPendingEdit] = []
+        inverse.reserveCapacity(ordered.count)
+        for edit in ordered.reversed() {
+            guard let previous = try? snapshot.data(in: edit.byteRange) else { return forwardOnly }
             let insertedUpper = edit.byteRange.lowerBound + Int64(edit.replacement.count)
-            inverseInForwardOrder.append(RecoveryPendingEdit(
+            inverse.append(RecoveryPendingEdit(
                 byteRange: edit.byteRange.lowerBound..<insertedUpper,
                 replacement: previous
             ))
         }
-        return RecoveryTransaction(
-            forward: forward,
-            inverse: Array(inverseInForwardOrder.reversed())
-        )
+        return RecoveryTransaction(forward: forward, inverse: inverse, payloadBytes: payloadBytes)
     }
 
-    private func recordRecoveryTransaction(_ transaction: RecoveryTransaction) {
+    private func recordRecoveryTransaction(_ build: @autoclosure () -> RecoveryTransaction?) {
         guard !recoveryPausedUntilSave else { return }
-        guard transaction.forward.allSatisfy({ $0.replacement.count <= 16 << 20 }) else {
-            pauseRecoveryUntilSave()
+        guard let transaction = build() else {
+            checkpointRecovery()
             return
         }
-        recoveryCoordinator?.record(transaction.forward)
-        recoveryUndoTransactions.append(transaction)
-        if recoveryUndoTransactions.count > 512 {
-            recoveryUndoTransactions.removeFirst(recoveryUndoTransactions.count - 512)
-        }
+        // A no-op consumes no piece-table history and must keep both stacks aligned.
+        guard !transaction.forward.isEmpty else { return }
+        recoveryCoordinator?.record(transaction.forward, resultingByteCount: engine.byteCount)
         recoveryRedoTransactions.removeAll(keepingCapacity: true)
+        guard transaction.inverse != nil else {
+            // The forward delta still journals the edit. A later Undo past
+            // this point uses a checkpoint of the restored piece-table root.
+            recoveryUndoTransactions.removeAll(keepingCapacity: false)
+            return
+        }
+        recoveryUndoTransactions.append(transaction)
+        var remainingBytes = RecoveryTransaction.maximumHistoryBytes
+        var remainingReferences = RecoveryTransaction.maximumHistoryReferences
+        var keep = 0
+        for recent in recoveryUndoTransactions.reversed().prefix(RecoveryTransaction.maximumHistoryTransactions) {
+            guard recent.payloadBytes <= remainingBytes, recent.referenceCount <= remainingReferences else { break }
+            remainingBytes -= recent.payloadBytes
+            remainingReferences -= recent.referenceCount
+            keep += 1
+        }
+        recoveryUndoTransactions.removeFirst(recoveryUndoTransactions.count - keep)
+        // Undo and Redo only move existing records between the two stacks.
     }
 
-    private func pauseRecoveryUntilSave() {
-        guard !recoveryPausedUntilSave else { return }
-        recoveryPausedUntilSave = true
-        recoveryCoordinator?.discardAfterSuccessfulSave()
-        recoveryCoordinator = nil
+#if LIGHTXT_STANDALONE_CSV_SESSION_QA
+    func qaFlushRecovery() { recoveryCoordinator?.flushSynchronously() }
+
+    var qaRecoveryHistoryUsage: (bytes: Int, references: Int, transactions: Int) {
+        let transactions = recoveryUndoTransactions + recoveryRedoTransactions
+        return (transactions.reduce(0) { $0 + $1.payloadBytes },
+                transactions.reduce(0) { $0 + $1.referenceCount }, transactions.count)
+    }
+#endif
+
+    private func checkpointRecovery(rebasingOn baseURL: URL? = nil) {
         recoveryUndoTransactions.removeAll(keepingCapacity: false)
         recoveryRedoTransactions.removeAll(keepingCapacity: false)
+        if recoveryCoordinator == nil {
+            configureRecoveryCoordinator(isUntitled: requiresDestinationSave || sourceURL == nil)
+        }
+        do {
+            let snapshot = try engine.snapshot()
+            recoveryPausedUntilSave = false
+            recoveryCoordinator?.checkpoint(snapshot, rebasingOn: baseURL, fingerprint: engine.recoveryBaseFingerprint)
+        } catch {
+            handleRecoveryFailure(error)
+        }
     }
 
     private func configureRecoveryCoordinator(isUntitled: Bool) {
@@ -1277,14 +1309,14 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
     }
 
     private func resetRecoveryAfterSave(baseURL: URL?) {
+        if engine.hasUnsavedChanges {
+            checkpointRecovery(rebasingOn: baseURL)
+            return
+        }
         recoveryCoordinator?.discardAfterSuccessfulSave()
         recoveryCoordinator = nil
         recoveryUndoTransactions.removeAll(keepingCapacity: false)
         recoveryRedoTransactions.removeAll(keepingCapacity: false)
-        if engine.hasUnsavedChanges {
-            recoveryPausedUntilSave = true
-            return
-        }
         recoveryPausedUntilSave = false
         configureRecoveryCoordinator(isUntitled: baseURL == nil)
     }
@@ -1296,6 +1328,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         switch syntaxFileType {
         case .plainText: .plainText
         case .json: .json
+        case .jsonLines: .jsonLines
         case .markdown: .markdown
         case .sql: .sql
         case .xml: .xml
@@ -1353,7 +1386,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
         callbacks.searchResultsInvalidated?()
     }
 
-    private func rebuildLineIndexAfterEdit() {
+    private func rebuildLineIndexAfterEdit(unchangedPrefixByteCount: Int64 = 0) {
         // Every root change invalidates an in-flight exact Go to Line scan.
         // Cancel it before taking the index's invalidation lock so a main-
         // thread edit never waits behind a multi-gigabyte lookup.
@@ -1374,6 +1407,7 @@ final class LighTxtDocumentSession: VirtualTextEditorDelegate, CSVMutationEditor
             _ = try lineIndex.invalidate(
                 byteCount: snapshot.byteCount,
                 sourceRevision: snapshot.revision,
+                unchangedPrefixByteCount: unchangedPrefixByteCount,
                 reader: { range in try snapshot.data(in: range) }
             )
             // Re-index a small prefix only after typing settles. Go to Line
@@ -1470,6 +1504,7 @@ extension SyntaxFileType {
         switch self {
         case .plainText: "Plain Text"
         case .json: "JSON"
+        case .jsonLines: "JSON Lines"
         case .markdown: "Markdown"
         case .sql: "SQL"
         case .xml: "XML"

@@ -6,6 +6,7 @@ final class DocumentOpenAsAccessoryView: NSView {
         case automatic
         case plainText
         case json
+        case jsonLines
         case markdown
         case sql
         case xml
@@ -20,6 +21,7 @@ final class DocumentOpenAsAccessoryView: NSView {
             case .automatic: "Automatic (sample content)"
             case .plainText: "Plain text"
             case .json: "JSON"
+            case .jsonLines: "JSON Lines"
             case .markdown: "Markdown"
             case .sql: "SQL"
             case .xml: "XML"
@@ -36,6 +38,7 @@ final class DocumentOpenAsAccessoryView: NSView {
             case .automatic: .automatic
             case .plainText: .plainText
             case .json: .json
+            case .jsonLines: .jsonLines
             case .markdown: .markdown
             case .sql: .sql
             case .xml: .xml

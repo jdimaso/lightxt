@@ -19,7 +19,7 @@ final class DocumentRecoveryCoordinator {
     /// reads from the main actor while a durable write is in flight.
     private nonisolated final class Storage: @unchecked Sendable {
         let store: RecoveryStore
-        let base: Base
+        var base: Base
         var journal: RecoveryJournal?
         var isStopped = false
 
@@ -55,8 +55,9 @@ final class DocumentRecoveryCoordinator {
         /// reject all queued follow-on edits whose coordinates may depend on
         /// the failed edit.
         func stopPreservingJournal() {
+            // The journal holds no persistent write descriptor. Keep the handle
+            // so a full checkpoint can resume it after a failed incremental write.
             isStopped = true
-            journal?.close()
         }
 
         /// Normal save/close must not leave a chooser entry behind. A journal
@@ -84,6 +85,7 @@ final class DocumentRecoveryCoordinator {
         autoreleaseFrequency: .workItem
     )
     private let storage: Storage
+    private let checkpointCancellation = CancellationToken()
     private var pendingEdits: [RecoveryPendingEdit] = []
     private var pendingInsertedBytes = 0
     private var flushWorkItem: DispatchWorkItem?
@@ -141,13 +143,10 @@ final class DocumentRecoveryCoordinator {
         )
     }
 
-    func record(_ edit: RecoveryPendingEdit) {
-        record([edit])
-    }
-
-    func record(_ edits: [RecoveryPendingEdit]) {
+    func record(_ edits: [RecoveryPendingEdit], resultingByteCount: Int64) {
         let meaningful = edits.filter { !$0.byteRange.isEmpty || !$0.replacement.isEmpty }
         guard !meaningful.isEmpty, !isStopped else { return }
+        latestMetadata = latestMetadata.clampingOffsets(to: resultingByteCount)
         pendingEdits.append(contentsOf: meaningful)
         pendingInsertedBytes += meaningful.reduce(0) { $0 + $1.replacement.count }
         if pendingEdits.count >= 64 || pendingInsertedBytes >= 256 << 10 {
@@ -157,15 +156,60 @@ final class DocumentRecoveryCoordinator {
         }
     }
 
-    func updateMetadata(_ metadata: RecoveryMetadata) {
+    /// Queued behind earlier edits and before any later edits in the new
+    /// revision's coordinates. A failed checkpoint leaves its predecessor intact.
+    func checkpoint(
+        _ snapshot: DocumentSnapshot,
+        rebasingOn newURL: URL? = nil,
+        fingerprint: RecoveryBaseFingerprint? = nil
+    ) {
+        guard !didDiscard else { return }
+        flushWorkItem?.cancel()
+        metadataWorkItem?.cancel()
+        // Preserve pre-checkpoint typing even if writing the new revision fails.
+        _ = flushPendingEdits(publishing: RecoveryMetadata(task: latestMetadata.task))
+        generation &+= 1
+        isStopped = false
+        let generation = self.generation
+        let cancellation = checkpointCancellation
+        let base = newURL.flatMap { url in
+            fingerprint.map { (url: url, fingerprint: $0, bookmark: try? url.bookmarkData(
+                options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil
+            )) }
+        }
+        if let newURL {
+            var task = latestMetadata.task ?? RecoveryTaskMetadata()
+            task.displayName = newURL.lastPathComponent
+            task.values["untitled"] = "false"
+            latestMetadata.task = task
+        }
+        latestMetadata = latestMetadata.clampingOffsets(to: snapshot.byteCount)
+        let metadata = latestMetadata
+        queue.async { [weak self, storage] in
+            guard !cancellation.isCancelled else { return }
+            do {
+                if let base {
+                    storage.base = .file(base.url, bookmark: base.bookmark, expectedFingerprint: base.fingerprint)
+                }
+                let journal = try storage.ensureJournal(metadata: RecoveryMetadata(task: metadata.task))
+                try journal.checkpoint(snapshot, metadata: metadata, rebasingOn: base, cancellation: cancellation)
+                storage.isStopped = false
+            } catch {
+                storage.stopPreservingJournal()
+                DispatchQueue.main.async { self?.handleFailure(error, generation: generation) }
+            }
+        }
+    }
+
+    func updateMetadata(_ metadata: RecoveryMetadata, byteCount: Int64) {
         guard !isStopped else { return }
-        latestMetadata = metadata
+        latestMetadata = metadata.clampingOffsets(to: byteCount)
         metadataWorkItem?.cancel()
         let generation = self.generation
         let item = DispatchWorkItem { [weak self] in
             guard let self, self.generation == generation else { return }
-            if !self.flushPendingEdits(publishing: metadata) {
-                self.publishMetadata(metadata, generation: generation)
+            if !self.flushPendingEdits(publishing: self.latestMetadata) {
+                self.publishMetadata(self.latestMetadata, generation: generation)
             }
         }
         metadataWorkItem = item
@@ -189,6 +233,7 @@ final class DocumentRecoveryCoordinator {
     func discardAfterSuccessfulSave() {
         guard !didDiscard else { return }
         didDiscard = true
+        checkpointCancellation.cancel()
         isStopped = true
         generation &+= 1
         flushWorkItem?.cancel()
@@ -230,10 +275,10 @@ final class DocumentRecoveryCoordinator {
         queue.async { [weak self, storage] in
             guard !storage.isStopped else { return }
             do {
-                try storage.ensureJournal(metadata: metadata).record(
-                    batch,
-                    metadata: metadata
-                )
+                // The caret/viewport describe the edited document. Publish them with
+                // its first batch; the unedited base can be shorter, or empty.
+                let journal = try storage.ensureJournal(metadata: RecoveryMetadata(task: metadata.task))
+                try journal.record(batch, metadata: metadata)
             } catch {
                 storage.stopPreservingJournal()
                 DispatchQueue.main.async {

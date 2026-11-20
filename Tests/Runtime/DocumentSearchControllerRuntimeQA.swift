@@ -53,10 +53,64 @@ struct DocumentSearchControllerRuntimeQA {
             "exhaustive search did not retain the first matches in file order"
         )
 
+        try checkNavigation()
         print(
             "Document search controller QA passed: bounded search stops after the first 100 "
                 + "matches and exhaustive search reports the exact 250-match total"
         )
+    }
+
+    private static func checkNavigation() throws {
+        let table = FileBackedPieceTable(empty: .init())
+        defer { table.close() }
+        let controller = DocumentSearchController { table }
+        func find(
+            _ query: String,
+            from start: Int64,
+            backwards: Bool = false,
+            regex: Bool = true,
+            continuing: Bool = false,
+            options: SearchOptions = .init()
+        ) throws -> Range<Int64>? {
+            var outcome: Result<SearchMatch?, Error>?
+            controller.findOne(
+                query: query,
+                regularExpression: regex,
+                from: start,
+                backwards: backwards,
+                skippingEmptyMatchAtOrigin: continuing,
+                options: options
+            ) { outcome = $0 }
+            try wait(until: { outcome != nil }, failure: "find-one completion was not delivered")
+            return try outcome?.get()?.byteRange
+        }
+
+        try table.insert(utf8: "needle", at: 0)
+        for regex in [false, true] {
+            let wrapped = try find("needle", from: 3, regex: regex)
+            try expect(wrapped == 0..<6, "wrapped search missed a match spanning the caret")
+        }
+
+        try table.replace(byteRange: 0..<6, with: Data("😀a".utf8))
+        let empty = "(?=.|$)"
+        for (from, backwards, expected): (Int64, Bool, Int64) in [
+            (0, false, 4), (4, false, 5), (5, false, 0),
+            (0, true, 5), (5, true, 4), (4, true, 0)
+        ] {
+            let match = try find(empty, from: from, backwards: backwards, continuing: true)
+            try expect(match == expected..<expected, "zero-width search failed from byte \(from)")
+        }
+
+        let source = String(repeating: "€", count: 1_400_000) + "XY"
+        try table.replace(byteRange: 0..<5, with: Data(source.utf8))
+        let options = SearchOptions(
+            regexChunkByteCount: 128 << 10,
+            regexContextByteCount: 0,
+            maximumRegexWindowByteCount: 256 << 10,
+            maximumExactRegexDocumentByteCount: 0
+        )
+        let last = try find("Y", from: table.byteCount, backwards: true, options: options)
+        try expect(last == (table.byteCount - 1)..<table.byteCount, "reverse regex split a UTF-8 scalar")
     }
 
     private static func findAll(

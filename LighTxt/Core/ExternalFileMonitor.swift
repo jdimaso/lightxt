@@ -51,7 +51,7 @@ public nonisolated struct ExternalFileState: Sendable, Equatable {
 
     init(_ status: stat) {
         identity = ExternalFileIdentity(
-            device: UInt64(status.st_dev),
+            device: UInt64(bitPattern: Int64(status.st_dev)),
             inode: UInt64(status.st_ino)
         )
         byteCount = Int64(status.st_size)

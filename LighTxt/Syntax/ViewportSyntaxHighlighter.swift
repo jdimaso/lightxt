@@ -41,7 +41,7 @@ public enum ViewportSyntaxHighlighter {
         switch fileType {
         case .plainText, .parquet:
             endMode = .normal
-        case .json:
+        case .json, .jsonLines:
             endMode = highlightJSON(bytes, initialMode: initialState.mode, collector: &collector)
         case .markdown:
             endMode = highlightMarkdown(

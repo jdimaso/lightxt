@@ -10,6 +10,7 @@ public enum SyntaxFileTypeDetector {
         switch pathExtension.lowercased() {
         case "txt", "text", "log", "script": .plainText
         case "json": .json
+        case "jsonl", "ndjson": .jsonLines
         case "md", "markdown": .markdown
         case "sql": .sql
         case "xml": .xml

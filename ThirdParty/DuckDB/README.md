@@ -12,6 +12,11 @@ to provide bounded, read-only Parquet queries without a runtime download.
 - Vendored dependency notices: `ThirdParty/DuckDB/Licenses/`, copied without
   modification from the v1.4.5 source tree
 
+The compile-time `include/duckdb.h` is the unmodified header from that same
+archive. It supplies the ABI for DuckDB's by-value result and string descriptors.
+When updating the archive, extract the matching header with
+`unzip -p <archive> duckdb.h > ThirdParty/DuckDB/include/duckdb.h`.
+
 The deterministic SHA-256 over the sorted per-file SHA-256 listing in the
 vendored license directory is
 `d01087ae16feea36d5ae4a3d80a48fc683bb043cb3e9f147a63088b7498d623a`.

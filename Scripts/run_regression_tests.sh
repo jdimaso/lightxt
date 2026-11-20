@@ -247,8 +247,9 @@ run_release_performance_regression() {
         --disable-sandbox \
         --configuration release \
         --quiet \
-        --filter CSVScaleRegressionTests.testQuarterMillionRowInteractiveOperationsStayWithinReleaseBudget \
+        --filter 'CSVScaleRegressionTests.testQuarterMillionRowInteractiveOperationsStayWithinReleaseBudget|StreamingSearchTests.testWarmLiteralThroughput' \
         2>&1 | /usr/bin/tee "$performance_log"
+    /usr/bin/grep -Fq "LighTxt literal throughput:" "$performance_log" &&
     /usr/bin/grep -Fq "LighTxt 250k CSV regression:" "$performance_log" || {
         print -u2 "The filtered Release performance test did not execute."
         return 65
@@ -381,6 +382,7 @@ verify_duckdb() {
 
 typeset -a SWIFTC_COMMON
 SWIFTC_COMMON=(
+    -I "$REPOSITORY_ROOT/ThirdParty/DuckDB/include"
     -parse-as-library
     -swift-version 5
     -O
@@ -465,6 +467,7 @@ qa_structured_view() {
     swift_qa "$executable" \
         -DLIGHTXT_STANDALONE_STRUCTURE_QA \
         -DLIGHTXT_RUNTIME_QA \
+        LighTxt/UI/LighTxtTheme.swift \
         LighTxt/UI/FindBarView.swift \
         LighTxt/UI/StructureSearchResultBuilder.swift \
         LighTxt/UI/StructureSidebarView.swift \
@@ -478,6 +481,7 @@ qa_csv_session_mutation() {
     local executable="$BIN_DIRECTORY/CSVSessionMutationRuntimeQA"
     swift_qa "$executable" \
         -DLIGHTXT_STANDALONE_CSV_SESSION_QA \
+        -DLIGHTXT_RUNTIME_QA \
         -import-objc-header LighTxt/LighTxt-Bridging-Header.h \
         -Xcc -I -Xcc LighTxt/Vendor/JSONAccelerator/include \
         LighTxt/Core/LighTxtCoreError.swift \
@@ -487,6 +491,7 @@ qa_csv_session_mutation() {
         LighTxt/Core/StreamingUnicodeTranscoder.swift \
         LighTxt/Core/RecoveryJournal.swift \
         LighTxt/Core/FileBackedPieceTable.swift \
+        LighTxt/Core/CSVNumericValue.swift \
         LighTxt/Core/CSVDocumentIndex.swift \
         LighTxt/Core/CSVDataOperations.swift \
         LighTxt/Core/BulkReplace.swift \
@@ -529,6 +534,7 @@ qa_csv_table() {
         LighTxt/Core/StreamingFileWriter.swift \
         LighTxt/Core/RecoveryJournal.swift \
         LighTxt/Core/FileBackedPieceTable.swift \
+        LighTxt/Core/CSVNumericValue.swift \
         LighTxt/Core/CSVDocumentIndex.swift \
         LighTxt/Core/CSVDataOperations.swift \
         LighTxt/Core/TabularExport.swift \
@@ -538,6 +544,10 @@ qa_csv_table() {
         LighTxt/UI/LighTxtComfortScroller.swift \
         LighTxt/UI/TabularExportAccessoryView.swift \
         LighTxt/UI/TabularValueInspector.swift \
+        LighTxt/UI/TabularQueryLoadingOverlayView.swift \
+        LighTxt/Core/CSVAnalysis.swift \
+        LighTxt/UI/CSVPivotWindow.swift \
+        LighTxt/UI/CSVAnalysisBar.swift \
         LighTxt/UI/CSVTableView.swift \
         Tests/Runtime/CSVTableRuntimeQA.swift \
         "$NATIVE_DIRECTORY/LighTxtJSONAccelerator.o" \
@@ -575,6 +585,12 @@ qa_editor_scrolling() {
     swift_qa "$executable" \
         -DLIGHTXT_STANDALONE_EDITOR_SCROLL_QA \
         -DLIGHTXT_RUNTIME_QA \
+        LighTxt/Core/LighTxtCoreError.swift \
+        LighTxt/Core/ExternalFileMonitor.swift \
+        LighTxt/Core/MemoryMappedFile.swift \
+        LighTxt/Core/StreamingFileWriter.swift \
+        LighTxt/Core/RecoveryJournal.swift \
+        LighTxt/Core/FileBackedPieceTable.swift \
         LighTxt/Application/LighTxtFontController.swift \
         LighTxt/UI/LighTxtTheme.swift \
         LighTxt/UI/SyntaxPalette.swift \
@@ -615,11 +631,17 @@ qa_parquet_table() {
         LighTxt/Core/MemoryMappedFile.swift \
         LighTxt/Core/TabularExport.swift \
         LighTxt/Core/ParquetQueryService.swift \
+        LighTxt/Core/CSVNumericValue.swift \
         LighTxt/Core/CSVInMemoryQueryService.swift \
         LighTxt/UI/LighTxtComfortScroller.swift \
         LighTxt/UI/TabularExportAccessoryView.swift \
         LighTxt/UI/TabularValueInspector.swift \
+        LighTxt/UI/TabularQueryLoadingOverlayView.swift \
+        LighTxt/Core/CSVAnalysis.swift \
+        LighTxt/UI/CSVPivotWindow.swift \
+        LighTxt/UI/CSVAnalysisBar.swift \
         LighTxt/UI/CSVTableView.swift \
+        LighTxt/UI/ParquetColumnChooser.swift \
         LighTxt/UI/ParquetTableView.swift \
         Tests/Runtime/ParquetTableRuntimeQA.swift
     LIGHTXT_DUCKDB_LIBRARY_PATH="$DUCKDB_LIBRARY" \
@@ -676,7 +698,7 @@ run_selected_runtime_qa() {
 run_step "Preflight and runtime-QA registration" preflight
 run_step "SwiftPM core, syntax, and line-index tests" run_swiftpm_tests
 if [[ "$MODE" == full ]]; then
-    run_step "Release 250,000-row interaction performance budget" run_release_performance_regression
+    run_step "Release CSV interaction and literal search budgets" run_release_performance_regression
 fi
 run_step "$APP_CONFIGURATION application build" build_application
 run_step "Pinned DuckDB runtime verification" verify_duckdb

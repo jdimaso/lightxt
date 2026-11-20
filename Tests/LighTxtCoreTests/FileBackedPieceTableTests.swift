@@ -325,6 +325,68 @@ final class FileBackedPieceTableTests: XCTestCase {
         XCTAssertFalse(table.hasUnsavedChanges)
     }
 
+    func testExternalAppendExportsRecoverableLocalBytesAndOriginalRanges() throws {
+        let original = Data("first/middle/last".utf8)
+        let source = try makeFile(named: "source.txt", contents: original)
+        let table = try FileBackedPieceTable(opening: source,
+                                             configuration: .init(maximumResidentEditBytes: 0))
+        try table.replace(byteRange: 6..<12, withUTF8: "雪")
+        try table.delete(byteRange: 0..<2)
+        try table.insert(Data([0, 255]), at: table.byteCount)
+        let snapshot = try table.snapshot()
+        let exact = try snapshot.materializedData()
+        let handle = try FileHandle(forWritingTo: source)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("external".utf8))
+        try handle.close()
+        XCTAssertTrue(snapshot.originalFileIsUnavailable)
+        let target = temporaryDirectory.appendingPathComponent("copy.txt")
+        XCTAssertThrowsError(try table.saveAs(target))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+
+        let rescue = temporaryDirectory.appendingPathComponent("edits.jsonl")
+        try LocalEditExport.write(snapshot: snapshot, sourceURL: source, to: rescue, expectedDestination: nil)
+        let records = try Data(contentsOf: rescue).split(separator: 0x0A).map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0)) as? [String: Any])
+        }
+        XCTAssertEqual(records.first?["format"] as? String, "LighTxt local edits")
+        let base = try XCTUnwrap(records.first?["original"] as? [String: Any])
+        XCTAssertEqual(base["filename"] as? String, "source.txt")
+        XCTAssertEqual(base["byteCount"] as? Int, original.count)
+        var rebuilt = Data()
+        for record in records.dropFirst() {
+            switch record["op"] as? String {
+            case "copyOriginal":
+                let start = try XCTUnwrap(record["byteOffset"] as? Int)
+                let count = try XCTUnwrap(record["byteCount"] as? Int)
+                rebuilt.append(original[start..<(start + count)])
+            case "insertUTF8":
+                rebuilt.append(contentsOf: try XCTUnwrap(record["text"] as? String).utf8)
+            case "insertBase64":
+                rebuilt.append(try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(record["base64"] as? String))))
+            default: XCTFail("Unexpected rescue operation")
+            }
+        }
+        XCTAssertEqual(rebuilt, exact)
+        XCTAssertEqual(try Data(contentsOf: source), original + Data("external".utf8))
+        XCTAssertTrue(table.hasUnsavedChanges)
+        let fingerprint = try FileFingerprint.atPath(source.path)
+        XCTAssertThrowsError(try LocalEditExport.write(snapshot: snapshot, sourceURL: source, to: source,
+                                                       expectedDestination: fingerprint))
+    }
+
+    func testExternalAtomicReplacementKeepsFullSaveAsAvailable() throws {
+        let source = try makeFile(named: "replaced.txt", contents: Data("original".utf8))
+        let table = try FileBackedPieceTable(opening: source)
+        try table.insert(utf8: " local", at: table.byteCount)
+        try Data("changed externally".utf8).write(to: source, options: .atomic)
+        XCTAssertFalse(try table.snapshot().originalFileIsUnavailable)
+        let target = temporaryDirectory.appendingPathComponent("rescued.txt")
+        try table.saveAs(target)
+        XCTAssertEqual(try Data(contentsOf: target), Data("original local".utf8))
+        XCTAssertEqual(try Data(contentsOf: source), Data("changed externally".utf8))
+    }
+
     func testSaveRefusesToOverwriteExternalChange() throws {
         let source = try makeFile(named: "conflict.txt", contents: Data("one".utf8))
         let table = try FileBackedPieceTable(opening: source)
@@ -472,6 +534,106 @@ final class FileBackedPieceTableTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: destination), Data("safe".utf8))
     }
 
+    func testSaveStagingRequestsTheDestinationVolumeForNewAndExistingFiles() throws {
+        let existing = try makeFile(named: "existing.txt", contents: Data("previous".utf8))
+        let new = temporaryDirectory.appendingPathComponent("new.txt")
+        for (target, exists) in [(existing, true), (new, false)] {
+            let manager = SaveStagingFileManager()
+            let area = try StreamingFileWriter.makeStagingArea(appropriateFor: target, targetExists: exists, fileManager: manager)
+            defer { try? FileManager.default.removeItem(at: area.directoryURL) }
+            let anchor = exists ? existing : temporaryDirectory!
+            XCTAssertEqual(manager.replacementRequest?.standardizedFileURL.path, anchor.standardizedFileURL.path)
+            let anchorDevice = try XCTUnwrap(FileFingerprint.atPath(anchor.path)).device
+            XCTAssertEqual(try FileFingerprint.atPath(area.directoryURL.path)?.device, anchorDevice)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: area.fileURL.path))
+        }
+    }
+
+    func testSaveStagingFallbackRejectsAnotherDeviceBeforeWriting() throws {
+        let target = temporaryDirectory.appendingPathComponent("new.txt")
+        let expectedDevice = try XCTUnwrap(FileFingerprint.atPath(temporaryDirectory.path)).device
+        let manager = SaveStagingFileManager()
+        manager.failReplacementRequest = true
+        manager.fallbackDirectory = temporaryDirectory
+        let fallback = try StreamingFileWriter.makeStagingArea(appropriateFor: target, targetExists: false, fileManager: manager)
+        defer { try? FileManager.default.removeItem(at: fallback.directoryURL) }
+        XCTAssertEqual(try FileFingerprint.atPath(fallback.directoryURL.path)?.device, expectedDevice)
+        let differentDevice = URL(fileURLWithPath: "/dev", isDirectory: true)
+        try XCTSkipIf(try FileFingerprint.atPath(differentDevice.path)?.device == expectedDevice)
+        manager.fallbackDirectory = differentDevice
+        manager.rejectDirectoryCreation = true
+        XCTAssertThrowsError(try StreamingFileWriter.makeStagingArea(appropriateFor: target, targetExists: false, fileManager: manager)) { error in
+            guard case LighTxtCoreError.io(_, _, EXDEV) = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertFalse(manager.attemptedRejectedCreation)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+    }
+
+    func testSaveAsRejectsUnsupportedDestinationBeforeStreamingAndKeepsEdits() throws {
+        let table = FileBackedPieceTable(empty: .init())
+        try table.insert(utf8: "unsaved", at: 0)
+        let folder = temporaryDirectory.appendingPathComponent("existing-directory", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        let marker = folder.appendingPathComponent("preserved.txt")
+        try Data("original".utf8).write(to: marker)
+        let missingParent = temporaryDirectory.appendingPathComponent("absent/target.txt")
+        for destination in [folder, missingParent] {
+            var beganStreaming = false
+            XCTAssertThrowsError(try table.saveAs(destination, progress: { _ in beganStreaming = true }))
+            XCTAssertFalse(beganStreaming)
+            XCTAssertTrue(table.hasUnsavedChanges)
+            XCTAssertNil(table.documentURL)
+        }
+        XCTAssertEqual(try Data(contentsOf: marker), Data("original".utf8))
+        XCTAssertEqual(try text(of: table), "unsaved")
+    }
+
+    /// Supply a writable test directory on another volume. Only this test's
+    /// unique child directory is created or removed.
+    func testSaveAsAndSaveCopyToAnotherVolumeWhenAvailable() throws {
+        guard let path = ProcessInfo.processInfo.environment["LIGHTXT_CROSS_VOLUME_SAVE_DIRECTORY"] else {
+            throw XCTSkip("Set LIGHTXT_CROSS_VOLUME_SAVE_DIRECTORY to a writable directory on another volume")
+        }
+        let volume = URL(fileURLWithPath: path, isDirectory: true)
+        let device = try XCTUnwrap(FileFingerprint.atPath(volume.path)).device
+        XCTAssertNotEqual(device, try XCTUnwrap(FileFingerprint.atPath(temporaryDirectory.path)).device)
+        let directory = volume.appendingPathComponent("LighTxtSaveTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let source = try makeFile(named: "source.txt", contents: Data("source".utf8))
+        let table = try FileBackedPieceTable(opening: source)
+        let copy = directory.appendingPathComponent("copy.txt")
+        try table.saveCopy(to: copy)
+        XCTAssertEqual(try Data(contentsOf: copy), Data("source".utf8))
+        let destination = directory.appendingPathComponent("new.txt")
+        try table.insert(utf8: "-new", at: table.byteCount)
+        try table.saveAs(destination)
+        XCTAssertEqual(try FileFingerprint.atPath(destination.path)?.device, device)
+        XCTAssertFalse(table.hasUnsavedChanges)
+        try table.insert(utf8: "-existing", at: table.byteCount)
+        try table.save()
+        XCTAssertEqual(try Data(contentsOf: destination), Data("source-new-existing".utf8))
+        XCTAssertEqual(try Data(contentsOf: source), Data("source".utf8))
+        XCTAssertFalse(table.hasUnsavedChanges)
+    }
+
+    func testCleanSaveCopyStreamsFromAnotherSystemVolume() throws {
+        let source = URL(fileURLWithPath: "/System/Volumes/Preboot/Cryptexes/OS/System/Library/CoreServices/SystemVersion.plist")
+        guard FileManager.default.isReadableFile(atPath: source.path),
+              let sourceDevice = try FileFingerprint.atPath(source.path)?.device else {
+            throw XCTSkip("No readable system version fixture on the Preboot volume")
+        }
+        let targetDevice = try XCTUnwrap(FileFingerprint.atPath(temporaryDirectory.path)).device
+        try XCTSkipIf(sourceDevice == targetDevice, "System and temporary directories share one volume")
+        let destination = temporaryDirectory.appendingPathComponent("system-version-copy.plist")
+        let table = try FileBackedPieceTable(opening: source)
+        try table.saveCopy(to: destination)
+        XCTAssertEqual(try Data(contentsOf: destination), try Data(contentsOf: source))
+        XCTAssertEqual(try FileFingerprint.atPath(destination.path)?.device, targetDevice)
+        XCTAssertEqual(table.documentURL, source.standardizedFileURL.resolvingSymlinksInPath())
+    }
+
     /// Run separately under a sandbox profile that grants write access to the
     /// destination file itself while denying writes to its parent directory.
     /// This mirrors the Powerbox authority returned by NSSavePanel and guards
@@ -504,6 +666,39 @@ final class FileBackedPieceTableTests: XCTestCase {
     private func text(of table: FileBackedPieceTable) throws -> String {
         let snapshot = try table.snapshot()
         return try snapshot.utf8String(in: 0..<snapshot.byteCount)
+    }
+}
+
+private final class SaveStagingFileManager: FileManager, @unchecked Sendable {
+    var failReplacementRequest = false
+    var rejectDirectoryCreation = false
+    var attemptedRejectedCreation = false
+    var fallbackDirectory: URL?
+    var replacementRequest: URL?
+
+    override var temporaryDirectory: URL { fallbackDirectory ?? super.temporaryDirectory }
+
+    override func url(
+        for directory: FileManager.SearchPathDirectory,
+        in domain: FileManager.SearchPathDomainMask,
+        appropriateFor url: URL?,
+        create shouldCreate: Bool
+    ) throws -> URL {
+        replacementRequest = url
+        if failReplacementRequest { throw CocoaError(.fileWriteNoPermission) }
+        return try super.url(for: directory, in: domain, appropriateFor: url, create: shouldCreate)
+    }
+
+    override func createDirectory(
+        at url: URL,
+        withIntermediateDirectories createIntermediates: Bool,
+        attributes: [FileAttributeKey: Any]? = nil
+    ) throws {
+        if rejectDirectoryCreation {
+            attemptedRejectedCreation = true
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        try super.createDirectory(at: url, withIntermediateDirectories: createIntermediates, attributes: attributes)
     }
 }
 

@@ -3,6 +3,59 @@ import XCTest
 @testable import LighTxt
 
 final class CSVDocumentIndexTests: XCTestCase {
+    func testBOMBeforeQuotedMultilineFieldPreservesBoundariesAndByteLocations() throws {
+        let engine = FileBackedPieceTable(empty: .init())
+        let bytes = Data([0xEF, 0xBB, 0xBF]) + Data("\"first\nname\",age\r\nSam,30\r\n".utf8)
+        try engine.insert(bytes, at: 0)
+        let snapshot = try engine.snapshot()
+        for accelerated in [false, true] {
+            let index = try CSVRowIndex(snapshot: snapshot, configuration: .init(
+                readChunkByteCount: 1, initialCheckpointRecordInterval: 1,
+                allowsAcceleratedScanner: accelerated
+            ))
+            XCTAssertEqual(try index.scanToEnd().progress.totalRecordCount, 2)
+            let rows = try index.recordLocations(startingAt: 0, limit: 3)
+            XCTAssertEqual(try CSVRecordParser.parse(snapshot: snapshot, location: rows[0]).fields.map(\.value),
+                           ["first\nname", "age"])
+            XCTAssertEqual(try index.recordLocations(containingByteOffsets: [0, 3, 10, 21]).map { $0?.record },
+                           [0, 0, 0, 1])
+            let edit = try CSVRowMutationPlanner.delete(record: 0, snapshot: snapshot, index: index)
+            XCTAssertEqual(edit.byteRange, 3..<rows[1].contentRange.lowerBound)
+        }
+    }
+
+    func testClearingOnlyFieldOfFinalUnterminatedRowUpdatesRowCount() throws {
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(utf8: "first\nlast", at: 0)
+        let index = try CSVRowIndex(snapshot: engine.snapshot())
+        _ = try index.scanToEnd()
+        let last = try XCTUnwrap(index.recordLocation(forRecord: 1))
+        try engine.replace(byteRange: last.contentRange, withUTF8: "")
+        let rebased = try index.rebased(onto: engine.snapshot(), replacing: last.contentRange, insertedByteCount: 0)
+        XCTAssertEqual(try rebased.scanToEnd().progress.totalRecordCount, 1)
+        XCTAssertNil(try rebased.recordLocation(forRecord: 1))
+    }
+
+    func testInsertingIntoEmptyFirstFieldPreservesCheckpointAndBatchOrder() throws {
+        let engine = FileBackedPieceTable(empty: .init())
+        try engine.insert(utf8: ",x\n,y\n,z\n", at: 0)
+        var snapshot = try engine.snapshot()
+        var index = try CSVRowIndex(snapshot: snapshot, configuration: .init(initialCheckpointRecordInterval: 1))
+        _ = try index.scanToEnd()
+        for record in [Int64(0), 1] {
+            let location = try XCTUnwrap(index.recordLocation(forRecord: record))
+            let field = try CSVRecordParser.parse(snapshot: snapshot, location: location).fields[0]
+            try engine.replace(byteRange: field.byteRange, withUTF8: "abc")
+            snapshot = try engine.snapshot()
+            index = try index.rebased(onto: snapshot, replacing: field.byteRange, insertedByteCount: 3)
+        }
+        let sequence: [Int64] = [2, 0, 2, 1]
+        let locations = try index.recordLocations(forRecords: sequence)
+        XCTAssertEqual(locations.map(\.record), sequence)
+        XCTAssertEqual(try locations.map { try CSVRecordParser.parse(snapshot: snapshot, location: $0).fields[0].value },
+                       ["", "abc", "", "abc"])
+    }
+
     func testQuotedNewlinesEscapedQuotesAndCRLFAreSingleRecords() throws {
         let source = Data("name,notes\r\nAlice,\"hello,\nworld\"\r\nBob,\"said \"\"hi\"\"\"\n".utf8)
         let engine = FileBackedPieceTable(empty: .init())

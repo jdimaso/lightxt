@@ -1,0 +1,4 @@
+module CDuckDB {
+    header "duckdb.h"
+    export *
+}

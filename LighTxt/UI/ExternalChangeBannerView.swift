@@ -5,6 +5,7 @@ final class ExternalChangeBannerView: NSView {
     var onReload: (() -> Void)?
     var onKeep: (() -> Void)?
     var onSaveAs: (() -> Void)?
+    var onExportEdits: (() -> Void)?
 
     private let icon = NSImageView()
     private let message = NSTextField(wrappingLabelWithString: "")
@@ -30,6 +31,11 @@ final class ExternalChangeBannerView: NSView {
         action: #selector(saveAs(_:))
     )
 
+    private lazy var exportEditsButton = QuietButton(
+        title: "Export Local Edits…", symbolName: nil, minimumHeight: 26,
+        target: self, action: #selector(exportLocalEdits(_:))
+    )
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -48,7 +54,8 @@ final class ExternalChangeBannerView: NSView {
         message.lineBreakMode = .byTruncatingTail
         message.translatesAutoresizingMaskIntoConstraints = false
 
-        let actions = NSStackView(views: [reloadButton, keepButton, saveAsButton])
+        exportEditsButton.isHidden = true
+        let actions = NSStackView(views: [reloadButton, keepButton, saveAsButton, exportEditsButton])
         actions.orientation = .horizontal
         actions.spacing = 6
         actions.alignment = .centerY
@@ -88,12 +95,18 @@ final class ExternalChangeBannerView: NSView {
         case .removed:
             message.stringValue = "The file was removed or moved on disk."
         }
+        exportEditsButton.isHidden = onExportEdits == nil
+        if onExportEdits != nil {
+            message.stringValue = "The original bytes changed. Export your local edits to preserve them."
+            exportEditsButton.toolTip = "Save your edits with references to the original byte ranges."
+        }
         reloadButton.isEnabled = change.current != nil
         isHidden = false
     }
 
     @objc private func reload(_ sender: Any?) { onReload?() }
     @objc private func keep(_ sender: Any?) { onKeep?() }
+    @objc private func exportLocalEdits(_ sender: Any?) { onExportEdits?() }
     @objc private func saveAs(_ sender: Any?) { onSaveAs?() }
 
 #if LIGHTXT_RUNTIME_QA

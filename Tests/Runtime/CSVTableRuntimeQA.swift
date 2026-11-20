@@ -120,6 +120,8 @@ struct CSVTableRuntimeQA {
         fixtureView.layoutSubtreeIfNeeded()
         fixtureTable.headerView?.layoutSubtreeIfNeeded()
         try assertComfortScrollers(fixtureScrollView, label: "CSV table")
+        try checkCellAnalysis(in: outputDirectory)
+        fixtureWindow.makeKeyAndOrderFront(nil)
 
         try assertHeaderLayout(fixtureView, column: 0, label: "initial 1000pt fixture")
 
@@ -1739,6 +1741,122 @@ struct CSVTableRuntimeQA {
             throw QAError.failed("Could not encode CSV capture")
         }
         try png.write(to: url, options: .atomic)
+    }
+
+    private static func checkCellAnalysis(in directory: URL) throws {
+        let url = directory.appendingPathComponent("contributions.csv")
+        try """
+            Date,Employee,Employer,Total
+            7/10/2026,$468.62,$205.02,$673.64
+            6/30/2026,"$7,558.33","$2,588.50","$10,146.83"
+            7/15/2026,$0.00,$0.00,$0.00
+            7/25/2026,$9.25,$10.75,$20.00
+            """.write(to: url, atomically: true, encoding: .utf8)
+        let delegate = try QACSVDelegate(url: url)
+        let view = CSVTableView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 500))
+        let window = makeWindow(containing: view, appearance: .aqua)
+        window.makeKeyAndOrderFront(nil)
+        defer { view.deactivate(); window.close() }
+        view.editorDelegate = delegate
+        guard let table = descendant(of: view, as: NSTableView.self),
+              let bar = descendant(of: view, as: CSVAnalysisBar.self),
+              let pivot = descendants(of: bar, as: NSButton.self).first(where: { $0.title == "PivotViz…" }),
+              let content = window.contentView else { throw QAError.failed("CSV analysis controls unavailable") }
+        try wait(until: { table.numberOfRows == 4 && view.qaCachedValue(displayedRow: 0, column: 1) == "$468.62" },
+                 timeout: 5, failure: "Contribution header or first displayed currency row is incorrect")
+        window.layoutIfNeeded()
+
+        func gesture(row: Int, column: Int, to end: (row: Int, column: Int)? = nil,
+                     flags: NSEvent.ModifierFlags = [], clicks: Int = 1) throws {
+            func event(_ type: NSEvent.EventType, _ row: Int, _ column: Int) throws -> NSEvent {
+                let rect = table.frameOfCell(atColumn: column, row: row)
+                let location = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+                guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: flags,
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                    context: nil, eventNumber: 1, clickCount: clicks, pressure: 1)
+                else { throw QAError.failed("Could not create CSV selection event") }
+                return event
+            }
+            let down = try event(.leftMouseDown, row, column)
+            let location = content.superview?.convert(down.locationInWindow, from: nil) ?? down.locationInWindow
+            guard let target = content.hitTest(location), target === table || target.isDescendant(of: table)
+            else { throw QAError.failed("CSV cell or gutter did not hit its table") }
+            target.mouseDown(with: down)
+            let last = end ?? (row, column)
+            if end != nil { target.mouseDragged(with: try event(.leftMouseDragged, last.row, last.column)) }
+            target.mouseUp(with: try event(.leftMouseUp, last.row, last.column))
+        }
+
+        func expectStats(cells: Int, numbers: Int, sum: Double, median: Double? = nil) throws {
+            func format(_ value: Double) -> String { value.formatted(.number.precision(.significantDigits(1...10))) }
+            var expected = ["Cells \(cells)", "Numeric \(numbers)", "Sum \(format(sum))"]
+            if let median { expected.append("Median \(format(median))") }
+            try wait(until: {
+                descendants(of: bar, as: NSTextField.self).contains { field in
+                    let parts = field.stringValue.components(separatedBy: "·").map { $0.trimmingCharacters(in: .whitespaces) }
+                    return expected.allSatisfy(parts.contains)
+                }
+            }, timeout: 5, failure: "Missing contribution statistics \(expected)")
+        }
+
+        func background(row: Int, column: Int) throws -> NSColor {
+            let frame = table.frameOfCell(atColumn: column, row: row)
+            let sample = NSRect(x: frame.maxX - 12, y: frame.midY - 2, width: 4, height: 4)
+            guard let bitmap = table.bitmapImageRepForCachingDisplay(in: sample)
+            else { throw QAError.failed("Could not capture a displayed CSV cell") }
+            table.cacheDisplay(in: sample, to: bitmap)
+            guard let color = bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.deviceRGB)
+            else { throw QAError.failed("Could not read CSV cell background") }
+            return color
+        }
+        func colorDistance(_ a: NSColor, _ b: NSColor) -> CGFloat {
+            max(abs(a.redComponent - b.redComponent), abs(a.greenComponent - b.greenComponent),
+                abs(a.blueComponent - b.blueComponent))
+        }
+        let dataBackground = try background(row: 0, column: 2)
+        let neighborBackground = try background(row: 0, column: 3)
+        try gesture(row: 0, column: 2)
+        try expectStats(cells: 1, numbers: 1, sum: 468.62)
+        guard try colorDistance(dataBackground, background(row: 0, column: 2)) > 0.04,
+              try colorDistance(neighborBackground, background(row: 0, column: 3)) < 0.02 else {
+            throw QAError.failed("A single data cell did not visibly highlight on its own")
+        }
+        guard table.selectedRowIndexes.isEmpty else { throw QAError.failed("A cell click also selected its row") }
+        try gesture(row: 0, column: 3, flags: .shift)
+        try expectStats(cells: 2, numbers: 2, sum: 673.64, median: 336.82)
+        try gesture(row: 0, column: 2, to: (1, 3))
+        try expectStats(cells: 4, numbers: 4, sum: 10_820.47, median: 1_528.56)
+
+        try gesture(row: 0, column: 0)
+        guard table.selectedRowIndexes == IndexSet(integer: 0) else { throw QAError.failed("Gutter click did not select row one") }
+        try expectStats(cells: 4, numbers: 3, sum: 1_347.28)
+        try gesture(row: 3, column: 0, flags: .command)
+        guard table.selectedRowIndexes == IndexSet([0, 3]) else { throw QAError.failed("Command-click lost disjoint rows") }
+        try expectStats(cells: 8, numbers: 6, sum: 1_387.28)
+        try gesture(row: 3, column: 0, flags: .command)
+        guard table.selectedRowIndexes == IndexSet(integer: 0) else { throw QAError.failed("Command-click did not toggle a row off") }
+        try gesture(row: 1, column: 0)
+        try gesture(row: 3, column: 0, flags: .shift)
+        guard table.selectedRowIndexes == IndexSet(integersIn: 1..<4) else { throw QAError.failed("Shift-click did not extend gutter rows") }
+        try gesture(row: 2, column: 0, to: (0, 0))
+        guard table.selectedRowIndexes == IndexSet(integersIn: 0..<3) else { throw QAError.failed("Reverse gutter drag lost rows") }
+        try gesture(row: 0, column: 2)
+        guard table.selectedRowIndexes.isEmpty else { throw QAError.failed("Data click retained previous whole rows") }
+        table.selectAll(nil)
+        try expectStats(cells: 16, numbers: 12, sum: 21_680.94)
+
+        try gesture(row: 0, column: 2, clicks: 2)
+        guard let editor = window.firstResponder as? NSTextView, editor.isFieldEditor, editor.string == "$468.62"
+        else { throw QAError.failed("Double-click did not edit the selected currency cell") }
+        editor.selectAll(nil)
+        editor.insertText("$500.00", replacementRange: editor.selectedRange())
+        guard view.commitPendingEdit(), try delegate.engine.snapshot().utf8String(in: 0..<delegate.editorDocumentByteCount).contains("$500.00,$205.02")
+        else { throw QAError.failed("Currency text entered in the field editor did not commit to the CSV") }
+
+        pivot.performClick(nil)
+        guard let sideWindow = NSApp.windows.first(where: { $0 !== window && $0.title.hasPrefix("PivotViz") && $0.isVisible })
+        else { throw QAError.failed("PivotViz did not open a separate window from the CSV") }
+        sideWindow.close()
     }
 
     private static func descendant<T: NSView>(of root: NSView, as type: T.Type) -> T? {

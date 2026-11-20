@@ -88,6 +88,7 @@ struct MarkdownRendererRuntimeQA {
         )
         let source = try String(contentsOf: fixtureURL, encoding: .utf8)
 
+        try assertLineBoundaries()
         let light = NSAppearance(named: .aqua)!
         let dark = NSAppearance(named: .darkAqua)!
         let lightResult = MarkdownNativeRenderer.render(
@@ -134,6 +135,31 @@ struct MarkdownRendererRuntimeQA {
                 + "apply \(String(format: "%.3f", asyncSample.apply)) ms, stale publication rejected; "
                 + "light/dark captures rendered, \(pdfSummary), \(partialTableSummary)\(scrollingSummary)"
         )
+    }
+
+    private static func assertLineBoundaries() throws {
+        for separator in ["\n", "\r\n", "\r"] {
+            let lines = ["# Title", "- One", "- Two", ""]
+            let document = try MarkdownSemanticPreparer.prepare(lines.joined(separator: separator))
+            let offsets = [0, 7 + separator.utf8.count, 12 + 2 * separator.utf8.count, 17 + 3 * separator.utf8.count]
+            guard document.blocks.count == 4,
+                  case .heading = document.blocks[0], case .list = document.blocks[1],
+                  case .list = document.blocks[2], document.sourceLineByteOffsets == offsets else {
+                throw QAError.failed("Markdown lost a block or byte offset for newline bytes \(Array(separator.utf8))")
+            }
+        }
+
+        let text = String(repeating: "a🚀e\u{301}", count: 150_000)
+        let bytes = Data((text + "\r\nnext").utf8)
+        var reader = BoundedUTF8LineReader(maximumFragmentBytes: 256 * 1_024)
+        var lines = [""]
+        let emit: (BoundedUTF8LineReader.Fragment) -> Void = { fragment in
+            lines[lines.count - 1] += fragment.text
+            if fragment.endsLine { lines.append("") }
+        }
+        try bytes.withUnsafeBytes { try reader.consume($0, emit: emit) }
+        try reader.finish(emit: emit)
+        guard lines == [text, "next", ""] else { throw QAError.failed("PDF reader lost text across fragment boundaries") }
     }
 
     private static func assertPDFExport(

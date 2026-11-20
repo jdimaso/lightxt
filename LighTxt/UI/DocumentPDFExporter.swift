@@ -425,7 +425,7 @@ private nonisolated struct MarkdownFence {
     }
 }
 
-private nonisolated struct BoundedUTF8LineReader {
+nonisolated struct BoundedUTF8LineReader {
     struct Fragment {
         let text: String
         let endsLine: Bool
@@ -521,7 +521,7 @@ private nonisolated struct BoundedUTF8LineReader {
 
     private func utf8AlignedPrefixLength() -> Int {
         var end = min(maximumFragmentBytes, buffer.count)
-        while end > 0, end < buffer.count, buffer[end] & 0xC0 == 0x80 {
+        while end > 0, end < buffer.count, buffer[buffer.startIndex + end] & 0xC0 == 0x80 {
             end -= 1
         }
         let scalarAlignedEnd = max(1, end)

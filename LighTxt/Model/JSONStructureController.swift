@@ -203,6 +203,10 @@ final class JSONStructureController {
         generation &+= 1
         buildCancellation?.cancel()
         buildCancellation = nil
+        cancelPageRequests()
+    }
+
+    func cancelPageRequests() {
         for token in pageCancellations.values { token.cancel() }
         pageCancellations.removeAll(keepingCapacity: true)
     }

@@ -121,7 +121,28 @@ nonisolated final class MemoryMappedFile: @unchecked Sendable {
         return try bytes.withUnsafeBytes(body)
     }
 
-    private func validateDescriptorFingerprint() throws {
+    func cloneForRecovery(to destination: URL) throws -> MemoryMappedFile? {
+        try validateDescriptorFingerprint()
+        guard fclonefileat(descriptor, AT_FDCWD, destination.path, 0) == 0 else {
+            switch errno {
+            case EXDEV, ENOTSUP, EINVAL, ENOSYS: return nil
+            default: throw LighTxtCoreError.io(operation: "clone recovery checkpoint", path: destination.path, code: errno)
+            }
+        }
+        do {
+            try validateDescriptorFingerprint()
+            let clone = try MemoryMappedFile(url: destination)
+            guard fsync(clone.descriptor) == 0 else {
+                throw LighTxtCoreError.io(operation: "synchronize recovery checkpoint", path: destination.path, code: errno)
+            }
+            return clone
+        } catch {
+            unlink(destination.path)
+            throw error
+        }
+    }
+
+    func validateDescriptorFingerprint() throws {
         var status = stat()
         guard fstat(descriptor, &status) == 0 else {
             throw LighTxtCoreError.io(
@@ -144,7 +165,7 @@ nonisolated struct FileFingerprint: Equatable, Sendable {
     let modifiedNanoseconds: Int64
 
     init(_ status: stat) {
-        device = UInt64(status.st_dev)
+        device = UInt64(bitPattern: Int64(status.st_dev))
         inode = UInt64(status.st_ino)
         byteCount = Int64(status.st_size)
         modifiedSeconds = Int64(status.st_mtimespec.tv_sec)

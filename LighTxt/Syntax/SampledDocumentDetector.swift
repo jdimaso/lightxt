@@ -270,6 +270,14 @@ public enum SampledDocumentDetector {
             )
         }
 
+        let hint = extensionHint(fileName)
+        if hint == .jsonLines {
+            return Classification(format: .jsonLines, confidence: .low, dialect: nil)
+        }
+        if hint == nil, looksLikeJSONLines(trimmed) {
+            return Classification(format: .jsonLines, confidence: .high, dialect: nil)
+        }
+
         if looksLikeXML(trimmed) {
             return Classification(format: .xml, confidence: .high, dialect: nil)
         }
@@ -338,6 +346,19 @@ public enum SampledDocumentDetector {
         guard text[next].isLetter || text[next] == "_" else { return false }
         guard let close = text.firstIndex(of: ">") else { return false }
         return text.distance(from: text.startIndex, to: close) <= 256
+    }
+
+    /// Two complete object/array records distinguish an extensionless JSONL
+    /// sample from pretty-printed JSON and ordinary lists of scalar text.
+    private static func looksLikeJSONLines(_ text: String) -> Bool {
+        guard text.first == "{" || text.first == "[" else { return false }
+        let lines = text.split(maxSplits: 2, omittingEmptySubsequences: false) { $0 == "\n" || $0 == "\r\n" }
+        guard lines.count >= 2 else { return false }
+        return lines.prefix(2).allSatisfy { line in
+            let content = line.drop(while: { $0 == " " || $0 == "\t" })
+            guard content.first == "{" || content.first == "[" else { return false }
+            return (try? JSONSerialization.jsonObject(with: Data(content.utf8))) != nil
+        }
     }
 
     private static func jsonConfidence(_ text: String) -> SampleDetectionConfidence? {
@@ -673,7 +694,7 @@ public enum SampledDocumentDetector {
     private static func fieldShape(_ raw: String) -> FieldShape {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if value.isEmpty { return .empty }
-        if Double(value) != nil { return .number }
+        if CSVNumericValue.parse(value) != nil { return .number }
         switch value.lowercased() {
         case "true", "false", "yes", "no": return .boolean
         default: return .text
@@ -712,6 +733,7 @@ public enum SampledDocumentDetector {
         return switch ext {
         case "txt", "text", "log", "script": .plainText
         case "json": .json
+        case "jsonl", "ndjson": .jsonLines
         case "md", "markdown": .markdown
         case "sql": .sql
         case "xml": .xml

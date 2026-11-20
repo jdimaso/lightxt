@@ -333,6 +333,10 @@ bool scanValidatedNumber(
     return true;
 }
 
+uint64_t jsonContentStart(const uint8_t *source, uint64_t length) {
+    return length >= 3 && source[0] == 0xEF && source[1] == 0xBB && source[2] == 0xBF ? 3 : 0;
+}
+
 bool buildSIMDValidatedRecords(
     const uint8_t *source,
     uint64_t length,
@@ -344,7 +348,7 @@ bool buildSIMDValidatedRecords(
 ) {
     std::vector<Frame> stack;
     stack.reserve(128);
-    uint64_t cursor = 0;
+    uint64_t cursor = jsonContentStart(source, length);
     uint64_t containerCount = 0;
     uint64_t valueCount = 0;
     uint64_t rootChildCount = 0;
@@ -493,7 +497,7 @@ bool buildStrictRecords(
 ) {
     std::vector<Frame> stack;
     stack.reserve(128);
-    uint64_t cursor = 0;
+    uint64_t cursor = jsonContentStart(source, length);
     uint64_t containerCount = 0;
     uint64_t valueCount = 0;
     uint64_t rootChildCount = 0;
@@ -1118,10 +1122,11 @@ static LighTxtJSONAcceleratorResult buildJSONContainerIndex(
                 );
                 simdjson::ondemand::document document;
                 if (!validationError) {
+                    const auto start = jsonContentStart(source, sourceLength);
                     validationError = parser.iterate(
-                        source,
-                        size_t(sourceLength),
-                        size_t(sourceCapacity)
+                        source + start,
+                        size_t(sourceLength - start),
+                        size_t(sourceCapacity - start)
                     ).get(document);
                 }
                 if (!validationError) {

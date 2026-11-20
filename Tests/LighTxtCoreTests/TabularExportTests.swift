@@ -4,6 +4,18 @@ import Testing
 
 @Suite("Tabular export")
 struct TabularExportTests {
+    @Test("Duplicate JSON keys keep both values and preserve existing suffixed names")
+    func duplicateJSONKeys() throws {
+        let url = temporaryURL(extension: "jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let sink = try TabularExportSink(targetURL: url, format: .jsonLines,
+                                        headers: ["id", "id", "id_2"], expectedDestination: nil)
+        try sink.append(row: ["first", "second", "third"])
+        try sink.finish()
+        let values = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: String])
+        #expect(values == ["id": "first", "id_3": "second", "id_2": "third"])
+    }
+
     @Test("Parquet uses its dedicated atomic writer")
     func parquetRequiresDedicatedWriter() throws {
         let url = temporaryURL(extension: "parquet")

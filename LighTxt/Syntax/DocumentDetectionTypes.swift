@@ -136,6 +136,7 @@ public enum DocumentOpenAsFormat: Equatable, Sendable {
     case automatic
     case plainText
     case json
+    case jsonLines
     case markdown
     case sql
     case xml
@@ -149,6 +150,7 @@ public enum DocumentOpenAsFormat: Equatable, Sendable {
         case .automatic: nil
         case .plainText: .plainText
         case .json: .json
+        case .jsonLines: .jsonLines
         case .markdown: .markdown
         case .sql: .sql
         case .xml: .xml
@@ -161,6 +163,7 @@ public enum DocumentOpenAsFormat: Equatable, Sendable {
         switch self {
         case .automatic, .plainText: Self.defaultUntitledPathExtension
         case .json: "json"
+        case .jsonLines: "jsonl"
         case .markdown: "md"
         case .sql: "sql"
         case .xml: "xml"
@@ -172,6 +175,8 @@ public enum DocumentOpenAsFormat: Equatable, Sendable {
 
 public enum DocumentEncodingSelection: Equatable, Sendable {
     case automatic
+    /// A saved UTF-8 document reopens directly at its destination with strict validation.
+    case fileBackedUTF8
     case explicit(DocumentTextEncoding)
 }
 

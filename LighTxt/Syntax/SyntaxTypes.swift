@@ -4,6 +4,7 @@ import Foundation
 public enum SyntaxFileType: String, CaseIterable, Sendable {
     case plainText = "txt"
     case json
+    case jsonLines = "jsonl"
     case markdown = "md"
     case sql
     case xml
@@ -11,12 +12,15 @@ public enum SyntaxFileType: String, CaseIterable, Sendable {
     case yaml
     case parquet
 
+    public var hasJSONTree: Bool { self == .json || self == .jsonLines }
+
     public var preferredPathExtension: String { rawValue }
 
     public var pathExtensions: Set<String> {
         switch self {
         case .plainText: ["txt", "text", "log", "script"]
         case .json: ["json"]
+        case .jsonLines: ["jsonl", "ndjson"]
         case .markdown: ["md", "markdown"]
         case .sql: ["sql"]
         case .xml: ["xml"]

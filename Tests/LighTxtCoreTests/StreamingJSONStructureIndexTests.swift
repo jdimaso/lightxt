@@ -19,6 +19,91 @@ final class StreamingJSONStructureIndexTests: XCTestCase {
         if let temporaryDirectory { try? FileManager.default.removeItem(at: temporaryDirectory) }
     }
 
+    func testBOMPreservesAbsoluteRootAndChildRangesAcrossParsers() throws {
+        let data = Data([0xEF, 0xBB, 0xBF]) + Data(#"{"x":1}"#.utf8)
+        for maximumResidentBytes: Int64? in [nil, 0] {
+            var configuration = JSONStructureIndexConfiguration.default
+            configuration.maximumResidentSourceByteCount = maximumResidentBytes
+            let index = try makeIndex(data, configuration: configuration)
+            XCTAssertEqual(index.diagnosticCount, 0)
+            let root = try XCTUnwrap(index.children(of: index.documentRoot).nodes.first)
+            XCTAssertEqual(root.kind, .object)
+            XCTAssertEqual(root.byteRange, 3..<10)
+            XCTAssertEqual(try index.children(of: root).nodes.first?.byteRange, 8..<9)
+        }
+        XCTAssertEqual(forcedNative64Result(data).result.status, UInt32(LighTxtJSONAcceleratorSuccess))
+        XCTAssertEqual(forcedNative64Result(data).records.first?.start, 3)
+    }
+
+    func testJSONLinesKeepsDamagedRecordsIndependentAndJumpsWithoutReadingEarlierPages() throws {
+        var configuration = JSONStructureIndexConfiguration.default
+        configuration.isJSONLines = true
+        configuration.maximumStoredDiagnosticCount = 0
+        let body = "{\"x\":1}\r\n[0,\n\ntrue false\n  \"🚀\"  \n42\n[true,null]\n"
+        let bytes = Data([0xEF, 0xBB, 0xBF]) + Data(body.utf8)
+        let index = try makeIndex(bytes, configuration: configuration)
+        XCTAssertEqual(index.documentRoot.childCount, 7)
+        XCTAssertTrue(index.containsErrors)
+        let first = try index.children(of: index.documentRoot, limit: 3)
+        XCTAssertEqual(first.nodes.map(\.kind), [.object, .invalid, .invalid])
+        XCTAssertEqual(first.nodes[0].byteRange, 3..<10)
+        XCTAssertEqual(first.nodes[1].recordIssue, .unexpectedEndOfFile)
+        XCTAssertEqual(first.nodes[2].recordIssue, .expectedValue)
+        let second = try index.children(of: index.documentRoot, cursor: first.nextCursor, limit: 2)
+        XCTAssertEqual(second.nodes.map(\.kind), [.invalid, .string])
+        XCTAssertEqual(second.nodes[0].recordIssue, .trailingContent)
+        XCTAssertEqual(try index.preview(for: second.nodes[1]).value, "🚀")
+        let cursor = try XCTUnwrap(index.recordCursor(forOneBasedRecord: 7))
+        let last = try index.children(of: index.documentRoot, cursor: cursor)
+        XCTAssertEqual(last.firstChildOrdinal, 6)
+        XCTAssertNil(last.nextCursor)
+        XCTAssertEqual(try index.children(of: XCTUnwrap(last.nodes.first)).nodes.map(\.kind), [.boolean, .null])
+        XCTAssertNil(index.recordCursor(forOneBasedRecord: 0))
+        XCTAssertNil(index.recordCursor(forOneBasedRecord: 8))
+        XCTAssertEqual(try makeIndex("", configuration: configuration).documentRoot.childCount, 0)
+        XCTAssertEqual(try makeIndex("null", configuration: configuration).documentRoot.childCount, 1)
+    }
+
+    func testJSONLinesRecordPagesCrossIndexFlushAndInputChunkBoundaries() throws {
+        var configuration = JSONStructureIndexConfiguration.default
+        configuration.isJSONLines = true
+        let giant = String(repeating: "é", count: 600_000)
+        let index = try makeIndex(String(repeating: "0\n", count: 4_095) + "\"\(giant)\"\n{}\n", configuration: configuration)
+        XCTAssertEqual(index.documentRoot.childCount, 4_097)
+        let cursor = try XCTUnwrap(index.recordCursor(forOneBasedRecord: 4_095))
+        let page = try index.children(of: index.documentRoot, cursor: cursor)
+        XCTAssertEqual(page.nodes.map(\.kind), [.number, .string, .object])
+        XCTAssertEqual(page.nodes[1].byteRange.count, giant.utf8.count + 2)
+        XCTAssertTrue(try index.preview(for: page.nodes[1], maximumByteCount: 16).valueWasTruncated)
+        XCTAssertNil(page.nextCursor)
+    }
+
+    func testTabularJSONLinesExportReopensWithExactRowValues() throws {
+        let url = temporaryDirectory.appendingPathComponent("export.jsonl")
+        let sink = try TabularExportSink(targetURL: url, format: .jsonLines,
+                                        headers: ["name"], expectedDestination: nil)
+        try sink.append(row: ["first\nline"])
+        try sink.append(row: ["second"])
+        try sink.finish()
+        let snapshot = try FileBackedPieceTable(opening: url).snapshot()
+        let sample = try snapshot.data(in: 0..<snapshot.byteCount)
+        let detection = SampledDocumentDetector.detect(sample: sample, fileName: url.lastPathComponent)
+        XCTAssertEqual(detection.resolvedSyntaxFileType(forPathExtension: "jsonl"), .jsonLines)
+        XCTAssertEqual(SampledDocumentDetector.detect(sample: sample).format, .jsonLines)
+        XCTAssertEqual(SampledDocumentDetector.detect(sample: Data("{\n  \"id\": 2\n}".utf8)).format, .json)
+        XCTAssertEqual(SyntaxFileTypeDetector.detect(fileName: "export.ndjson"), .jsonLines)
+        var configuration = JSONStructureIndexConfiguration.default
+        configuration.isJSONLines = true
+        let index = try StreamingJSONStructureIndexer.build(snapshot: snapshot, generation: 1, configuration: configuration)
+        XCTAssertEqual(index.diagnosticCount, 0)
+        let objects = try index.children(of: index.documentRoot).nodes
+        XCTAssertEqual(objects.count, 2)
+        let values = try objects.map { try index.preview(for: XCTUnwrap(index.children(of: $0).nodes.first)).value }
+        XCTAssertEqual(values, ["first\nline", "second"])
+        XCTAssertTrue(SyntaxDiagnostics.inspect(sample, as: .jsonLines).isEmpty)
+        XCTAssertFalse(SyntaxDiagnostics.inspect(sample, as: .json).isEmpty)
+    }
+
     func testFullScanAndLazyPagesIncludePrimitiveChildren() throws {
         let source = #"{"na\u006de":"x","items":[1,true,null,{"z":"v"}],"empty":[]}"#
         let index = try makeIndex(source)

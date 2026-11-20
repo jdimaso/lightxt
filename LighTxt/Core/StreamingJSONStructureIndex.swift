@@ -45,6 +45,7 @@ public nonisolated struct JSONStructureNode: Sendable, Equatable {
     public let childCount: Int64?
     public let isComplete: Bool
     public let containsErrors: Bool
+    public fileprivate(set) var recordIssue: JSONStructureDiagnosticKind? = nil
 
     fileprivate let indexIdentifier: UUID
 }
@@ -195,6 +196,8 @@ public nonisolated struct JSONStructureIndexConfiguration: Sendable, Equatable {
     /// always falls back to the Swift diagnostics parser.
     public var allowsAcceleratedValidJSON: Bool
     public var maximumAcceleratedNestingDepth: Int
+    /// Treat every LF-delimited physical record as an independent JSON document.
+    public var isJSONLines = false
 
     public init(
         progressIntervalByteCount: Int64 = 8 << 20,
@@ -280,6 +283,50 @@ private nonisolated struct JSONDiagnosticRecord {
     var reserved: Int64 = 0
 
     static let byteCount = 32
+}
+
+/// Fixed-size, sequentially buffered descriptors let the outline jump directly
+/// to any record without allocating an in-memory row array or rescanning earlier lines.
+private nonisolated struct JSONLineRecord {
+    var start: Int64
+    var end: Int64
+    var containerOrdinal: Int64 = -1
+    var kind: Int32 = Int32(JSONStructureNodeKind.invalid.rawValue)
+    var issue: Int32 = 0
+}
+
+private nonisolated final class JSONLineRecords: @unchecked Sendable {
+    private let file: JSONTemporaryRecordFile
+    private var pending: [JSONLineRecord] = []
+    private(set) var count: Int64 = 0
+
+    init() throws {
+        file = try JSONTemporaryRecordFile(prefix: "LighTxt-json-lines", recordByteCount: MemoryLayout<JSONLineRecord>.stride)
+    }
+
+    func append(_ record: JSONLineRecord) throws {
+        pending.append(record)
+        count += 1
+        if pending.count == 4_096 { try flush() }
+    }
+
+    func flush() throws {
+        guard !pending.isEmpty else { return }
+        let start = (count - Int64(pending.count)) * Int64(MemoryLayout<JSONLineRecord>.stride)
+        try pending.withUnsafeBytes { try file.writePage(Data($0), atByteOffset: start) }
+        pending.removeAll(keepingCapacity: true)
+    }
+
+    func read(in range: Range<Int64>) throws -> [JSONLineRecord] {
+        guard range.lowerBound >= 0, range.upperBound <= count else { throw JSONStructureIndexError.corruptIndex }
+        var records = Array(repeating: JSONLineRecord(start: 0, end: 0), count: range.count)
+        try records.withUnsafeMutableBytes { bytes in
+            try file.readBytes(bytes, atByteOffset: range.lowerBound * Int64(MemoryLayout<JSONLineRecord>.stride))
+        }
+        return records
+    }
+
+    func close() { file.close() }
 }
 
 /// A RAM-first container store with a deterministic disk overflow path.
@@ -635,7 +682,7 @@ private nonisolated final class JSONTemporaryRecordFile: @unchecked Sendable {
         }
     }
 
-    private func readBytes(_ bytes: UnsafeMutableRawBufferPointer, atByteOffset offset: Int64) throws {
+    fileprivate func readBytes(_ bytes: UnsafeMutableRawBufferPointer, atByteOffset offset: Int64) throws {
         lock.lock()
         defer { lock.unlock() }
         guard descriptor >= 0 else { throw JSONStructureIndexError.closed }
@@ -890,12 +937,15 @@ public nonisolated final class JSONStructureIndex: @unchecked Sendable {
         let source: any JSONStructureSource
         let containers: JSONContainerRecordStore
         let diagnostics: JSONTemporaryRecordFile
+        let lines: JSONLineRecords?
     }
 
     private let stateLock = NSLock()
     private var openState: OpenState?
     private let identifier = UUID()
     private let configuration: JSONStructureIndexConfiguration
+    private let contentStart: Int64
+    public var isJSONLines: Bool { configuration.isJSONLines }
 
     public let sourceRevision: UInt64
     public let sourceByteCount: Int64
@@ -931,6 +981,8 @@ public nonisolated final class JSONStructureIndex: @unchecked Sendable {
         source: any JSONStructureSource,
         containers: JSONContainerRecordStore,
         diagnostics: JSONTemporaryRecordFile,
+        lines: JSONLineRecords?,
+        contentStart: Int64,
         configuration: JSONStructureIndexConfiguration,
         generation: UInt64,
         parserSeconds: Double,
@@ -950,8 +1002,10 @@ public nonisolated final class JSONStructureIndex: @unchecked Sendable {
         self.openState = OpenState(
             source: source,
             containers: containers,
-            diagnostics: diagnostics
+            diagnostics: diagnostics,
+            lines: lines
         )
+        self.contentStart = contentStart
         self.configuration = configuration
         self.sourceRevision = source.revision
         self.sourceByteCount = source.byteCount
@@ -969,10 +1023,14 @@ public nonisolated final class JSONStructureIndex: @unchecked Sendable {
         let (diagnosticBytes, diagnosticOverflow) = storedDiagnosticCount.multipliedReportingOverflow(
             by: Int64(JSONDiagnosticRecord.byteCount)
         )
+        let (lineBytes, lineOverflow) = (lines?.count ?? 0).multipliedReportingOverflow(
+            by: Int64(MemoryLayout<JSONLineRecord>.stride)
+        )
         let (combinedBytes, additionOverflow) = containerBytes.addingReportingOverflow(diagnosticBytes)
-        self.temporaryIndexByteCount = containerOverflow || diagnosticOverflow || additionOverflow
+        let (totalBytes, totalOverflow) = combinedBytes.addingReportingOverflow(lineBytes)
+        self.temporaryIndexByteCount = containerOverflow || diagnosticOverflow || lineOverflow || additionOverflow || totalOverflow
             ? Int64.max
-            : combinedBytes
+            : totalBytes
         self.parsedValueCount = parsedValueCount
         self.diagnosticCount = diagnosticCount
         self.storedDiagnosticCount = storedDiagnosticCount
@@ -1032,6 +1090,7 @@ public nonisolated final class JSONStructureIndex: @unchecked Sendable {
         stateLock.unlock()
         closing?.containers.close()
         closing?.diagnostics.close()
+        closing?.lines?.close()
     }
 
     public func isCurrent(revision: UInt64, generation: UInt64) -> Bool {
@@ -1056,17 +1115,59 @@ public nonisolated final class JSONStructureIndex: @unchecked Sendable {
         }
         let state = try capturedOpenState()
         let limit = min(configuration.maximumChildrenPerPage, max(1, requestedLimit))
+        if parent.kind == .document, let lines = state.lines {
+            let first = cursor?.nextChildOrdinal ?? 0
+            let end = min(lines.count, first + Int64(limit))
+            if cancellation?.isCancelled == true { throw CancellationError() }
+            let nodes = try lines.read(in: first..<end).map { line in
+                if cancellation?.isCancelled == true { throw CancellationError() }
+                let issue = JSONStructureDiagnosticKind(rawValue: UInt8(line.issue))
+                let kind = JSONStructureNodeKind(rawValue: UInt8(line.kind)) ?? .invalid
+                let container = line.containerOrdinal >= 0 && issue == nil
+                    ? try state.containers.read(at: line.containerOrdinal) : nil
+                var node = JSONStructureNode(
+                    id: JSONStructureNodeID(byteOffset: line.start),
+                    kind: issue == nil ? kind : .invalid,
+                    byteRange: line.start..<line.end,
+                    keyByteRange: nil,
+                    depth: 0,
+                    childCount: container?.childCount ?? 0,
+                    isComplete: issue == nil,
+                    containsErrors: issue != nil,
+                    indexIdentifier: identifier
+                )
+                node.recordIssue = issue
+                return node
+            }
+            return JSONStructureChildrenPage(
+                nodes: nodes,
+                firstChildOrdinal: first,
+                nextCursor: end < lines.count ? recordCursor(forOneBasedRecord: end + 1) : nil
+            )
+        }
         var scanner = JSONLazyChildrenScanner(
             source: state.source,
             containers: state.containers,
             containerCount: indexedContainerCount,
             indexIdentifier: identifier,
             parent: parent,
+            contentStart: contentStart,
             cursor: cursor,
             readByteCount: configuration.lazyReadByteCount,
             cancellation: cancellation
         )
         return try scanner.page(limit: limit)
+    }
+
+    /// O(1) continuation for explicit record navigation in JSON Lines.
+    public func recordCursor(forOneBasedRecord number: Int64) -> JSONStructureChildrenCursor? {
+        guard isJSONLines, number > 0, number <= (documentRoot.childCount ?? 0) else { return nil }
+        return JSONStructureChildrenCursor(
+            indexIdentifier: identifier,
+            parentID: documentRoot.id,
+            nextByteOffset: 0,
+            nextChildOrdinal: number - 1
+        )
     }
 
     /// Finds the deepest indexed JSON container which encloses `byteRange`,
@@ -1560,7 +1661,7 @@ public nonisolated enum StreamingJSONStructureIndexer {
         let maximumSourceBytes = configuration.maximumResidentSourceByteCount
             ?? automaticLimit
         let source: any JSONStructureSource
-        if let resident = try JSONOwnedMemorySource(
+        if !configuration.isJSONLines, let resident = try JSONOwnedMemorySource(
             snapshot: snapshot,
             maximumEligibleByteCount: maximumSourceBytes,
             cancellation: cancellation
@@ -1592,6 +1693,11 @@ public nonisolated enum StreamingJSONStructureIndexer {
         cancellation: CancellationToken? = nil,
         progress: ((JSONStructureIndexProgress) -> Void)? = nil
     ) throws -> JSONStructureIndex {
+        let contentStart: Int64
+        if source.byteCount >= 3, try source.data(in: 0..<3).starts(with: [0xEF, 0xBB, 0xBF]) {
+            contentStart = 3
+        } else { contentStart = 0 }
+        let lines = configuration.isJSONLines ? try JSONLineRecords() : nil
         let containerDisk = try JSONTemporaryRecordFile(
             prefix: "LighTxt-json-containers",
             recordByteCount: JSONContainerRecord.byteCount
@@ -1631,11 +1737,14 @@ public nonisolated enum StreamingJSONStructureIndexer {
                     containers: containers,
                     diagnostics: diagnostics,
                     stack: stack,
+                    lines: lines,
+                    contentStart: contentStart,
                     configuration: configuration,
                     cancellation: cancellation,
                     progress: progress
                 )
                 outcome = try parser.run()
+                try lines?.flush()
                 try containers.finish()
                 usedAcceleratedParser = false
             }
@@ -1644,6 +1753,8 @@ public nonisolated enum StreamingJSONStructureIndexer {
                 source: source,
                 containers: containers,
                 diagnostics: diagnostics,
+                lines: lines,
+                contentStart: contentStart,
                 configuration: configuration,
                 generation: generation,
                 parserSeconds: parserSeconds,
@@ -2053,6 +2164,10 @@ private nonisolated struct JSONStreamingStructureParser {
     let progress: ((JSONStructureIndexProgress) -> Void)?
 
     private var stack: JSONParserFrameStack
+    private let lines: JSONLineRecords?
+    private let contentStart: Int64
+    private var physicalLineStart: Int64 = 0
+    private var lineRoot = JSONLineRecord(start: 0, end: 0)
     private var current = JSONParserFrame.document()
     private var lexMode = JSONLexMode.normal
     private var offset: Int64 = 0
@@ -2068,6 +2183,8 @@ private nonisolated struct JSONStreamingStructureParser {
         containers: JSONContainerRecordStore,
         diagnostics: JSONTemporaryRecordFile,
         stack: JSONTemporaryRecordFile,
+        lines: JSONLineRecords?,
+        contentStart: Int64,
         configuration: JSONStructureIndexConfiguration,
         cancellation: CancellationToken?,
         progress: ((JSONStructureIndexProgress) -> Void)?
@@ -2076,6 +2193,8 @@ private nonisolated struct JSONStreamingStructureParser {
         self.containers = containers
         self.diagnostics = diagnostics
         self.stack = JSONParserFrameStack(store: stack)
+        self.lines = lines
+        self.contentStart = contentStart
         self.configuration = configuration
         self.cancellation = cancellation
         self.progress = progress
@@ -2088,11 +2207,8 @@ private nonisolated struct JSONStreamingStructureParser {
         try input.forEachSegment { segment in
             try consume(segment)
         }
-        try finishLexemeAtEOF()
-        try finishOpenContainersAtEOF()
-        if current.state == .documentExpectValue, current.childCount == 0 {
-            try addDiagnostic(.expectedValue, range: source.byteCount..<source.byteCount)
-            current.containsErrors = true
+        if lines == nil || physicalLineStart < source.byteCount {
+            try finishRoot(at: source.byteCount)
         }
         offset = source.byteCount
         try checkCancellation()
@@ -2103,7 +2219,7 @@ private nonisolated struct JSONStreamingStructureParser {
             diagnosticCount: diagnosticCount,
             storedDiagnosticCount: storedDiagnosticCount,
             maximumDepth: maximumDepth,
-            rootChildCount: current.childCount,
+            rootChildCount: lines?.count ?? current.childCount,
             containsErrors: current.containsErrors || diagnosticCount > 0,
             nativeRecordBuildSeconds: 0,
             nativeValidationSeconds: 0,
@@ -2114,7 +2230,28 @@ private nonisolated struct JSONStreamingStructureParser {
     private mutating func consume(_ segment: JSONIndexInputSegment) throws {
         switch segment {
         case let .bytes(bytes):
-            try consumeBytes(bytes)
+            let skip = min(bytes.count, Int(max(0, contentStart - offset)))
+            offset += Int64(skip)
+            let content = UnsafeRawBufferPointer(rebasing: bytes[skip...])
+            if lines == nil {
+                try consumeBytes(content)
+            } else {
+                var start = 0
+                while start < content.count {
+                    let remaining = UnsafeRawBufferPointer(rebasing: content[start...])
+                    guard let newline = memchr(remaining.baseAddress!, 0x0A, remaining.count) else {
+                        try consumeBytes(remaining)
+                        break
+                    }
+                    let length = remaining.baseAddress!.distance(to: UnsafeRawPointer(newline))
+                    try consumeBytes(UnsafeRawBufferPointer(rebasing: remaining[..<length]))
+                    try finishRoot(at: offset)
+                    offset += 1
+                    physicalLineStart = offset
+                    start += length + 1
+                    try reportProgressIfNeeded()
+                }
+            }
         case let .repeatedASCII(byte, count):
             guard count >= 0, offset <= Int64.max - count else {
                 throw LighTxtCoreError.fileTooLarge(Int64.max)
@@ -2350,6 +2487,11 @@ private nonisolated struct JSONStreamingStructureParser {
         kind: JSONStructureNodeKind,
         range: Range<Int64>
     ) throws {
+        if lines != nil, current.kind == .document {
+            lineRoot.start = range.lowerBound
+            lineRoot.end = range.upperBound
+            lineRoot.kind = Int32(kind.rawValue)
+        }
         _ = try prepareParentForValue(at: range.lowerBound)
         valueCount += 1
         if kind == .invalid { current.containsErrors = true }
@@ -2493,6 +2635,12 @@ private nonisolated struct JSONStreamingStructureParser {
         record.setComplete(complete)
         record.setContainsErrors(current.containsErrors || !complete)
         try containers.write(&record, at: current.recordOrdinal)
+        if lines != nil, current.depth == 0 {
+            lineRoot.start = record.start
+            lineRoot.end = record.end
+            lineRoot.containerOrdinal = current.recordOrdinal
+            lineRoot.kind = Int32(record.kind.rawValue)
+        }
         let childHadErrors = record.containsErrors
         guard var parent = try stack.pop() else {
             throw JSONStructureIndexError.corruptIndex
@@ -2501,24 +2649,38 @@ private nonisolated struct JSONStreamingStructureParser {
         current = parent
     }
 
-    private mutating func finishLexemeAtEOF() throws {
+    private mutating func finishRoot(at end: Int64) throws {
+        try finishLexeme(at: end)
+        while current.kind != .document {
+            try addDiagnostic(.unexpectedEndOfFile, range: current.start..<end)
+            current.containsErrors = true
+            try finalizeCurrentContainer(end: end, complete: false)
+        }
+        if current.childCount == 0 {
+            try addDiagnostic(.expectedValue, range: end..<end)
+            current.containsErrors = true
+        }
+        if let lines {
+            if lineRoot.issue != 0 {
+                lineRoot.start = physicalLineStart
+                lineRoot.end = end
+            }
+            try lines.append(lineRoot)
+            lineRoot = JSONLineRecord(start: 0, end: 0)
+            current = .document()
+        }
+    }
+
+    private mutating func finishLexeme(at end: Int64) throws {
         switch lexMode {
         case .normal:
             break
         case let .bare(token):
-            try finishBare(token, end: source.byteCount)
+            try finishBare(token, end: end)
         case let .string(token):
-            try finishString(token, end: source.byteCount, complete: false)
+            try finishString(token, end: end, complete: false)
         }
         lexMode = .normal
-    }
-
-    private mutating func finishOpenContainersAtEOF() throws {
-        while current.kind != .document {
-            try addDiagnostic(.unexpectedEndOfFile, range: current.start..<source.byteCount)
-            current.containsErrors = true
-            try finalizeCurrentContainer(end: source.byteCount, complete: false)
-        }
     }
 
     private mutating func addDiagnostic(
@@ -2526,6 +2688,7 @@ private nonisolated struct JSONStreamingStructureParser {
         range: Range<Int64>
     ) throws {
         diagnosticCount += 1
+        if lines != nil, lineRoot.issue == 0 { lineRoot.issue = Int32(kind.rawValue) }
         guard storedDiagnosticCount < configuration.maximumStoredDiagnosticCount else { return }
         var record = JSONDiagnosticRecord(
             start: max(0, min(source.byteCount, range.lowerBound)),
@@ -2650,6 +2813,7 @@ private nonisolated struct JSONLazyChildrenScanner {
         containerCount: Int64,
         indexIdentifier: UUID,
         parent: JSONStructureNode,
+        contentStart: Int64,
         cursor: JSONStructureChildrenCursor?,
         readByteCount: Int,
         cancellation: CancellationToken?
@@ -2666,7 +2830,7 @@ private nonisolated struct JSONLazyChildrenScanner {
             self.childOrdinal = cursor.nextChildOrdinal
         } else {
             self.position = parent.kind == .document
-                ? parent.byteRange.lowerBound
+                ? contentStart
                 : min(parent.byteRange.upperBound, parent.byteRange.lowerBound + 1)
             self.childOrdinal = 0
         }

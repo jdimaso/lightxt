@@ -135,7 +135,7 @@ nonisolated final class TabularExportSink: @unchecked Sendable {
 
         self.target = target
         self.format = format
-        self.headers = headers
+        self.headers = format == .jsonLines ? headers.map(Self.uniqueJSONKeys) : headers
         self.expectedDestination = expectedDestination
         self.targetExisted = targetExisted
         self.staging = staging
@@ -165,6 +165,17 @@ nonisolated final class TabularExportSink: @unchecked Sendable {
             try appendDelimitedRow(row)
         }
         rowCount += 1
+    }
+
+    /// Writes a self-describing record through the same atomic JSON Lines
+    /// destination used for table exports.
+    func appendJSONRecord(_ record: [String: Any]) throws {
+        precondition(format == .jsonLines)
+        guard descriptor >= 0, !isFinished else {
+            throw LighTxtCoreError.io(operation: "append JSON record", path: target.path, code: EBADF)
+        }
+        try write(JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]))
+        try writeByte(0x0A)
     }
 
     func finish() throws {
@@ -233,6 +244,24 @@ nonisolated final class TabularExportSink: @unchecked Sendable {
         }
         if start < data.endIndex { try write(data.subdata(in: start..<data.endIndex)) }
         try writeByte(0x22)
+    }
+
+    private static func uniqueJSONKeys(_ headers: [String]) -> [String] {
+        let reserved = Set(headers)
+        var used: Set<String> = []
+        var nextSuffix: [String: Int] = [:]
+        return headers.map { name in
+            if used.insert(name).inserted { return name }
+            var suffix = nextSuffix[name, default: 2]
+            var candidate: String
+            repeat {
+                candidate = "\(name)_\(suffix)"
+                suffix += 1
+            } while reserved.contains(candidate) || used.contains(candidate)
+            nextSuffix[name] = suffix
+            used.insert(candidate)
+            return candidate
+        }
     }
 
     private func appendJSONLine(_ values: [String?]) throws {

@@ -28,7 +28,7 @@ public enum SyntaxFoldDiscovery {
     ) -> SyntaxFoldResult {
         var collector = FoldCollector(baseOffset: baseByteOffset, maximumCount: limits.maximumFoldRanges)
         switch fileType {
-        case .json:
+        case .json, .jsonLines:
             discoverJSON(bytes, limits: limits, collector: &collector)
         case .xml:
             discoverXML(bytes, limits: limits, collector: &collector)

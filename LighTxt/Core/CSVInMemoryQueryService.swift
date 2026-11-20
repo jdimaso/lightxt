@@ -213,6 +213,35 @@ public actor CSVInMemoryQueryService: TabularQueryService {
         }
     }
 
+    public func forEachExportRow(
+        query: ParquetTableQuery,
+        selectedRows: IndexSet?,
+        consume: @escaping @Sendable (Int64, [String?]) throws -> Void
+    ) async throws -> Int64 {
+        let metadata = try await open()
+        try validate(query: query, columns: metadata.allColumns)
+        let columns = try query.projectedColumns(in: metadata)
+        let projection = columns.map { "CAST(\(internalIdentifier(for: $0.index)) AS VARCHAR)" }.joined(separator: ", ")
+        var bindings: [DuckDBBinding] = []
+        let predicates = buildWhereClause(query.filters, columns: metadata.allColumns, bindings: &bindings)
+        let order = buildOrderClause(query.sort, columns: metadata.allColumns)
+        var sql = "SELECT \(projection) \(sourceClause(addingNumberFor: query.sort?.column)) \(predicates) \(order)"
+        if let selectedRows {
+            guard let first = selectedRows.first, let last = selectedRows.last else { return 0 }
+            sql += " LIMIT ? OFFSET ?"
+            bindings.append(.int64(Int64(last - first) + 1))
+            bindings.append(.int64(Int64(first)))
+        }
+        let statement = sql
+        let parameters = bindings
+        return try await performQuery(sql: statement) { runtime, connection, cancelled in
+            try runtime.streamRows(
+                connection: connection, sql: statement, bindings: parameters,
+                selectedRows: selectedRows, cancelled: cancelled, consume: consume
+            )
+        }
+    }
+
     public func page(
         offset: Int64,
         limit: Int,
@@ -222,6 +251,7 @@ public actor CSVInMemoryQueryService: TabularQueryService {
         guard offset >= 0, limit > 0, limit <= limits.maximumPageRows else {
             throw CSVInMemoryQueryError.invalidPage(offset: offset, limit: limit)
         }
+        let columns = try query.projectedColumns(in: metadata)
         try validate(query: query, columns: metadata.columns)
 
         let countKey = ParquetTableQuery(filters: query.filters)
@@ -241,7 +271,6 @@ public actor CSVInMemoryQueryService: TabularQueryService {
             )
         }
 
-        let columns = metadata.columns
         let boundedLimit = min(limit, limits.maximumPageRows)
         let cellBudgetDivisor = max(1, boundedLimit * max(1, columns.count))
         let cellCharacterLimit = min(
@@ -256,10 +285,10 @@ public actor CSVInMemoryQueryService: TabularQueryService {
         var bindings: [DuckDBBinding] = []
         let whereClause = buildWhereClause(
             query.filters,
-            columns: columns,
+            columns: metadata.columns,
             bindings: &bindings
         )
-        let orderClause = buildOrderClause(query.sort, columns: columns)
+        let orderClause = buildOrderClause(query.sort, columns: metadata.columns)
         let sql: String
         if query.filters.isEmpty && query.sort == nil {
             bindings.append(.int64(offset))
@@ -276,7 +305,7 @@ public actor CSVInMemoryQueryService: TabularQueryService {
             bindings.append(.int64(offset))
             sql = """
                 SELECT \(projection)
-                \(Self.sourceClause)
+                \(sourceClause(addingNumberFor: query.sort?.column))
                 \(whereClause)
                 \(orderClause)
                 LIMIT ? OFFSET ?
@@ -412,13 +441,18 @@ public actor CSVInMemoryQueryService: TabularQueryService {
             columns: metadata.columns,
             bindings: &bindings
         )
+        // Keep the original formatting of each numeric extreme. Equal numbers use the
+        // first source spelling, including when parallel DuckDB scans complete out of order.
+        let number = Self.numericColumn
+        let firstMin = "arg_min(\(text), row(\(number), rowid)) FILTER (WHERE \(number) IS NOT NULL)"
+        let firstMax = "arg_max(\(text), row(\(number), -rowid)) FILTER (WHERE \(number) IS NOT NULL)"
         let sql = """
             SELECT COUNT(*)::BIGINT AS row_count,
                    COUNT(*) FILTER (WHERE \(identifier) IS NULL)::BIGINT AS null_count,
                    COALESCE(approx_count_distinct(\(text)), 0)::BIGINT AS distinct_count,
-                   hex(encode(left(MIN(\(text)), \(limits.maximumCellCharacters)))) AS minimum,
-                   hex(encode(left(MAX(\(text)), \(limits.maximumCellCharacters)))) AS maximum
-            \(Self.sourceClause)
+                   hex(encode(left(COALESCE(\(firstMin), MIN(\(text))), \(limits.maximumCellCharacters)))) AS minimum,
+                   hex(encode(left(COALESCE(\(firstMax), MAX(\(text))), \(limits.maximumCellCharacters)))) AS maximum
+            \(sourceClause(addingNumberFor: columnIndex))
             \(whereClause)
             """
         let result = try await execute(sql: sql, bindings: bindings)
@@ -770,8 +804,46 @@ public actor CSVInMemoryQueryService: TabularQueryService {
             return "ORDER BY \(Self.rowIdentifier) ASC"
         }
         let direction = sort.order == .ascending ? "ASC" : "DESC"
-        return "ORDER BY \(internalIdentifier(for: sort.column)) \(direction) NULLS LAST, \(Self.rowIdentifier) ASC"
+        let text = internalIdentifier(for: sort.column)
+        let number = Self.numericColumn
+        // As in file-backed CSV, numbers precede text ascending and follow it descending.
+        // Empty cells stay at the end. Equal numeric values retain their original order.
+        return """
+            ORDER BY (\(text) IS NULL OR \(text) = '') ASC,
+                     (\(number) IS NULL) \(direction),
+                     \(number) \(direction) NULLS LAST,
+                     CASE WHEN \(number) IS NULL THEN \(text) END \(direction),
+                     \(Self.rowIdentifier) ASC
+            """
     }
+
+    private static let numericColumn = "__lightxt_numeric_value"
+
+    /// Add a numeric key only for the requested sort or summary. CSV columns remain
+    /// VARCHAR so the grid, filter picker and exports retain the exact input strings.
+    private func sourceClause(addingNumberFor column: Int?) -> String {
+        guard let column else { return Self.sourceClause }
+        let identifier = internalIdentifier(for: column)
+        let pattern = Self.duckDBStringLiteral(CSVNumericValue.formattedPattern)
+        let trimCharacters = Self.duckDBStringLiteral(Self.numericEdgeWhitespace)
+        // DuckDB permits a later expression in a projection to reference an earlier alias.
+        // The user-provided headers cannot collide with these internal column names.
+        return """
+            FROM (SELECT *, \(Self.rowIdentifier),
+                         trim(\(identifier), \(trimCharacters)) AS __lightxt_trimmed,
+                         CASE WHEN regexp_full_match(__lightxt_trimmed, \(pattern)) THEN
+                              TRY_CAST(translate(replace(__lightxt_trimmed, '(', '-'), '$,) ' || chr(9), '') AS DOUBLE)
+                         END AS __lightxt_parsed,
+                         CASE WHEN isfinite(__lightxt_parsed) THEN __lightxt_parsed END AS \(Self.numericColumn)
+                  \(Self.sourceClause)) AS __lightxt_numbered
+            """
+    }
+
+    // Foundation's whitespacesAndNewlines includes Unicode separators and U+200B.
+    // Keeping the characters in a DuckDB trim constant avoids two more regexes per row.
+    private static let numericEdgeWhitespace = " \t\n\r\u{000B}\u{000C}\u{0085}\u{00A0}\u{1680}"
+        + String(String.UnicodeScalarView((0x2000...0x200B).compactMap(UnicodeScalar.init)))
+        + "\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}"
 
     private func displayProjection(column: ParquetColumn, characterLimit: Int) -> String {
         let identifier = internalIdentifier(for: column.index)
@@ -802,6 +874,15 @@ public actor CSVInMemoryQueryService: TabularQueryService {
         bindings: [DuckDBBinding],
         validatesSource: Bool = false
     ) async throws -> DuckDBResult {
+        try await performQuery(sql: sql, validatesSource: validatesSource) { runtime, connection, _ in
+            try runtime.execute(connection: connection, sql: sql, bindings: bindings)
+        }
+    }
+
+    private func performQuery<T: Sendable>(
+        sql: String, validatesSource: Bool = false,
+        operation: @escaping @Sendable (DuckDBDynamicAPI, OpaquePointer, () -> Bool) throws -> T
+    ) async throws -> T {
         try ensureOpen()
         guard connectionStorage.connection != nil else { throw CSVInMemoryQueryError.closed }
         #if LIGHTXT_PACKAGE_TESTING
@@ -829,11 +910,7 @@ public actor CSVInMemoryQueryService: TabularQueryService {
                     if validatesSource, !pinnedSource.matchesOriginalRevision() {
                         throw CSVInMemoryQueryError.sourceChanged
                     }
-                    let result = try runtime.execute(
-                        connection: connection,
-                        sql: sql,
-                        bindings: bindings
-                    )
+                    let result = try operation(runtime, connection) { interruptHandle.isCancelled(requestID) }
                     if validatesSource, !pinnedSource.matchesOriginalRevision() {
                         throw CSVInMemoryQueryError.sourceChanged
                     }

@@ -32,6 +32,8 @@
 				<string>log</string>
 				<string>script</string>
 				<string>json</string>
+				<string>jsonl</string>
+				<string>ndjson</string>
 				<string>md</string>
 				<string>markdown</string>
 				<string>sql</string>
@@ -47,6 +49,7 @@
 				<string>public.plain-text</string>
 				<string>app.lightext.script</string>
 				<string>public.json</string>
+				<string>app.lightext.json-lines</string>
 				<string>net.daringfireball.markdown</string>
 				<string>public.sql</string>
 				<string>public.xml</string>
@@ -115,6 +118,24 @@
 	<true/>
 	<key>UTImportedTypeDeclarations</key>
 	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>app.lightext.json-lines</string>
+			<key>UTTypeDescription</key>
+			<string>JSON Lines document</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>jsonl</string>
+					<string>ndjson</string>
+				</array>
+			</dict>
+		</dict>
 		<dict>
 			<key>UTTypeConformsTo</key>
 			<array>

@@ -823,6 +823,10 @@ final class DocumentStatusBar: NSView {
         configureNavigation(unit: "line", current: currentLine, total: totalLines, enabled: enabled)
     }
 
+    func configureRecordNavigation(current: Int64, total: Int64?) {
+        configureNavigation(unit: "record", current: current, total: total, enabled: (total ?? 0) > 0)
+    }
+
     func configureRowNavigation(currentRow: Int64?, totalRows: Int64?, enabled: Bool) {
         configureNavigation(unit: "row", current: currentRow, total: totalRows, enabled: enabled)
     }

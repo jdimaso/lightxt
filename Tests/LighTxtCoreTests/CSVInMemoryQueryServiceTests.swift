@@ -19,6 +19,13 @@ final class CSVInMemoryQueryServiceTests: XCTestCase {
         defer { Task { await service.close() } }
         let page = try await service.page(offset: 0, limit: 2, query: .init())
         XCTAssertTrue(page.rows[0][1].isTruncated)
+        let streamed = try await service.forEachExportRow(
+            query: .init(sort: .init(column: 0, order: .descending), projectedColumnIndexes: [1, 0]),
+            selectedRows: nil
+        ) { number, values in
+            XCTAssertEqual(values, number == 1 ? [oversized, "2"] : [complete, "1"])
+        }
+        XCTAssertEqual(streamed, 2)
         let first = try await service.cellDetail(sourceRowOrdinal: 0, column: 1)
         XCTAssertEqual(first.value, complete)
         XCTAssertFalse(first.isTruncated)
@@ -100,8 +107,8 @@ final class CSVInMemoryQueryServiceTests: XCTestCase {
                 sort: .init(column: 1, order: .ascending)
             )
         )
-        XCTAssertEqual(sorted.rows.map { $0[0].value }, ["delta", "gamma", "Alpha", "Beta, Jr"])
-        XCTAssertEqual(sorted.sourceRowOrdinals, [3, 2, 0, 1], "Equal keys must keep source order")
+        XCTAssertEqual(sorted.rows.map { $0[0].value }, ["gamma", "Alpha", "Beta, Jr", "delta"])
+        XCTAssertEqual(sorted.sourceRowOrdinals, [2, 0, 1, 3], "Equal keys must keep source order, and blanks must sort last")
 
         let unique = try await service.uniqueValues(
             forColumn: 1,
@@ -126,8 +133,8 @@ final class CSVInMemoryQueryServiceTests: XCTestCase {
         )
         XCTAssertEqual(summary.rowCount, 2)
         XCTAssertEqual(summary.nullCount, 0)
-        XCTAssertEqual(summary.minimum, "10")
-        XCTAssertEqual(summary.maximum, "2")
+        XCTAssertEqual(summary.minimum, "2")
+        XCTAssertEqual(summary.maximum, "10")
 
         do {
             _ = try await service.structuredCellDetail(sourceRowOrdinal: 0, column: 0)
@@ -137,6 +144,35 @@ final class CSVInMemoryQueryServiceTests: XCTestCase {
                 return XCTFail("Expected an explicit unsupported-detail error, got \(error)")
             }
         }
+    }
+
+    func testCurrencySortingAndSummaryPreserveExactSourceValues() async throws {
+        let directory = try Self.makeFixtureDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("contributions.csv")
+        let values = ["$7,558.33", "$468.62", "468.620", "($1,020.25)", "$12,34",
+                      "$0.00", "$116,898.19", "Pending", "", "1e999", "$205.02"]
+        let csv = (["row,value"] + values.enumerated().map { "\($0.offset),\"\($0.element)\"" }).joined(separator: "\n")
+        try Data(csv.utf8).write(to: url)
+        let service = try CSVInMemoryQueryService(
+            url: url, configuration: .init(columnNames: ["row", "value"], firstRowIsHeader: true),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        defer { Task { await service.close() } }
+        let ascending = ParquetTableQuery(sort: .init(column: 1, order: .ascending))
+        let ordered = [3, 5, 10, 1, 2, 0, 6, 4, 9, 7, 8]
+        let first = try await service.page(offset: 0, limit: 4, query: ascending)
+        let rest = try await service.page(offset: 4, limit: 20, query: ascending)
+        XCTAssertEqual((first.rows + rest.rows).map { $0[1].value }, ordered.map { values[$0] })
+        let descending = try await service.page(offset: 0, limit: 20, query: .init(sort: .init(column: 1, order: .descending)))
+        XCTAssertEqual(descending.sourceRowOrdinals, [7, 9, 4, 6, 0, 1, 2, 10, 5, 3, 8])
+        let summary = try await service.columnSummary(forColumn: 1)
+        XCTAssertEqual(summary.minimum, "($1,020.25)")
+        XCTAssertEqual(summary.maximum, "$116,898.19")
+        let count = try await service.forEachExportRow(query: ascending, selectedRows: nil) { row, fields in
+            XCTAssertEqual(fields[1], values[ordered[Int(row) - 1]])
+        }
+        XCTAssertEqual(count, Int64(values.count))
     }
 
     func testHeaderlessSemicolonCSVPreservesFirstRecordAndDuplicateDisplayNames() async throws {

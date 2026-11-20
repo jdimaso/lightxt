@@ -63,9 +63,15 @@ SIGN_UPDATE="$SPARKLE_BIN/sign_update"
     exit 69
 }
 
-# This lookup proves the signing identity exists without exporting or printing
-# the private key. Sparkle reads it directly from the login Keychain.
-"$GENERATE_KEYS" --account "$KEYCHAIN_ACCOUNT" -p >/dev/null
+# Sparkle's -p lookup returns only the existing public key.
+SIGNING_PUBLIC_KEY="$("$GENERATE_KEYS" --account "$KEYCHAIN_ACCOUNT" -p)"
+APP_PUBLIC_KEY="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$INFO_PLIST")"
+[[ -n "$APP_PUBLIC_KEY" && "$SIGNING_PUBLIC_KEY" == "$APP_PUBLIC_KEY" ]] || {
+    print -u2 "The app's Sparkle public key does not match the release signing account."
+    exit 65
+}
+PUBLISHED_FEED="$REPOSITORY_ROOT/appcast.xml"
+"$SIGN_UPDATE" --account "$KEYCHAIN_ACCOUNT" --verify "$PUBLISHED_FEED"
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 SIGNED_ENTITLEMENTS="$(codesign -d --entitlements - "$APP_PATH" 2>&1)"
@@ -197,24 +203,64 @@ SPARKLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString
 ARCHIVE_NAME="LighTxt-$SHORT_VERSION-macOS-universal.zip"
 ARCHIVE_PATH="$OUTPUT_DIR/$ARCHIVE_NAME"
 NOTES_PATH="$OUTPUT_DIR/${ARCHIVE_NAME:r}.md"
+DOWNLOAD_PREFIX="https://github.com/$REPOSITORY/releases/download/v$SHORT_VERSION/"
+GENERATED_FEED="$OUTPUT_DIR/appcast.xml"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ARCHIVE_PATH"
 cp "$RELEASE_NOTES_PATH" "$NOTES_PATH"
-cp "$REPOSITORY_ROOT/appcast.xml" "$OUTPUT_DIR/appcast.xml"
+cp "$PUBLISHED_FEED" "$GENERATED_FEED"
 
 "$GENERATE_APPCAST" \
     --account "$KEYCHAIN_ACCOUNT" \
-    --download-url-prefix "https://github.com/$REPOSITORY/releases/download/v$SHORT_VERSION/" \
+    --download-url-prefix "$DOWNLOAD_PREFIX" \
     --link "https://github.com/$REPOSITORY" \
     --embed-release-notes \
     --maximum-versions 0 \
     --maximum-deltas 0 \
     "$OUTPUT_DIR"
 
-"$SIGN_UPDATE" --account "$KEYCHAIN_ACCOUNT" --verify "$OUTPUT_DIR/appcast.xml"
-xmllint --noout "$OUTPUT_DIR/appcast.xml"
-grep -q "sparkle:edSignature=" "$OUTPUT_DIR/appcast.xml"
-grep -q "sparkle-signatures:" "$OUTPUT_DIR/appcast.xml"
+"$SIGN_UPDATE" --account "$KEYCHAIN_ACCOUNT" --verify "$GENERATED_FEED"
+MINIMUM_SYSTEM="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$INFO_PLIST")"
+ARCHIVE_SIGNATURE="$(/usr/bin/python3 - "$PUBLISHED_FEED" "$GENERATED_FEED" \
+    "$SHORT_VERSION" "$BUILD_VERSION" "$MINIMUM_SYSTEM" "$DOWNLOAD_PREFIX$ARCHIVE_NAME" "$ARCHIVE_PATH" <<'PY'
+import os
+import sys
+import xml.etree.ElementTree as ET
+
+published, generated, version, build, minimum_system, url, archive = sys.argv[1:]
+sparkle = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+previous = ET.parse(published).findall("./channel/item")
+items = ET.parse(generated).findall("./channel/item")
+if len(items) != len(previous) + 1:
+    sys.exit("Expected exactly one new release in the generated appcast.")
+
+def canonical_item(item):
+    return ET.canonicalize(ET.tostring(item, encoding="unicode"))
+
+if any(canonical_item(old) != canonical_item(new) for old, new in zip(previous, items[1:])):
+    sys.exit("The generated appcast changed a previously published item.")
+for item in previous:
+    if item.findtext(sparkle + "version") == build or any(el.get("url") == url for el in item.findall("enclosure")):
+        sys.exit("This build or archive URL is already published.")
+
+latest = items[0]
+for key, expected in (("shortVersionString", version), ("version", build), ("minimumSystemVersion", minimum_system)):
+    if latest.findtext(sparkle + key) != expected:
+        sys.exit(f"The newest appcast item has an unexpected {key} (expected {expected}).")
+
+enclosures = latest.findall("enclosure")
+if len(enclosures) != 1 or enclosures[0].get("url") != url:
+    sys.exit(f"The newest appcast item must enclose {url}.")
+enclosure = enclosures[0]
+if enclosure.get("length") != str(os.path.getsize(archive)):
+    sys.exit("The archive length in the appcast differs from the release ZIP.")
+signature = enclosure.get(sparkle + "edSignature")
+if not signature:
+    sys.exit("The newest appcast item is missing its archive signature.")
+print(signature)
+PY
+)"
+"$SIGN_UPDATE" --account "$KEYCHAIN_ACCOUNT" --verify "$ARCHIVE_PATH" "$ARCHIVE_SIGNATURE"
 
 print "Prepared Sparkle release v$SHORT_VERSION (build $BUILD_VERSION)"
 print "Sparkle framework: $SPARKLE_VERSION"

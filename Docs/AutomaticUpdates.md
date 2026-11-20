@@ -32,33 +32,51 @@ change that choice in Sparkle's update UI.
 ## Prepare a real release
 
 1. Increase both `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`. Sparkle
-   compares the latter as its machine-readable update version.
-2. Create a universal Release archive in Xcode, export it with **Developer
-   ID**, notarize the app, and staple the notarization ticket to the app.
-3. Write Markdown release notes, then run:
+   compares the latter as its machine-readable update version. Write the
+   user-facing notes in `Docs/ReleaseNotes/VERSION.md`. Run the regression
+   suite and commit the tested release source, including new source files,
+   version settings, and notes. Record the full commit with `git rev-parse HEAD`.
+2. On the release Mac, unlock the login Keychain and sign in to the release
+   team's account in Xcode. In Finder, double-click
+   `Scripts/prepare_signed_release.command`, or run it in Terminal.
 
    ```sh
-   ./Scripts/prepare_sparkle_release.sh \
-     /path/to/export/LighTxt.app \
-     /path/to/release-notes.md
+   ./Scripts/prepare_signed_release.command
    ```
 
-   The script refuses unsigned, unstapled, wrong-bundle, or wrong-Sparkle
-   builds. It creates `SparkleUpdates/vVERSION/` (gitignored), packages the app
-   with `ditto` so framework symlinks survive, signs the archive entry, embeds
-   the release notes, signs the feed, verifies the feed, and prints a SHA-256.
-   The signing tools read the private key directly from Keychain.
+   The command snapshots the working sources in a private directory under
+   `/private/tmp`, builds a universal Release archive, submits the Developer ID
+   export to Apple for notarization, and exports the ticketed app. Allow any
+   Keychain requests for the release credentials. To use an existing
+   `notarytool` Keychain profile, start the command with
+   `LIGHTXT_NOTARY_PROFILE="your-profile-name" ./Scripts/prepare_signed_release.command`.
+   If interrupted, run the printed `--resume` command. It uses the same source
+   snapshot and notarization method. Start a new run for source changes.
 
-4. Inspect the ZIP and signed appcast. Create the GitHub Release as a draft and
-   upload the immutable ZIP (and optional DMG), but do not publish it or change
-   the production feed yet:
+3. Find the verified ZIP, signed appcast, and release notes in
+   `SparkleUpdates/vVERSION/`. The command prints the ZIP's SHA-256 and the
+   path to the notarized app. Keep the temporary workspace until QA is complete.
+   If you already have a notarized, stapled universal Developer ID export,
+   you can run the same packaging checks directly with
+   `./Scripts/prepare_sparkle_release.sh /path/to/LighTxt.app Docs/ReleaseNotes/VERSION.md`.
+   The signing tools use the Sparkle key in Keychain. Both commands leave the
+   repository's production feed untouched.
+
+4. Inspect the ZIP and signed appcast. Tag the exact tested source commit
+   recorded in step 1, then push that tag before creating a draft GitHub
+   Release. Replace `VERSION` and `TESTED_COMMIT` below. If the tag already
+   exists, confirm that it resolves to the same commit locally and on GitHub.
+   Upload the immutable ZIP (and optional DMG) to the draft.
 
    ```sh
+   git tag -a "vVERSION" TESTED_COMMIT -m "LighTxt VERSION"
+   git push origin "refs/tags/vVERSION"
    gh release create "vVERSION" \
      "SparkleUpdates/vVERSION/LighTxt-VERSION-macOS-universal.zip" \
      --repo jdimaso/lightxt \
      --title "LighTxt VERSION" \
-     --notes-file /path/to/release-notes.md \
+     --notes-file "Docs/ReleaseNotes/VERSION.md" \
+     --verify-tag \
      --draft
    ```
 

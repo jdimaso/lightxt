@@ -4,6 +4,93 @@ import XCTest
 @testable import LighTxt
 
 final class ParquetQueryServiceTests: XCTestCase {
+    func testFullAndSparseSortedExportsAcrossNativeChunksKeepLongAndEmbeddedNULValues() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".parquet")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let library = try Self.duckDBLibraryURL()
+        let runtime = try DuckDBDynamicAPI(libraryURL: library)
+        let handles = try runtime.openInMemory(options: [])
+        defer { runtime.disconnect(handles.connection); runtime.close(handles.database) }
+        _ = try runtime.execute(connection: handles.connection, sql: """
+            COPY (SELECT i, CASE WHEN i = 2345 THEN repeat('雪', 9000) || chr(0) || 'end'
+                                 WHEN i = 4000 THEN NULL ELSE 'v' || i::VARCHAR END AS note
+                  FROM range(5210) t(i)) TO $1 (FORMAT parquet)
+            """, bindings: [.text(file.path)])
+        let service = try ParquetQueryService(url: file, libraryURL: library)
+        defer { Task { await service.close() } }
+        let expectedLong = String(repeating: "雪", count: 9_000) + "\0end"
+        let count = try await service.forEachExportRow(query: .init(), selectedRows: nil) { number, cells in
+            let id = number - 1
+            XCTAssertEqual(cells[0], String(id))
+            let expected = id == 2345 ? expectedLong : id == 4000 ? nil : "v\(id)"
+            XCTAssertEqual(cells[1], expected)
+        }
+        XCTAssertEqual(count, 5_210)
+        let selection = [1, 1209, 2864, 5207]
+        let sparse = try await service.forEachExportRow(
+            query: .init(sort: .init(column: 0, order: .descending), projectedColumnIndexes: [1, 0]),
+            selectedRows: IndexSet(selection)
+        ) { number, cells in
+            let id = 5209 - selection[Int(number - 1)]
+            XCTAssertEqual(cells[1], String(id))
+            XCTAssertEqual(cells[0], id == 2345 ? expectedLong : id == 4000 ? nil : "v\(id)")
+        }
+        XCTAssertEqual(sparse, Int64(selection.count))
+    }
+
+    func testStreamExportsExactProjectedStringsInFilteredSortedSelection() async throws {
+        let service = try ParquetQueryService(url: Self.fixtureURL(), limits: .init(maximumCellCharacters: 64),
+                                              libraryURL: try Self.duckDBLibraryURL())
+        defer { Task { await service.close() } }
+        let query = ParquetTableQuery(filters: [.init(column: 1, selectedValues: [.text("same")])],
+                                      sort: .init(column: 0, order: .ascending),
+                                      projectedColumnIndexes: [2, 0])
+        let selected = IndexSet([0, 1, 3])
+        let count = try await service.forEachExportRow(query: query, selectedRows: selected) { number, cells in
+            switch number {
+            case 1: XCTAssertEqual(cells, [nil, "1"])
+            case 2: XCTAssertEqual(cells, ["", "2"])
+            case 3: XCTAssertEqual(cells, ["zeta", "6"])
+            default: XCTFail("Unexpected row")
+            }
+        }
+        XCTAssertEqual(count, 3)
+    }
+
+    func testColumnProjectionCanReachBeyondTheDefaultPageWithoutChangingPhysicalKeys() async throws {
+        let service = try ParquetQueryService(
+            url: Self.fixtureURL(), limits: .init(maximumPresentedColumns: 2),
+            libraryURL: try Self.duckDBLibraryURL()
+        )
+        defer { Task { await service.close() } }
+        let metadata = try await service.open()
+        XCTAssertEqual(metadata.columns.map(\.index), [0, 1])
+        XCTAssertEqual(metadata.allColumns.map(\.index), Array(0..<6))
+
+        let query = ParquetTableQuery(
+            filters: [.init(column: 2, containsText: "zet")],
+            sort: .init(column: 3, order: .descending),
+            projectedColumnIndexes: [1, 0]
+        )
+        let filtered = try await service.page(offset: 0, limit: 2, query: query)
+        XCTAssertEqual(filtered.rows.map { $0.map(\.value) }, [["same", "6"]])
+
+        let nested = try await service.page(
+            offset: 0, limit: 2, query: .init(projectedColumnIndexes: [5, 0])
+        )
+        XCTAssertEqual(nested.rows.first?.last?.value, "1")
+        XCTAssertNotNil(nested.rows.first?.first?.value)
+        let detail = try await service.structuredCellDetail(sourceRowOrdinal: 0, column: 5)
+        XCTAssertEqual(detail.json, #"{"name":"alpha","nums":[1,2]}"#)
+
+        for invalid in [[], [0, 0], [0, 1, 5], [6], [-1]] {
+            do {
+                _ = try await service.page(offset: 100, limit: 2, query: .init(projectedColumnIndexes: invalid))
+                XCTFail("Accepted invalid column projection \(invalid)")
+            } catch is ParquetQueryError {}
+        }
+    }
+
     func testPagedQueriesFiltersSummariesAndSandboxAllowlist() async throws {
         let fixtureDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("LighTxt Parquet 'fixtures' \(UUID().uuidString)", isDirectory: true)

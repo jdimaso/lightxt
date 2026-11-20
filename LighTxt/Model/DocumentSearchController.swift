@@ -26,8 +26,6 @@ final class DocumentSearchController {
         self.engineProvider = engineProvider
     }
 
-    var isRunning: Bool { cancellation != nil }
-
     func cancel() {
         generation &+= 1
         cancellation?.cancel()
@@ -39,6 +37,7 @@ final class DocumentSearchController {
         regularExpression: Bool,
         from byteOffset: Int64,
         backwards: Bool,
+        skippingEmptyMatchAtOrigin: Bool = false,
         options: SearchOptions = .init(),
         completion: @escaping MatchHandler
     ) {
@@ -61,34 +60,64 @@ final class DocumentSearchController {
             let result: Result<SearchMatch?, Error>
             do {
                 let snapshot = try engine.snapshot()
-                let start = min(max(0, byteOffset), snapshot.byteCount)
+                var start = min(max(0, byteOffset), snapshot.byteCount)
                 let match: SearchMatch?
                 if backwards {
-                    match = try Self.previousMatch(
+                    let previous = try Self.previousMatch(
                         snapshot: snapshot,
                         pattern: pattern,
                         before: start,
-                        options: options,
-                        cancellation: token
-                    ) ?? Self.previousMatch(
-                        snapshot: snapshot,
-                        pattern: pattern,
-                        before: snapshot.byteCount,
+                        includeEmptyAtOrigin: !skippingEmptyMatchAtOrigin,
                         options: options,
                         cancellation: token
                     )
+                    if previous == nil, start < snapshot.byteCount || skippingEmptyMatchAtOrigin {
+                        match = try Self.previousMatch(
+                            snapshot: snapshot,
+                            pattern: pattern,
+                            before: snapshot.byteCount,
+                            includeEmptyAtOrigin: true,
+                            options: options,
+                            cancellation: token
+                        )
+                    } else {
+                        match = previous
+                    }
                 } else {
-                    match = try snapshot.firstMatch(
+                    if regularExpression {
+                        if skippingEmptyMatchAtOrigin {
+                            start = start == snapshot.byteCount ? 0 : start + 1
+                        }
+                        start = try snapshot.utf8BoundaryAtOrAfter(start, limitedBy: snapshot.byteCount)
+                    }
+                    let next = try snapshot.firstMatch(
                         for: pattern,
                         in: start..<snapshot.byteCount,
                         options: options,
                         cancellation: token
-                    ) ?? snapshot.firstMatch(
-                        for: pattern,
-                        in: 0..<start,
-                        options: options,
-                        cancellation: token
                     )
+                    if next == nil, start > 0 {
+                        // A match that starts before the caret may end after it.
+                        // Exact regexes can have arbitrary width and context.
+                        let end: Int64
+                        switch pattern {
+                        case let .literal(bytes):
+                            end = start + min(Int64(bytes.count - 1), snapshot.byteCount - start)
+                        case .regularExpression where snapshot.byteCount <= Int64(options.maximumExactRegexDocumentByteCount):
+                            end = snapshot.byteCount
+                        case .regularExpression:
+                            let context = min(Int64(options.maximumRegexWindowByteCount), snapshot.byteCount - start)
+                            end = try snapshot.utf8BoundaryAtOrAfter(start + context, limitedBy: snapshot.byteCount)
+                        }
+                        match = try snapshot.firstMatch(
+                            for: pattern,
+                            in: 0..<end,
+                            options: options,
+                            cancellation: token
+                        )
+                    } else {
+                        match = next
+                    }
                 }
                 result = .success(match)
             } catch {
@@ -189,10 +218,12 @@ final class DocumentSearchController {
         snapshot: DocumentSnapshot,
         pattern: SearchPattern,
         before byteOffset: Int64,
+        includeEmptyAtOrigin: Bool,
         options: SearchOptions,
         cancellation: CancellationToken
     ) throws -> SearchMatch? {
         var primaryEnd = min(max(0, byteOffset), snapshot.byteCount)
+        if primaryEnd == 0, !includeEmptyAtOrigin { return nil }
         let primaryWindow: Int64
         let overlap: Int64
         switch pattern {
@@ -212,31 +243,36 @@ final class DocumentSearchController {
             overlap = maximumWindow
         }
 
-        while primaryEnd > 0 {
+        repeat {
             if cancellation.isCancelled { throw CancellationError() }
-            let primaryStart = max(0, primaryEnd - primaryWindow)
+            var primaryStart = max(0, primaryEnd - primaryWindow)
             // Context-free regex and literal matches are owned by their start
             // offset. The preceding primary window owns any match that begins
             // before `primaryStart`; only right context is needed here.
-            let scanStart = primaryStart
-            let scanEnd = primaryEnd + min(overlap, snapshot.byteCount - primaryEnd)
+            var scanEnd = primaryEnd + min(overlap, snapshot.byteCount - primaryEnd)
+            if case .regularExpression = pattern {
+                primaryStart = try snapshot.utf8BoundaryAtOrBefore(primaryStart, limitedBy: 0)
+                scanEnd = try snapshot.utf8BoundaryAtOrAfter(scanEnd, limitedBy: snapshot.byteCount)
+            }
             var last: SearchMatch?
             _ = try snapshot.search(
                 pattern,
-                in: scanStart..<scanEnd,
+                in: primaryStart..<scanEnd,
                 options: options,
                 cancellation: cancellation
             ) { match in
-                if match.byteRange.lowerBound >= primaryStart,
-                   match.byteRange.lowerBound < primaryEnd,
-                   match.byteRange.upperBound <= byteOffset {
+                let range = match.byteRange
+                let includesOrigin = includeEmptyAtOrigin && range.isEmpty && range.lowerBound == byteOffset
+                if range.lowerBound >= primaryEnd, !includesOrigin { return false }
+                if range.lowerBound >= primaryStart,
+                   range.upperBound <= byteOffset {
                     last = match
                 }
-                return true
+                return !includesOrigin
             }
             if let last { return last }
             primaryEnd = primaryStart
-        }
+        } while primaryEnd > 0
         return nil
     }
 }

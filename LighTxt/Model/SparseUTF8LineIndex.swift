@@ -2,8 +2,9 @@ import Foundation
 
 /// A sparse, byte-addressed line index for UTF-8 documents.
 ///
-/// The index stores one `Int64` offset every `checkpointLineInterval` lines,
-/// rather than one object per line. It never materializes the document and asks
+/// The index stores one `Int64` offset every `checkpointLineInterval` lines
+/// and a scanner checkpoint every MiB to bound lookups inside long lines.
+/// It never materializes the document and asks
 /// its reader for at most `readChunkByteCount` bytes at a time. The reader can
 /// therefore be backed directly by a `DocumentSnapshot`:
 ///
@@ -65,6 +66,7 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
         public let knownLineCount: Int64
         public let totalLineCount: Int64?
         public let checkpointCount: Int
+        public let byteCheckpointCount: Int
         public let isComplete: Bool
 
         public var fractionCompleted: Double {
@@ -72,10 +74,10 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
             return min(1, Double(indexedByteCount) / Double(totalByteCount))
         }
 
-        /// Payload bytes retained by the sparse offset array. Array bookkeeping
+        /// Payload bytes retained by both checkpoint arrays. Array bookkeeping
         /// and the fixed-size scanner state are intentionally excluded.
         public var checkpointPayloadByteCount: Int {
-            checkpointCount * MemoryLayout<Int64>.stride
+            checkpointCount * MemoryLayout<Int64>.stride + byteCheckpointCount * MemoryLayout<ByteCheckpoint>.stride
         }
     }
 
@@ -122,7 +124,19 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
         }
     }
 
+    private static let byteCheckpointInterval: Int64 = 1 << 20
+
+    /// State immediately before reading the byte at a fixed MiB boundary.
+    /// Offset is implicit in the array index, including inside a CRLF pair.
+    private struct ByteCheckpoint {
+        let line: Int64
+        let lineStart: Int64
+        let pendingCR: Bool
+    }
+
     private struct State {
+        var byteCheckpoints: [ByteCheckpoint] = []
+        var lineStart: Int64 = 0
         var generation: Generation
         var byteCount: Int64
         var reader: ChunkReader
@@ -141,6 +155,7 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
         let completedLineBreakCount: Int64
         let hasPendingCarriageReturn: Bool
         let progress: Progress
+        let lineStart: Int64
     }
 
     private enum ScanCaptureResult {
@@ -153,6 +168,7 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
         let byteCount: Int64
         let reader: ChunkReader
         let checkpoints: [Int64]
+        let byteCheckpoints: [ByteCheckpoint]
     }
 
     private let configuration: Configuration
@@ -228,10 +244,7 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
     @discardableResult
     public func purgeRebuildableResidentMemory() -> Int {
         withStateLock { state in
-            let reclaimed = max(
-                0,
-                (state.checkpoints.count - 1) * MemoryLayout<Int64>.stride
-            )
+            let reclaimed = Self.makeProgress(from: state).checkpointPayloadByteCount - MemoryLayout<Int64>.stride
             let next = Generation(
                 rawValue: state.generation.rawValue &+ 1,
                 sourceRevision: state.generation.sourceRevision
@@ -253,10 +266,12 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
     /// Installs a new immutable source after an edit and invalidates all work
     /// captured from the previous generation. In-flight scans may finish their
     /// current bounded read, but can never commit stale checkpoints afterward.
+    /// Pass the first edited byte to retain checkpoints in the unchanged prefix.
     @discardableResult
     public func invalidate(
         byteCount: Int64,
         sourceRevision: UInt64? = nil,
+        unchangedPrefixByteCount: Int64 = 0,
         reader: @escaping ChunkReader
     ) throws -> Generation {
         guard byteCount >= 0 else { throw IndexError.invalidByteCount(byteCount) }
@@ -265,16 +280,47 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
                 rawValue: state.generation.rawValue &+ 1,
                 sourceRevision: sourceRevision
             )
-            state = State(
-                generation: next,
-                byteCount: byteCount,
-                reader: reader,
-                checkpoints: [0],
-                scannedByteOffset: 0,
-                completedLineBreakCount: 0,
-                hasPendingCarriageReturn: false,
-                isComplete: byteCount == 0
-            )
+            let prefix = max(0, min(unchangedPrefixByteCount, state.scannedByteOffset, byteCount))
+            // A bare CR at the final unchanged byte may pair with a newly
+            // inserted LF. A line checkpoint at that exact byte can depend
+            // on old lookahead. Byte checkpoints retain their pending CR.
+            let lineSlot = max(0, Self.prefixCount(state.checkpoints.count) { state.checkpoints[$0] < prefix } - 1)
+            let byteSlots = min(state.byteCheckpoints.count, Int(prefix / Self.byteCheckpointInterval))
+            let byteBoundary = Int64(byteSlots) * Self.byteCheckpointInterval
+            let lineBoundary = state.checkpoints[lineSlot]
+            var offset = lineBoundary
+            var start = ByteCheckpoint(line: Int64(lineSlot) * configuration.checkpointLineInterval,
+                                       lineStart: lineBoundary, pendingCR: false)
+            if byteSlots > 0 && byteBoundary >= lineBoundary {
+                offset = byteBoundary
+                start = state.byteCheckpoints[byteSlots - 1]
+            }
+            // An in-progress scan also holds the exact parser state at the
+            // last committed byte, including when the edit appends to it.
+            if prefix > offset, prefix == state.scannedByteOffset, !state.isComplete {
+                offset = prefix
+                start = ByteCheckpoint(line: state.completedLineBreakCount, lineStart: state.lineStart,
+                                       pendingCR: state.hasPendingCarriageReturn)
+            }
+            let keepLines = Int(start.line / configuration.checkpointLineInterval) + 1
+            state.checkpoints.removeLast(state.checkpoints.count - keepLines)
+            state.byteCheckpoints.removeLast(state.byteCheckpoints.count - Int(offset / Self.byteCheckpointInterval))
+            state.generation = next
+            state.byteCount = byteCount
+            state.reader = reader
+            state.scannedByteOffset = offset
+            state.completedLineBreakCount = start.line
+            state.lineStart = start.lineStart
+            state.hasPendingCarriageReturn = start.pendingCR
+            state.isComplete = offset == byteCount
+            if state.isComplete, start.pendingCR {
+                state.hasPendingCarriageReturn = false
+                state.completedLineBreakCount += 1
+                state.lineStart = offset
+                if state.completedLineBreakCount % configuration.checkpointLineInterval == 0 {
+                    state.checkpoints.append(offset)
+                }
+            }
             return next
         }
     }
@@ -386,10 +432,19 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
             return checkpointOffset
         }
 
+        let slot = Self.prefixCount(capture.byteCheckpoints.count) { capture.byteCheckpoints[$0].line <= line }
+        let byteOffsetAtSlot = Int64(slot) * Self.byteCheckpointInterval
+        let useByteCheckpoint = slot > 0 && byteOffsetAtSlot > checkpointOffset
+        let start = useByteCheckpoint ? capture.byteCheckpoints[slot - 1]
+            : ByteCheckpoint(line: checkpointLine, lineStart: checkpointOffset, pendingCR: false)
+        if start.line == line {
+            try requireCurrent(generation)
+            return start.lineStart
+        }
         return try locateLineStart(
             targetLine: line,
-            checkpointLine: checkpointLine,
-            checkpointOffset: checkpointOffset,
+            start: start,
+            checkpointOffset: useByteCheckpoint ? byteOffsetAtSlot : checkpointOffset,
             capture: capture,
             cancellation: cancellation
         )
@@ -439,16 +494,19 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
         )
 
         let capture = try queryCapture(expected: generation)
-        let checkpointIndex = Self.lastCheckpointIndex(
-            atOrBefore: byteOffset,
-            checkpoints: capture.checkpoints
-        )
+        let checkpointIndex = Self.prefixCount(capture.checkpoints.count) { capture.checkpoints[$0] <= byteOffset } - 1
         let checkpointLine = Int64(checkpointIndex)
             * configuration.checkpointLineInterval
+        let regularOffset = capture.checkpoints[checkpointIndex]
+        let slot = Int(byteOffset / Self.byteCheckpointInterval)
+        let byteOffsetAtSlot = Int64(slot) * Self.byteCheckpointInterval
+        let useByteCheckpoint = slot > 0 && slot <= capture.byteCheckpoints.count && byteOffsetAtSlot > regularOffset
+        let start = useByteCheckpoint ? capture.byteCheckpoints[slot - 1]
+            : ByteCheckpoint(line: checkpointLine, lineStart: regularOffset, pendingCR: false)
         return try locatePosition(
             byteOffset: byteOffset,
-            checkpointLine: checkpointLine,
-            checkpointOffset: capture.checkpoints[checkpointIndex],
+            start: start,
+            checkpointOffset: useByteCheckpoint ? byteOffsetAtSlot : regularOffset,
             capture: capture,
             cancellation: cancellation
         )
@@ -469,7 +527,8 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
                 scannedByteOffset: state.scannedByteOffset,
                 completedLineBreakCount: state.completedLineBreakCount,
                 hasPendingCarriageReturn: state.hasPendingCarriageReturn,
-                progress: Self.makeProgress(from: state)
+                progress: Self.makeProgress(from: state),
+                lineStart: state.lineStart
             ))
         }
 
@@ -493,7 +552,8 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
         }
 
         let remaining = capture.byteCount - capture.scannedByteOffset
-        let requestedCount = min(Int64(configuration.readChunkByteCount), remaining)
+        let bytesToCheckpoint = Self.byteCheckpointInterval - capture.scannedByteOffset % Self.byteCheckpointInterval
+        let requestedCount = min(Int64(configuration.readChunkByteCount), remaining, bytesToCheckpoint)
         let upperBound = capture.scannedByteOffset + requestedCount
         let range = capture.scannedByteOffset..<upperBound
         let data: Data
@@ -519,6 +579,7 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
             return ScanResult(progress: progress, stopReason: .cancelled)
         }
 
+        var lastLineStart = capture.lineStart
         var completedBreaks = capture.completedLineBreakCount
         var pendingCR = capture.hasPendingCarriageReturn
         var newCheckpoints: [Int64] = []
@@ -528,6 +589,7 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
         @inline(__always)
         func recordLineStart(at byteOffset: Int64) {
             completedBreaks += 1
+            lastLineStart = byteOffset
             if completedBreaks % configuration.checkpointLineInterval == 0 {
                 newCheckpoints.append(byteOffset)
             }
@@ -578,6 +640,9 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
             return ScanResult(progress: progress, stopReason: .cancelled)
         }
 
+        let byteCheckpoint = upperBound % Self.byteCheckpointInterval == 0
+            ? ByteCheckpoint(line: completedBreaks, lineStart: lastLineStart, pendingCR: pendingCR)
+            : nil
         var completed = upperBound == capture.byteCount
         if completed, pendingCR {
             pendingCR = false
@@ -589,6 +654,8 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
                   state.scannedByteOffset == capture.scannedByteOffset else {
                 return (Self.makeProgress(from: state), false)
             }
+            if let byteCheckpoint { state.byteCheckpoints.append(byteCheckpoint) }
+            state.lineStart = lastLineStart
             state.checkpoints.append(contentsOf: newCheckpoints)
             state.scannedByteOffset = upperBound
             state.completedLineBreakCount = completedBreaks
@@ -697,14 +764,14 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
 
     private func locateLineStart(
         targetLine: Int64,
-        checkpointLine: Int64,
+        start: ByteCheckpoint,
         checkpointOffset: Int64,
         capture: QueryCapture,
         cancellation: CancellationCheck?
     ) throws -> Int64 {
-        var line = checkpointLine
+        var line = start.line
         var cursor = checkpointOffset
-        var pendingCR = false
+        var pendingCR = start.pendingCR
         var foundOffset: Int64?
 
         while cursor < capture.byteCount, foundOffset == nil {
@@ -774,15 +841,15 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
 
     private func locatePosition(
         byteOffset: Int64,
-        checkpointLine: Int64,
+        start: ByteCheckpoint,
         checkpointOffset: Int64,
         capture: QueryCapture,
         cancellation: CancellationCheck?
     ) throws -> LineAndColumn {
-        var line = checkpointLine
-        var lineStart = checkpointOffset
+        var line = start.line
+        var lineStart = start.lineStart
         var cursor = checkpointOffset
-        var pendingCR = false
+        var pendingCR = start.pendingCR
 
         @inline(__always)
         func recordLineStart(at offset: Int64) {
@@ -879,7 +946,8 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
                 generation: state.generation,
                 byteCount: state.byteCount,
                 reader: state.reader,
-                checkpoints: state.checkpoints
+                checkpoints: state.checkpoints,
+                byteCheckpoints: state.byteCheckpoints
             )
         }
     }
@@ -912,21 +980,18 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
         }
     }
 
-    private static func lastCheckpointIndex(
-        atOrBefore byteOffset: Int64,
-        checkpoints: [Int64]
-    ) -> Int {
+    private static func prefixCount(_ count: Int, satisfying predicate: (Int) -> Bool) -> Int {
         var lowerBound = 0
-        var upperBound = checkpoints.count
+        var upperBound = count
         while lowerBound < upperBound {
             let middle = lowerBound + (upperBound - lowerBound) / 2
-            if checkpoints[middle] <= byteOffset {
+            if predicate(middle) {
                 lowerBound = middle + 1
             } else {
                 upperBound = middle
             }
         }
-        return max(0, lowerBound - 1)
+        return lowerBound
     }
 
     private static func makeProgress(from state: State) -> Progress {
@@ -939,6 +1004,7 @@ public nonisolated final class SparseUTF8LineIndex: @unchecked Sendable {
                 ? state.completedLineBreakCount + 1
                 : nil,
             checkpointCount: state.checkpoints.count,
+            byteCheckpointCount: state.byteCheckpoints.count,
             isComplete: state.isComplete
         )
     }

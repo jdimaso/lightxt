@@ -129,6 +129,13 @@ struct ParquetTableRuntimeQA {
               view.qaVisibleDataCellsAreReadOnly else {
             throw QAError.failed("Initial schema, NULL/empty/literal values, or read-only accessibility is incorrect")
         }
+        guard let parquetBar = descendant(of: view, as: CSVAnalysisBar.self),
+              parquetBar.isHidden else {
+            throw QAError.failed("The CSV analysis footer is visible in a raw Parquet document")
+        }
+        try verifyResidentCellSelection(beside: fixtureURL, in: outputDirectory)
+        window.makeKeyAndOrderFront(nil)
+
         view.qaBeginQueryOverlayAnimationProbe()
         runLoop(0.24)
         guard view.qaQueryOverlayHasFadedTable else {
@@ -152,6 +159,31 @@ struct ParquetTableRuntimeQA {
         guard view.qaBodyMenuTitles(row: 0, visualColumn: 1).filter({ !$0.isEmpty }) == ["Inspect Value…", "Copy Cell", "Copy Row"] else {
             throw QAError.failed("Parquet body exposed a mutation action")
         }
+        guard view.qaChooseColumns(named: ["amount", "id"]) else {
+            throw QAError.failed("The Parquet column chooser could not apply its searched selection")
+        }
+        try wait(until: { view.qaIsReady }, failure: "Selected Parquet columns did not load")
+        guard view.qaColumnNames == ["id", "amount"],
+              view.qaValue(row: 0, column: 0) == "1",
+              view.qaValue(row: 0, column: 1) == nil else {
+            throw QAError.failed("Projection lost its physical column indexes")
+        }
+        view.qaMoveDataColumn(3, toVisualIndex: 1)
+        let projectedExport = outputDirectory.appendingPathComponent("projection.csv")
+        view.qaExportVisibleColumns(to: projectedExport)
+        try wait(until: { !view.isExporting }, failure: "Projected export did not finish")
+        let exported = try String(contentsOf: projectedExport, encoding: .utf8).split(whereSeparator: \.isNewline)
+        guard exported.count == 9, exported.first == "amount,id",
+              exported[1].hasSuffix(",1") else {
+            throw QAError.failed("Export did not preserve the chosen columns in dragged visual order")
+        }
+        guard view.qaChooseColumns(named: ["id", "group_key", "value", "amount", "file_row_number", "nested"]) else {
+            throw QAError.failed("The Parquet column chooser could not restore the full schema")
+        }
+        try wait(until: { view.qaIsReady }, failure: "Restored Parquet columns did not load")
+        // Existing visible columns keep their visual order on Apply. Restore the test's original layout.
+        view.qaMoveDataColumn(0, toVisualIndex: 1)
+        view.qaMoveDataColumn(3, toVisualIndex: 4)
         view.qaSelectRows(IndexSet([1, 3]))
         let inspectorSelection = view.qaSelectedRows
         guard view.qaInspectValue(row: 3, column: 2),
@@ -709,6 +741,95 @@ struct ParquetTableRuntimeQA {
             throw QAError.failed("The structured Parquet runtime fixture is not valid base64")
         }
         return data
+    }
+
+    private static func verifyResidentCellSelection(beside parquetURL: URL, in directory: URL) throws {
+        let url = directory.appendingPathComponent("resident-selection.csv")
+        let names = ["group", "score", "qty"]
+        try """
+            group,score,qty
+            keep,"$7,558.33","$2,588.50"
+            drop,"$20,000.10",$0.00
+            keep,$0.00,$0.00
+            keep,$468.62,$205.02
+            keep,$10.00,$4.00
+            """.write(to: url, atomically: true, encoding: .utf8)
+        let resident = ParquetTableView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+        let window = host(resident, appearance: .aqua)
+        window.makeKeyAndOrderFront(nil)
+        defer { resident.deactivate(); window.close() }
+        func loadCSV() {
+            resident.loadCSVInMemory(url: url, delimiter: .comma, firstRowIsHeader: true, columnNames: names)
+        }
+        loadCSV()
+        try wait(until: { resident.qaIsReady }, failure: "Resident CSV did not load")
+        resident.qaApplyContainsFilter(column: 0, value: "keep")
+        try wait(until: { resident.qaIsReady && resident.qaRowCount == 4 }, failure: "Resident CSV filter failed")
+        resident.qaCycleHeaderSort(column: 1)
+        try wait(until: { resident.qaIsReady }, failure: "Resident CSV ascending sort failed")
+        resident.qaCycleHeaderSort(column: 1)
+        try wait(until: { resident.qaIsReady && resident.qaValue(row: 0, column: 1) == "$7,558.33" },
+                 failure: "Resident CSV descending sort failed")
+        window.layoutIfNeeded()
+        guard let bar = descendant(of: resident, as: CSVAnalysisBar.self), !bar.isHidden, bar.frame.height > 0,
+              let table = descendant(of: resident, as: NSTableView.self) else {
+            throw QAError.failed("The resident CSV selection controls were unavailable")
+        }
+        func mouse(_ type: NSEvent.EventType, column: Int, row: Int, flags: NSEvent.ModifierFlags = []) throws -> NSEvent {
+            let rect = table.frameOfCell(atColumn: column, row: row)
+            let point = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+            guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: flags,
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else {
+                throw QAError.failed("Could not create a table selection event")
+            }
+            return event
+        }
+        table.mouseDown(with: try mouse(.leftMouseDown, column: 2, row: 0))
+        table.mouseDragged(with: try mouse(.leftMouseDragged, column: 3, row: 1))
+        table.mouseUp(with: try mouse(.leftMouseUp, column: 3, row: 1))
+        func format(_ value: Double) -> String { value.formatted(.number.precision(.significantDigits(1...10))) }
+        let expected = ["Cells 4", "Filled 4", "Numeric 4", "Sum \(format(10_820.47))",
+                        "Avg \(format(2_705.1175))", "Median \(format(1_528.56))",
+                        "Min \(format(205.02))", "Max \(format(7_558.33))"]
+        try wait(until: { applicationTextValues().contains { label in expected.allSatisfy(label.contains) } },
+                 failure: "Resident CSV statistics did not use the sorted, filtered cell rectangle")
+        table.mouseDown(with: try mouse(.leftMouseDown, column: 0, row: 0))
+        table.mouseUp(with: try mouse(.leftMouseUp, column: 0, row: 0))
+        table.mouseDown(with: try mouse(.leftMouseDown, column: 0, row: 2, flags: .command))
+        table.mouseUp(with: try mouse(.leftMouseUp, column: 0, row: 2, flags: .command))
+        try wait(until: { table.selectedRowIndexes == IndexSet([0, 2]) && applicationTextValues().contains {
+            $0.contains("Cells 6") && $0.contains("Numeric 4") && $0.contains("Sum " + format(10_160.83))
+        } }, failure: "Resident CSV gutter statistics included an intervening displayed row")
+        guard let source = try bar.source?(true) else { throw QAError.failed("Resident PivotViz source missing") }
+        resident.load(url: parquetURL)
+        try wait(until: { resident.qaIsReady }, failure: "Raw Parquet did not reopen")
+        guard bar.isHidden else { throw QAError.failed("Raw Parquet retained the CSV analysis footer") }
+        table.deselectAll(nil)
+        table.selectAll(nil)
+        guard table.numberOfRows > 0, table.selectedRowIndexes == IndexSet(integersIn: 0..<table.numberOfRows) else {
+            throw QAError.failed("Raw Parquet Select All did not use its native row selection")
+        }
+        var detachedResult: Result<CSVPivotResult, Error>?
+        Task {
+            do {
+                detachedResult = .success(try await CSVPivotResult.calculate(dimensions: [0],
+                    metrics: [.init(operation: .sum, field: 1)], scan: source.scan))
+            } catch { detachedResult = .failure(error) }
+        }
+        try wait(until: { detachedResult != nil }, failure: "Detached resident PivotViz query did not finish")
+        guard let result = try detachedResult?.get(), result.recordCount == 4, let value = result.rows.first?.values.first ?? nil,
+              abs(value - 8_036.95) < 0.000001 else {
+            throw QAError.failed("PivotViz lost its filtered data after the source grid switched files")
+        }
+        loadCSV()
+        try wait(until: { resident.qaIsReady }, failure: "Resident CSV did not reopen")
+        guard !bar.isHidden else { throw QAError.failed("Reopened resident CSV lost its analysis footer") }
+        table.mouseDown(with: try mouse(.leftMouseDown, column: 2, row: 0))
+        table.mouseUp(with: try mouse(.leftMouseUp, column: 2, row: 0))
+        try wait(until: { table.selectedRowIndexes.isEmpty && applicationTextValues().contains {
+            $0.contains("Cells 1") && $0.contains("Sum " + format(7_558.33))
+        } }, failure: "Reopened resident CSV still selected whole rows on data clicks")
     }
 
     private static func host(_ view: NSView, appearance: NSAppearance.Name) -> NSWindow {

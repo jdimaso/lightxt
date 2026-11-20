@@ -120,6 +120,23 @@ public nonisolated struct RecoveryPendingEdit: Equatable, Sendable {
     }
 }
 
+extension RecoveryMetadata {
+    /// The editor may deliver a selection from before a deletion or undo.
+    func clampingOffsets(to byteCount: Int64) -> RecoveryMetadata {
+        var result = self
+        if let lower = window?.selectionLowerByteOffset {
+            result.window?.selectionLowerByteOffset = min(max(0, lower), byteCount)
+        }
+        if let upper = window?.selectionUpperByteOffset {
+            result.window?.selectionUpperByteOffset = min(max(0, upper), byteCount)
+        }
+        if let viewport = window?.viewportByteOffset {
+            result.window?.viewportByteOffset = min(max(0, viewport), byteCount)
+        }
+        return result
+    }
+}
+
 public nonisolated struct RecoveryJournalConfiguration: Equatable, Sendable {
     public var maximumOperationCount: Int
     public var maximumInsertedBytesPerOperation: Int
@@ -235,6 +252,8 @@ public nonisolated struct RecoveryEntryInspection: Equatable, Sendable {
 public nonisolated struct RecoveryPrunePolicy: Equatable, Sendable {
     public var maximumAge: TimeInterval
     public var maximumEntryCount: Int
+    /// Budget for journal data other than the active full-document checkpoint.
+    /// The age and entry-count policies also apply to checkpointed entries.
     public var maximumStoredBytes: Int64
     public var damagedEntryGracePeriod: TimeInterval
     public var removeEntriesWhoseBaseChanged: Bool
@@ -294,6 +313,15 @@ private nonisolated struct RecoveryStoredEdit: Codable, Equatable, Sendable {
     let replacement: RecoveryBlobReference?
 }
 
+private nonisolated struct RecoveryCheckpoint: Codable, Equatable, Sendable {
+    let identifier: UUID
+    let fingerprint: RecoveryBaseFingerprint
+
+    static func url(for identifier: UUID, in directory: URL) -> URL {
+        directory.appendingPathComponent("checkpoint-" + identifier.uuidString)
+    }
+}
+
 private nonisolated struct RecoveryManifest: Codable, Equatable, Sendable {
     static let currentVersion = 1
 
@@ -308,6 +336,7 @@ private nonisolated struct RecoveryManifest: Codable, Equatable, Sendable {
     var committedBlobByteCount: Int64
     var edits: [RecoveryStoredEdit]
     var metadata: RecoveryMetadata
+    var checkpoint: RecoveryCheckpoint?
 
     var entry: RecoveryEntry {
         RecoveryEntry(
@@ -532,6 +561,56 @@ public nonisolated final class RecoveryJournal: @unchecked Sendable {
         try RecoveryManifestIO.publish(next, in: directoryURL, configuration: configuration)
         manifest = next
         return next.entry
+    }
+
+    /// Publishes an entire revision as one durable checkpoint. The existing edit
+    /// blob and previous checkpoint remain readable until the manifest commits.
+    func checkpoint(
+        _ snapshot: DocumentSnapshot,
+        metadata: RecoveryMetadata,
+        rebasingOn newBase: (url: URL, fingerprint: RecoveryBaseFingerprint, bookmark: Data?)? = nil,
+        cancellation: CancellationToken? = nil
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { throw RecoveryJournalError.entryClosed }
+        if cancellation?.isCancelled == true { throw CancellationError() }
+        var next = manifest
+        if let newBase {
+            guard let current = try FileFingerprint.atPath(newBase.url.path),
+                  newBase.fingerprint.matches(current) else { throw RecoveryJournalError.baseFileChanged }
+            next.baseURL = newBase.url
+            next.baseFingerprint = newBase.fingerprint
+            next.securityScopedBookmark = newBase.bookmark
+        }
+        try RecoveryValidation.validate(metadata: metadata, resultingByteCount: snapshot.byteCount, configuration: configuration)
+        let identifier = UUID()
+        let url = RecoveryCheckpoint.url(for: identifier, in: directoryURL)
+        let stored = try snapshot.cloneBulkRewriteForRecovery(to: url) ?? StreamingFileWriter.write(
+            snapshot: snapshot, to: url, expectedDestination: nil,
+            durable: true, cancellation: cancellation, progress: nil
+        )
+        if cancellation?.isCancelled == true {
+            try? FileManager.default.removeItem(at: url)
+            throw CancellationError()
+        }
+        next.version = 2
+        next.checkpoint = RecoveryCheckpoint(identifier: identifier, fingerprint: RecoveryBaseFingerprint(stored.fingerprint))
+        next.edits = []
+        next.resultingByteCount = snapshot.byteCount
+        next.committedBlobByteCount = 0
+        next.metadata = metadata
+        next.updatedAt = max(RecoveryTimestamp.manifestPrecision(Date()), next.createdAt)
+        // A failure synchronizing the directory can occur after the atomic
+        // rename. Keep both revisions on that error.
+        try RecoveryManifestIO.publish(next, in: directoryURL, configuration: configuration)
+        let previous = manifest.checkpoint
+        manifest = next
+        if let previous {
+            try? FileManager.default.removeItem(at: RecoveryCheckpoint.url(for: previous.identifier, in: directoryURL))
+        }
+        // Subsequent appends also truncate to the committed byte count.
+        _ = Darwin.truncate(RecoveryFileLayout.blob(in: directoryURL).path, 0)
     }
 
     /// Stops further writes but retains the entry for a future recovery chooser.
@@ -879,6 +958,14 @@ public nonisolated struct RecoveryStore: Sendable {
 
         let engine = try FileBackedPieceTable(opening: resolution.url)
         do {
+            if let checkpoint = manifest.checkpoint {
+                let url = RecoveryCheckpoint.url(for: checkpoint.identifier, in: directory)
+                let mapping = try MemoryMappedFile(url: url)
+                guard checkpoint.fingerprint.matches(mapping.fingerprint) else {
+                    throw RecoveryJournalError.damagedBlob
+                }
+                try engine.installBulkRewrite(mapping, replacing: engine.snapshot())
+            }
             try RecoveryReplay.apply(
                 manifest: manifest,
                 blobURL: RecoveryFileLayout.blob(in: directory),
@@ -958,11 +1045,12 @@ public nonisolated struct RecoveryStore: Sendable {
                     ))
                     continue
                 }
-                RecoveryFileIO.removeOldManifestTemps(
+                RecoveryFileIO.removeOrphanedFiles(
                     in: directory,
+                    activeCheckpoint: manifest.checkpoint?.identifier,
                     olderThan: now.addingTimeInterval(-policy.damagedEntryGracePeriod)
                 )
-                retained.append((directory, manifest, bytes))
+                retained.append((directory, manifest, RecoveryFileIO.directoryByteCount(directory)))
             } catch {
                 let modified = RecoveryFileIO.modificationDate(directory) ?? .distantPast
                 let age = max(0, now.timeIntervalSince(modified))
@@ -999,7 +1087,8 @@ public nonisolated struct RecoveryStore: Sendable {
         var retainedBytes: Int64 = 0
         var storageOverflow: [(directory: URL, manifest: RecoveryManifest, bytes: Int64)] = []
         for item in retained {
-            let sum = retainedBytes.addingReportingOverflow(item.bytes)
+            let chargedBytes = max(0, item.bytes - (item.manifest.checkpoint?.fingerprint.byteCount ?? 0))
+            let sum = retainedBytes.addingReportingOverflow(chargedBytes)
             if sum.overflow || sum.partialValue > policy.maximumStoredBytes {
                 storageOverflow.append(item)
             } else {
@@ -1024,7 +1113,7 @@ private nonisolated enum RecoveryValidation {
         expectedIdentifier: UUID,
         configuration: RecoveryJournalConfiguration
     ) throws {
-        guard manifest.version == RecoveryManifest.currentVersion else {
+        guard (manifest.version == 1 && manifest.checkpoint == nil) || (manifest.version == 2 && manifest.checkpoint != nil) else {
             throw RecoveryJournalError.unsupportedManifestVersion(manifest.version)
         }
         guard manifest.identifier == expectedIdentifier,
@@ -1041,7 +1130,8 @@ private nonisolated enum RecoveryValidation {
             throw RecoveryJournalError.damagedManifest
         }
 
-        var currentByteCount = manifest.baseFingerprint.byteCount
+        var currentByteCount = manifest.checkpoint?.fingerprint.byteCount ?? manifest.baseFingerprint.byteCount
+        guard currentByteCount >= 0 else { throw RecoveryJournalError.damagedManifest }
         var expectedBlobOffset: Int64 = 0
         for (index, edit) in manifest.edits.enumerated() {
             guard edit.sequence == UInt64(index),
@@ -1242,6 +1332,11 @@ private nonisolated enum RecoveryManifestIO {
             expectedIdentifier: expectedIdentifier,
             configuration: configuration
         )
+        if let checkpoint = manifest.checkpoint {
+            let url = RecoveryCheckpoint.url(for: checkpoint.identifier, in: directory)
+            guard let fingerprint = try FileFingerprint.atPath(url.path),
+                  checkpoint.fingerprint.matches(fingerprint) else { throw RecoveryJournalError.damagedBlob }
+        }
         try RecoveryFileIO.validateBlobLength(
             RecoveryFileLayout.blob(in: directory),
             minimumByteCount: manifest.committedBlobByteCount
@@ -1575,15 +1670,19 @@ private nonisolated enum RecoveryFileIO {
         try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
     }
 
-    static func removeOldManifestTemps(in directory: URL, olderThan cutoff: Date) {
+    static func removeOrphanedFiles(in directory: URL, activeCheckpoint: UUID?, olderThan cutoff: Date) {
         guard let children = try? FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
             options: [.skipsHiddenFiles]
         ) else { return }
-        for child in children where child.lastPathComponent.hasPrefix(
-            "\(RecoveryFileLayout.manifestName).tmp."
-        ) {
+        for child in children {
+            let name = child.lastPathComponent
+            let checkpointPrefix = "checkpoint-"
+            let checkpointID = name.hasPrefix(checkpointPrefix)
+                ? UUID(uuidString: String(name.dropFirst(checkpointPrefix.count))) : nil
+            guard name.hasPrefix("\(RecoveryFileLayout.manifestName).tmp.")
+                    || (checkpointID != nil && checkpointID != activeCheckpoint) else { continue }
             guard let values = try? child.resourceValues(
                 forKeys: [.contentModificationDateKey, .isRegularFileKey]
             ), values.isRegularFile == true,

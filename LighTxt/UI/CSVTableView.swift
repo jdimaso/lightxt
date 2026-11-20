@@ -151,7 +151,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     private let progressIndicator = NSProgressIndicator()
     private let scrollView = NSScrollView()
     private let tableView = LighTxtCSVTableView()
-    private let queryLoadingOverlay = CSVQueryLoadingOverlayView()
+    private let analysisBar = CSVAnalysisBar()
+    private let queryLoadingOverlay = TabularQueryLoadingOverlayView(
+        title: "Filtering", accessibilityLabel: "Updating table results", preferredWidth: 430
+    )
 
     private var snapshot: DocumentSnapshot?
     private var rowIndex: CSVRowIndex?
@@ -223,6 +226,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         super.init(frame: frameRect)
         configureControls()
         configureTable()
+        configureAnalysis()
         configureLayout()
         applyAppearance()
     }
@@ -907,8 +911,53 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         scrollView.tile()
     }
 
+    private func configureAnalysis() {
+        analysisBar.physicalColumn = { [weak self] in self?.dataColumn(forTableColumnIndex: $0) }
+        tableView.canBeginSelection = { [weak self] in
+            guard let self else { return false }
+            return !self.isEditingRegistered || self.commitPendingEdit()
+        }
+        tableView.activateCell = { [weak self] cell in
+            guard let self, let field = self.tableView.view(atColumn: cell.column, row: cell.row,
+                makeIfNecessary: true) as? CSVEditableTextField, field.isEditable else { return false }
+            field.selectText(nil)
+            return field.currentEditor() != nil
+        }
+        tableView.cellFocusChanged = { [weak self] in
+            guard let self else { return }
+            if let cell = self.tableView.focusCell, let column = self.dataColumn(forTableColumnIndex: cell.column) {
+                self.focusedDataColumn = column
+            }
+            self.publishPosition()
+        }
+        analysisBar.connect(tableView)
+        tableView.cellMode = true
+        analysisBar.source = { [weak self] forPivot in
+            guard let self, let snapshot = self.snapshot, let index = self.rowIndex,
+                  !self.isTableOperationInFlight, !self.isQueryLoadingOverlayVisible,
+                  !self.isEditingRegistered || self.commitPendingEdit() else {
+                throw CSVAnalysisError("Finish the current table operation before analyzing cells.")
+            }
+            guard !forPivot || index.progress.isComplete else {
+                throw CSVAnalysisError("PivotViz will be available when row indexing finishes.")
+            }
+            let fields = self.tableView.tableColumns.compactMap { column -> CSVAnalysisField? in
+                self.dataColumn(for: column).map { CSVAnalysisField(id: $0, name: column.title) }
+            }
+            guard !fields.isEmpty else { throw CSVAnalysisError("There are no CSV columns to analyze.") }
+            let first: Int64 = self.firstRowIsHeader ? 1 : 0
+            let filters = self.coreFilters(from: self.publishedFilters)
+            let map = forPivot ? nil : self.displayedRowMap
+            return CSVAnalysisBar.Source(title: self.window?.title ?? "CSV", fields: fields,
+                rowCount: Int64(self.numberOfRows(in: self.tableView))) { columns, rows, visit in
+                try CSVAnalysisReader.read(snapshot: snapshot, index: index, firstRecord: first,
+                    filters: filters, rowMap: map, rows: rows, columns: columns, visit: visit)
+            }
+        }
+    }
+
     private func configureLayout() {
-        [controls, scrollView, queryLoadingOverlay].forEach {
+        [controls, scrollView, queryLoadingOverlay, analysisBar].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             addSubview($0)
         }
@@ -961,7 +1010,11 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: controls.bottomAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: analysisBar.topAnchor),
+            analysisBar.leadingAnchor.constraint(equalTo: leadingAnchor),
+            analysisBar.trailingAnchor.constraint(equalTo: trailingAnchor),
+            analysisBar.bottomAnchor.constraint(equalTo: bottomAnchor),
+            analysisBar.heightAnchor.constraint(equalToConstant: 34),
 
             queryLoadingOverlay.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
             queryLoadingOverlay.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
@@ -1388,7 +1441,12 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         return match.overlaps(field)
     }
 
+    func tableView(_ tableView: NSTableView, shouldReorderColumn columnIndex: Int, toColumn newColumnIndex: Int) -> Bool {
+        columnIndex != 0 && newColumnIndex != 0
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
+        tableView.synchronizeRowSelection()
         if let column = dataColumn(forTableColumnIndex: tableView.clickedColumn) {
             focusedDataColumn = column
         }
@@ -1397,7 +1455,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     private func publishPosition() {
         onPositionChange?(
-            Int64(max(0, tableView.selectedRow + 1)),
+            Int64(max(0, (tableView.focusCell?.row ?? tableView.selectedRow) + 1)),
             tableView.selectedRowIndexes.count,
             tableView.numberOfRows
         )
@@ -1532,11 +1590,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         tableView.reloadData()
         publishPosition()
         let rowCount = numberOfRows(in: tableView)
-        var validSelection = IndexSet()
-        for row in selection where row >= 0 && row < rowCount {
-            validSelection.insert(row)
+        let validSelection = selection.intersection(IndexSet(integersIn: 0..<rowCount))
+        if tableView.selectedRowIndexes != validSelection {
+            tableView.selectRowIndexes(validSelection, byExtendingSelection: false)
         }
-        tableView.selectRowIndexes(validSelection, byExtendingSelection: false)
     }
 
     private func schedulePageDecode(
@@ -1730,6 +1787,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         editedRecord: Int64
     ) {
         dismissValueInspector()
+        analysisBar.reset()
         let needsProjectionRefresh = !activeFilters.isEmpty || activeSort != nil
         if needsProjectionRefresh {
             // Never expose a row map computed from the pre-edit snapshot. The
@@ -1908,6 +1966,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     private func rowMenu(forTableColumn tableColumn: Int, row: Int) -> NSMenu? {
         let isExistingRow = row >= 0 && row < tableView.numberOfRows
         if !isExistingRow {
+            tableView.clearCellRange()
             tableView.deselectAll(nil)
             let menu = NSMenu(title: "CSV Table")
             let addRow = menuItem(
@@ -1915,6 +1974,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                 symbol: "plus.rectangle.on.rectangle",
                 action: #selector(addRowBelow(_:))
             )
+            addRow.representedObject = IndexSet()
             addRow.isEnabled = canStartDatasetMutation
             menu.addItem(addRow)
             if columnCount == 0 {
@@ -1929,12 +1989,17 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             return menu
         }
         if !tableView.selectedRowIndexes.contains(row) {
-            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            let cell = CSVRangeTableView.Cell(row: row, column: tableColumn)
+            if dataColumn(forTableColumnIndex: tableColumn) != nil {
+                if !tableView.includesCell(cell) { tableView.selectCell(cell, extending: false) }
+            } else {
+                tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            }
         }
         if let column = dataColumn(forTableColumnIndex: tableColumn) {
             focusedDataColumn = column
         }
-        let selectedRows = selectedVisibleRows()
+        let selectedRows = tableView.selectedRowIndexes.isEmpty ? IndexSet(integer: row) : tableView.selectedRowIndexes
         let menu = NSMenu(title: "CSV Row")
         if let column = dataColumn(forTableColumnIndex: tableColumn) {
             let inspect = menuItem("Inspect Value…", symbol: "text.magnifyingglass", action: #selector(inspectValueFromMenu(_:)))
@@ -1951,6 +2016,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             symbol: "arrow.up.to.line.compact",
             action: #selector(addRowAbove(_:))
         )
+        above.representedObject = selectedRows
         above.isEnabled = canStartDatasetMutation
         menu.addItem(above)
         let below = menuItem(
@@ -1958,6 +2024,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             symbol: "arrow.down.to.line.compact",
             action: #selector(addRowBelow(_:))
         )
+        below.representedObject = selectedRows
         below.isEnabled = canStartDatasetMutation
         menu.addItem(below)
         menu.addItem(.separator())
@@ -1969,6 +2036,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
             symbol: "trash",
             action: #selector(deleteSelectedRows(_:))
         )
+        deleteRows.representedObject = selectedRows
         deleteRows.isEnabled = canStartDatasetMutation && !selectedRows.isEmpty
         menu.addItem(deleteRows)
         return menu
@@ -2045,14 +2113,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         return item
     }
 
-    private var currentColumnTitle: String {
-        guard columnCount > 0 else { return "" }
-        let column = min(max(0, focusedDataColumn), columnCount - 1)
-        return tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
-    }
-
-    private func selectedVisibleRows() -> IndexSet {
+    private func selectedVisibleRows(_ sender: Any?) -> IndexSet {
+        if let rows = (sender as? NSMenuItem)?.representedObject as? IndexSet { return rows }
         if !tableView.selectedRowIndexes.isEmpty { return tableView.selectedRowIndexes }
+        if let cell = tableView.focusCell { return IndexSet(integer: cell.row) }
         guard tableView.clickedRow >= 0 else { return [] }
         return IndexSet(integer: tableView.clickedRow)
     }
@@ -2155,7 +2219,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         guard guardDatasetMutationAvailable() else { return }
         do {
             let sourceRecord: Int64
-            if let selected = selectedVisibleRows().first {
+            if let selected = selectedVisibleRows(sender).first {
                 sourceRecord = try self.sourceRecord(forDisplayedRow: Int64(selected))
             } else {
                 sourceRecord = firstRowIsHeader ? 1 : 0
@@ -2170,7 +2234,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         guard guardDatasetMutationAvailable() else { return }
         do {
             let sourceRecord: Int64
-            if let selected = selectedVisibleRows().last {
+            if let selected = selectedVisibleRows(sender).last {
                 sourceRecord = try self.sourceRecord(forDisplayedRow: Int64(selected)) + 1
             } else {
                 sourceRecord = latestProgress?.totalRecordCount
@@ -2200,7 +2264,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     @objc private func deleteSelectedRows(_ sender: Any?) {
         guard guardDatasetMutationAvailable() else { return }
-        let rows = selectedVisibleRows()
+        let rows = selectedVisibleRows(sender)
         guard !rows.isEmpty else { return }
         guard rows.count <= Self.maximumSelectedRowMutationCount else {
             let message = "Row deletion is limited to \(Self.maximumSelectedRowMutationCount.formatted()) selected rows at a time."
@@ -2326,14 +2390,10 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
     private func commitInlineContainsFilter(column: Int, value: String) {
         let current = activeFilters[column] ?? CSVFilterDraft(
-            predicate: .contains,
-            value: "",
-            isCaseSensitive: false
+            value: ""
         )
         commitFilterDraft(CSVFilterDraft(
-            predicate: .contains,
             value: value,
-            isCaseSensitive: false,
             selectedValues: current.selectedValues
         ), for: column)
     }
@@ -2559,15 +2619,6 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         )
     }
 
-    private func dismissPopover(containing controller: NSViewController?) {
-        guard let controller, presentedPopover?.contentViewController === controller else { return }
-        cancelUniqueValueRequest()
-        cancelColumnSummaryRequest()
-        presentedPopover?.close()
-        presentedPopover = nil
-        presentedPopoverAnchor = nil
-    }
-
     func popoverDidClose(_ notification: Notification) {
         if notification.object as? NSPopover === presentedPopover {
             presentedPopover = nil
@@ -2588,6 +2639,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     private func requestApplyQuery() {
+        analysisBar.reset()
         // Filter controls have their own committed/draft lifecycle. Ending all
         // window editing here would steal focus from a popover or inline
         // search field shortly after the user typed the first characters.
@@ -2763,16 +2815,17 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         restoreTableStatus()
     }
 
-    private func coreFilters(excluding excludedColumn: Int? = nil) -> [CSVColumnFilter] {
-        activeFilters.keys.sorted().compactMap { column -> CSVColumnFilter? in
+    private func coreFilters(excluding excludedColumn: Int? = nil, from projection: [Int: CSVFilterDraft]? = nil) -> [CSVColumnFilter] {
+        let filters = projection ?? activeFilters
+        return filters.keys.sorted().compactMap { column -> CSVColumnFilter? in
             guard column != excludedColumn,
-                  let draft = activeFilters[column],
+                  let draft = filters[column],
                   !draft.isEmpty else { return nil }
             return CSVColumnFilter(
                 column: column,
                 containsText: draft.value,
                 selectedValues: draft.selectedValues,
-                containsCaseSensitive: draft.isCaseSensitive,
+                containsCaseSensitive: false,
                 selectedValuesCaseSensitive: true
             )
         }
@@ -2810,6 +2863,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     private func cancelQueryAndCloseRowMap() {
+        analysisBar.reset()
         queryGeneration &+= 1
         queryCancellation?.cancel()
         queryCancellation = nil
@@ -3337,9 +3391,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     func qaApplyContainsFilter(column: Int, value: String) {
         guard column >= 0, column < columnCount else { return }
         activeFilters[column] = CSVFilterDraft(
-            predicate: .contains,
-            value: value,
-            isCaseSensitive: false
+            value: value
         )
         updateFilterChrome()
         requestApplyQuery()
@@ -3916,6 +3968,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
         // Export scope is row-based in the shared accessory. Always preserve
         // the complete presented schema, matching Parquet table export.
         let columns = Array(0..<columnCount)
+        let columnSet = Set(columns)
         let columnNames = columns.map { column in
             tableColumn(forDataColumn: column)?.title ?? spreadsheetColumnName(column)
         }
@@ -4004,7 +4057,7 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
                     let selected = try CSVRecordParser.selectedFields(
                         snapshot: snapshot,
                         location: location,
-                        columns: Set(columns),
+                        columns: columnSet,
                         delimiter: rowIndex.delimiter,
                         maximumValueBytesPerField: 4 << 20,
                         maximumRetainedValueBytes: 16 << 20,
@@ -4032,57 +4085,39 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
 
                 do {
                     if let selectedDisplayedRows {
-                        // Iterate the existing compact IndexSet and translate
-                        // filtered/sorted rows in bounded pages. Do not build a
-                        // second O(selection) source-record array.
-                        for contiguous in selectedDisplayedRows.rangeView {
-                            var displayed = Int64(contiguous.lowerBound)
-                            let upper = Int64(contiguous.upperBound)
-                            while displayed < upper {
-                                if cancellation.isCancelled { throw CancellationError() }
-                                let pageUpper = min(upper, displayed + 4_096)
+                        for range in selectedDisplayedRows.rangeView {
+                            var lower = Int64(range.lowerBound)
+                            while lower < Int64(range.upperBound) {
+                                let upper = lower + min(4_096, Int64(range.upperBound) - lower)
+                                let locations: [CSVRowIndex.RecordLocation]
                                 if let displayedMap {
-                                    let records = try displayedMap.records(in: displayed..<pageUpper)
-                                    for record in records {
-                                        guard let location = try rowIndex.recordLocation(
-                                            forRecord: record,
-                                            cancellation: { cancellation.isCancelled }
-                                        ) else { continue }
-                                        try append(location: location)
-                                    }
+                                    let records = try displayedMap.records(in: lower..<upper)
+                                    locations = try rowIndex.recordLocations(
+                                        forRecords: records, cancellation: { cancellation.isCancelled }
+                                    )
                                 } else {
-                                    var row = displayed
-                                    while row < pageUpper {
-                                        guard let location = try rowIndex.recordLocation(
-                                            forRecord: row + firstRecord,
-                                            cancellation: { cancellation.isCancelled }
-                                        ) else {
-                                            row += 1
-                                            continue
-                                        }
-                                        try append(location: location)
-                                        row += 1
-                                    }
+                                    locations = try rowIndex.recordLocations(
+                                        startingAt: lower + firstRecord, limit: Int(upper - lower),
+                                        cancellation: { cancellation.isCancelled }
+                                    )
                                 }
-                                displayed = pageUpper
+                                guard locations.count == Int(upper - lower) else {
+                                    throw CSVRowIndex.IndexError.inconsistentCheckpointData
+                                }
+                                for location in locations { try append(location: location) }
+                                lower = upper
                             }
                         }
                     } else if let displayedMap {
-                        var offset: Int64 = 0
-                        while offset < displayedMap.rowCount {
-                            if cancellation.isCancelled { throw CancellationError() }
-                            let records = try displayedMap.records(
-                                in: offset..<min(displayedMap.rowCount, offset + 4_096)
+                        var lower: Int64 = 0
+                        while lower < displayedMap.rowCount {
+                            let upper = lower + min(4_096, displayedMap.rowCount - lower)
+                            let records = try displayedMap.records(in: lower..<upper)
+                            let locations = try rowIndex.recordLocations(
+                                forRecords: records, cancellation: { cancellation.isCancelled }
                             )
-                            guard !records.isEmpty else { break }
-                            for record in records {
-                                guard let location = try rowIndex.recordLocation(
-                                    forRecord: record,
-                                    cancellation: { cancellation.isCancelled }
-                                ) else { continue }
-                                try append(location: location)
-                            }
-                            offset += Int64(records.count)
+                            for location in locations { try append(location: location) }
+                            lower = upper
                         }
                     } else {
                         var record = firstRecord
@@ -4205,292 +4240,6 @@ final class CSVTableView: NSView, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 }
 
-@MainActor
-private final class CSVQueryLoadingOverlayView: NSView {
-    var blocksInteraction = false
-
-    private let card = NSVisualEffectView()
-    private let indicator = CSVQueryLoadingIndicatorView()
-    private let titleLabel = NSTextField(labelWithString: "Filtering")
-    private let detailLabel = NSTextField(labelWithString: "")
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        setAccessibilityElement(true)
-        setAccessibilityRole(.progressIndicator)
-        setAccessibilityLabel("Updating table results")
-
-        card.material = .popover
-        card.blendingMode = .withinWindow
-        card.state = .active
-        card.wantsLayer = true
-        card.layer?.cornerRadius = 16
-        card.layer?.masksToBounds = true
-
-        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        titleLabel.lineBreakMode = .byTruncatingTail
-        detailLabel.font = .systemFont(ofSize: 12.5, weight: .regular)
-        detailLabel.lineBreakMode = .byTruncatingTail
-        detailLabel.maximumNumberOfLines = 2
-
-        addSubview(card)
-        [indicator, titleLabel, detailLabel].forEach { card.addSubview($0) }
-        [card, indicator, titleLabel, detailLabel].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-        }
-
-        let preferredWidth = card.widthAnchor.constraint(equalToConstant: 430)
-        preferredWidth.priority = .defaultHigh
-        NSLayoutConstraint.activate([
-            card.centerXAnchor.constraint(equalTo: centerXAnchor),
-            card.centerYAnchor.constraint(equalTo: centerYAnchor),
-            card.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 24),
-            card.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -24),
-            card.widthAnchor.constraint(greaterThanOrEqualToConstant: 340),
-            preferredWidth,
-            card.heightAnchor.constraint(equalToConstant: 112),
-
-            indicator.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 24),
-            indicator.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            indicator.widthAnchor.constraint(equalToConstant: 104),
-            indicator.heightAnchor.constraint(equalToConstant: 64),
-
-            titleLabel.leadingAnchor.constraint(equalTo: indicator.trailingAnchor, constant: 20),
-            titleLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -24),
-            titleLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 27),
-            detailLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            detailLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-            detailLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 7),
-            detailLabel.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor, constant: -22),
-        ])
-        applyResolvedAppearance()
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyResolvedAppearance()
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        blocksInteraction ? super.hitTest(point) : nil
-    }
-
-    func update(title: String, detail: String, progress: Double?) {
-        titleLabel.stringValue = title
-        detailLabel.stringValue = detail
-        indicator.progress = progress
-        setAccessibilityLabel(title)
-        setAccessibilityHelp(detail)
-        setAccessibilityValue(progress.map { Int(min(1, max(0, $0)) * 100) })
-    }
-
-    func startAnimating() {
-        indicator.startAnimating()
-    }
-
-    func stopAnimating() {
-        indicator.stopAnimating()
-    }
-
-    private func applyResolvedAppearance() {
-        let appearance = effectiveAppearance
-        let background = LighTxtTheme.resolved(LighTxtTheme.editorBackground, for: appearance)
-        let primary = LighTxtTheme.resolved(LighTxtTheme.primaryText, for: appearance)
-        let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
-        let separator = LighTxtTheme.resolved(LighTxtTheme.separator, for: appearance)
-        layer?.backgroundColor = background.withAlphaComponent(0.46).cgColor
-        card.layer?.borderColor = separator.withAlphaComponent(0.48).cgColor
-        card.layer?.borderWidth = 1
-        titleLabel.textColor = primary
-        detailLabel.textColor = secondary
-        indicator.applyResolvedAppearance()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-}
-
-/// Rows drift beneath a scanning beam; matching cells pulse as the projected
-/// row map is assembled. It is intentionally table-shaped rather than a
-/// generic spinner so the animation explains the work without extra copy.
-@MainActor
-private final class CSVQueryLoadingIndicatorView: NSView {
-    var progress: Double? {
-        didSet {
-            if let progress {
-                setAccessibilityValue(Int(min(1, max(0, progress)) * 100))
-            } else {
-                setAccessibilityValue(nil)
-            }
-            positionStaticScannerIfNeeded()
-        }
-    }
-
-    private let viewportLayer = CALayer()
-    private let outlineLayer = CAShapeLayer()
-    private let scannerLayer = CAGradientLayer()
-    private var cellLayers: [CALayer] = []
-    private let highlightedCells: Set<Int> = [2, 6, 13, 17]
-    private var isAnimating = false
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        setAccessibilityElement(false)
-
-        viewportLayer.masksToBounds = true
-        viewportLayer.cornerRadius = 8
-        layer?.addSublayer(viewportLayer)
-
-        outlineLayer.fillColor = NSColor.clear.cgColor
-        outlineLayer.lineWidth = 1
-        viewportLayer.addSublayer(outlineLayer)
-
-        for _ in 0..<20 {
-            let cell = CALayer()
-            cell.cornerRadius = 2.5
-            cellLayers.append(cell)
-            viewportLayer.addSublayer(cell)
-        }
-
-        scannerLayer.startPoint = CGPoint(x: 0, y: 0.5)
-        scannerLayer.endPoint = CGPoint(x: 1, y: 0.5)
-        scannerLayer.locations = [0, 0.48, 0.52, 1]
-        viewportLayer.addSublayer(scannerLayer)
-        progress = nil
-        applyResolvedAppearance()
-    }
-
-    override func layout() {
-        super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        viewportLayer.frame = bounds.insetBy(dx: 2, dy: 4)
-        outlineLayer.frame = viewportLayer.bounds
-        outlineLayer.path = CGPath(
-            roundedRect: viewportLayer.bounds.insetBy(dx: 0.5, dy: 0.5),
-            cornerWidth: 8,
-            cornerHeight: 8,
-            transform: nil
-        )
-
-        let horizontalInset: CGFloat = 8
-        let verticalInset: CGFloat = 7
-        let columnGap: CGFloat = 4
-        let rowGap: CGFloat = 6
-        let columns: CGFloat = 5
-        let rows: CGFloat = 4
-        let cellWidth = max(
-            4,
-            (viewportLayer.bounds.width - horizontalInset * 2 - columnGap * (columns - 1)) / columns
-        )
-        let cellHeight = max(
-            4,
-            (viewportLayer.bounds.height - verticalInset * 2 - rowGap * (rows - 1)) / rows
-        )
-        for (index, cell) in cellLayers.enumerated() {
-            let row = CGFloat(index / 5)
-            let column = CGFloat(index % 5)
-            cell.frame = CGRect(
-                x: horizontalInset + column * (cellWidth + columnGap),
-                y: verticalInset + row * (cellHeight + rowGap),
-                width: cellWidth,
-                height: cellHeight
-            )
-        }
-        scannerLayer.frame = CGRect(
-            x: -34,
-            y: 1,
-            width: 34,
-            height: max(0, viewportLayer.bounds.height - 2)
-        )
-        CATransaction.commit()
-        positionStaticScannerIfNeeded()
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyResolvedAppearance()
-    }
-
-    func applyResolvedAppearance() {
-        let appearance = effectiveAppearance
-        let accent = LighTxtTheme.resolved(LighTxtTheme.accent, for: appearance)
-        let secondary = LighTxtTheme.resolved(LighTxtTheme.secondaryText, for: appearance)
-        viewportLayer.backgroundColor = secondary.withAlphaComponent(0.055).cgColor
-        outlineLayer.strokeColor = secondary.withAlphaComponent(0.24).cgColor
-        for (index, cell) in cellLayers.enumerated() {
-            cell.backgroundColor = (highlightedCells.contains(index) ? accent : secondary)
-                .withAlphaComponent(highlightedCells.contains(index) ? 0.92 : 0.25)
-                .cgColor
-        }
-        scannerLayer.colors = [
-            accent.withAlphaComponent(0).cgColor,
-            accent.withAlphaComponent(0.08).cgColor,
-            accent.withAlphaComponent(0.72).cgColor,
-            accent.withAlphaComponent(0).cgColor,
-        ]
-    }
-
-    func startAnimating() {
-        guard !isAnimating else { return }
-        isAnimating = true
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
-            positionStaticScannerIfNeeded()
-            return
-        }
-        layoutSubtreeIfNeeded()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        scannerLayer.setAffineTransform(.identity)
-        CATransaction.commit()
-
-        let scan = CABasicAnimation(keyPath: "transform.translation.x")
-        scan.fromValue = 0
-        scan.toValue = viewportLayer.bounds.width + 68
-        scan.duration = 1.18
-        scan.repeatCount = .infinity
-        scan.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        scannerLayer.add(scan, forKey: "csv.queryScan")
-
-        for (order, index) in highlightedCells.sorted().enumerated() {
-            let pulse = CAKeyframeAnimation(keyPath: "opacity")
-            pulse.values = [0.42, 1, 0.42]
-            pulse.keyTimes = [0, 0.48, 1]
-            pulse.duration = 1.25
-            pulse.beginTime = CACurrentMediaTime() + Double(order) * 0.14
-            pulse.repeatCount = .infinity
-            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            cellLayers[index].add(pulse, forKey: "csv.matchPulse")
-        }
-    }
-
-    func stopAnimating() {
-        isAnimating = false
-        scannerLayer.removeAllAnimations()
-        cellLayers.forEach { $0.removeAllAnimations() }
-    }
-
-    private func positionStaticScannerIfNeeded() {
-        guard NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
-        let fraction = CGFloat(min(1, max(0, progress ?? 0.5)))
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        scannerLayer.setAffineTransform(
-            CGAffineTransform(translationX: fraction * (viewportLayer.bounds.width + 34), y: 0)
-        )
-        CATransaction.commit()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-}
-
 private enum CSVCellSearchHighlight: Equatable {
     case none
     case match
@@ -4530,56 +4279,8 @@ private final class CSVEditableTextField: NSTextField {
 #endif
 
 struct CSVFilterDraft: Equatable {
-    enum Predicate: Int, CaseIterable {
-        case contains
-        case equals
-        case doesNotEqual
-        case startsWith
-        case endsWith
-        case isEmpty
-        case isNotEmpty
-        case greaterThan
-        case lessThan
-
-        var title: String {
-            switch self {
-            case .contains: "Contains"
-            case .equals: "Equals"
-            case .doesNotEqual: "Does Not Equal"
-            case .startsWith: "Starts With"
-            case .endsWith: "Ends With"
-            case .isEmpty: "Is Empty"
-            case .isNotEmpty: "Is Not Empty"
-            case .greaterThan: "Greater Than"
-            case .lessThan: "Less Than"
-            }
-        }
-
-        var needsValue: Bool {
-            self != .isEmpty && self != .isNotEmpty
-        }
-
-        var needsNumber: Bool {
-            self == .greaterThan || self == .lessThan
-        }
-    }
-
-    var predicate: Predicate
     var value: String
-    var isCaseSensitive: Bool
-    var selectedValues: Set<String>
-
-    init(
-        predicate: Predicate,
-        value: String,
-        isCaseSensitive: Bool,
-        selectedValues: Set<String> = []
-    ) {
-        self.predicate = predicate
-        self.value = value
-        self.isCaseSensitive = isCaseSensitive
-        self.selectedValues = selectedValues
-    }
+    var selectedValues: Set<String> = []
 
     var isEmpty: Bool { value.isEmpty && selectedValues.isEmpty }
 
@@ -4644,9 +4345,7 @@ final class CSVFilterPopoverViewController: NSViewController,
         self.columnTitle = columnTitle
         self.valueDisplayProvider = valueDisplayProvider
         self.committedFilter = filter ?? CSVFilterDraft(
-            predicate: .contains,
-            value: "",
-            isCaseSensitive: false
+            value: ""
         )
         super.init(nibName: nil, bundle: nil)
         preferredContentSize = NSSize(width: 350, height: 390)
@@ -4902,9 +4601,7 @@ final class CSVFilterPopoverViewController: NSViewController,
 
     private func commitTypedValue() {
         let next = CSVFilterDraft(
-            predicate: .contains,
             value: valueField.stringValue,
-            isCaseSensitive: false,
             selectedValues: committedFilter.selectedValues
         )
         guard next != committedFilter else { return }
@@ -4926,9 +4623,7 @@ final class CSVFilterPopoverViewController: NSViewController,
 
     @objc private func clear(_ sender: Any?) {
         committedFilter = CSVFilterDraft(
-            predicate: .contains,
-            value: "",
-            isCaseSensitive: false
+            value: ""
         )
         valueField.stringValue = ""
         clearButton.isEnabled = false
@@ -5940,7 +5635,7 @@ final class LighTxtCSVHeaderView: NSTableHeaderView, NSSearchFieldDelegate {
 }
 
 @MainActor
-final class LighTxtCSVTableView: NSTableView {
+final class LighTxtCSVTableView: CSVRangeTableView {
     var bodyMenuProvider: ((Int, Int) -> NSMenu?)?
     var inspectValueProvider: ((Int, Int) -> Bool)?
     private var lastFocusedColumn = -1
@@ -5952,8 +5647,10 @@ final class LighTxtCSVTableView: NSTableView {
     }
 
     override func keyDown(with event: NSEvent) {
-        if TabularValueInspector.isInspectShortcut(event), selectedRow >= 0,
-           inspectValueProvider?(selectedColumn >= 0 ? selectedColumn : lastFocusedColumn, selectedRow) == true {
+        let row = focusCell?.row ?? selectedRow
+        let column = focusCell?.column ?? (selectedColumn >= 0 ? selectedColumn : lastFocusedColumn)
+        if TabularValueInspector.isInspectShortcut(event), row >= 0,
+           inspectValueProvider?(column, row) == true {
             return
         }
         super.keyDown(with: event)

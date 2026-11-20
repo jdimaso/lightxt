@@ -20,6 +20,7 @@ protocol VirtualTextEditorDelegate: AnyObject {
     var editorDocumentByteCount: Int64 { get }
     var editorSyntaxFileType: SyntaxFileType { get }
     var editorCSVDelimiter: UInt8 { get }
+    var editorAllowsTextMutation: Bool { get }
 
     func editorSnapshot() throws -> DocumentSnapshot
     func editorReadBytes(in range: Range<Int64>) throws -> Data
@@ -39,6 +40,7 @@ protocol VirtualTextEditorDelegate: AnyObject {
 
 extension VirtualTextEditorDelegate {
     var editorCSVDelimiter: UInt8 { 0x2C }
+    var editorAllowsTextMutation: Bool { true }
 }
 
 private final class ViewportSyntaxCancellation: @unchecked Sendable {
@@ -233,6 +235,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
         didSet {
             if oldValue !== editorDelegate {
                 residentPurgeState = nil
+                selectionOutsideViewport = nil
                 rememberedHorizontalOffset = leadingHorizontalOrigin
                     ?? scrollView.contentView.bounds.minX
                 loadViewport(centeredAt: 0, preferredSelection: nil)
@@ -241,7 +244,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     }
 
     private let scrollView = NSScrollView()
-    private let textView = NSTextView(frame: .zero)
+    private let textView = DocumentSelectionTextView(frame: .zero)
     private let virtualScroller = LighTxtComfortScroller()
     private lazy var rulerView = ViewportLineNumberRuler(scrollView: scrollView, orientation: .verticalRuler)
 
@@ -259,6 +262,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     private var syntaxGeneration: UInt64 = 0
     private var fontSize: CGFloat = 13
     private var fontChoice = LighTxtEditorFontChoice.persisted()
+    fileprivate var selectionOutsideViewport: Range<Int64>?
     private var requestedSelectionAfterLoad: Range<Int64>?
     private var usesWrappedLongLineViewport = false
     private var appearanceTargetsConfigured = false
@@ -351,6 +355,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
 
     var selectedGlobalByteRange: Range<Int64> {
         if let residentPurgeState { return residentPurgeState.selection }
+        if let selectionOutsideViewport { return selectionOutsideViewport }
         return localUTF16RangeToGlobalBytes(textView.selectedRange())
             ?? viewportRange.lowerBound..<viewportRange.lowerBound
     }
@@ -472,15 +477,32 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
         let clampedUpper = max(clampedLower, min(byteRange.upperBound, total))
         let clamped = clampedLower..<clampedUpper
 
-        if viewportRange.contains(clampedLower), clampedUpper <= viewportRange.upperBound {
-            selectGlobalByteRange(clamped, scroll: true)
+        if viewportRange.lowerBound <= clampedLower, clampedUpper <= viewportRange.upperBound {
+            if select {
+                selectGlobalByteRange(clamped, scroll: true)
+            } else {
+                scrollGlobalByteOffset(clampedLower, verticalFraction: 0.5)
+            }
         } else {
             loadViewport(centeredAt: clampedLower, preferredSelection: select ? clamped : nil)
         }
     }
 
+    func restoreRecoverySelection(_ selection: Range<Int64>, viewportByteOffset: Int64) {
+        scrollTo(byteRange: selection)
+        // Keep the insertion point when a distant saved viewport cannot fit
+        // in the same bounded TextKit window.
+        if viewportRange.lowerBound <= viewportByteOffset, viewportByteOffset <= viewportRange.upperBound {
+            scrollGlobalByteOffset(viewportByteOffset, screenOffset: 0, horizontalOffset: rememberedHorizontalOffset)
+        }
+        // A programmatic scroll near a window edge can queue a second load
+        // centered on that edge, which would displace the restored caret.
+        reloadWork?.cancel()
+    }
+
     func useSelectionForFind() -> String? {
         reactivateAfterResidentPurge()
+        guard selectionOutsideViewport == nil else { return nil }
         let range = textView.selectedRange()
         guard range.length > 0, range.length <= 16_384 else { return nil }
         return (textView.string as NSString).substring(with: range)
@@ -493,15 +515,6 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
 
     func changeFontSize(by delta: CGFloat) { setFontSize(fontSize + delta) }
     func resetFontSize() { setFontSize(13) }
-
-    func undoCoreEdit() {
-        // Routed by the owning document session, which has byte-coordinate
-        // history independent of whichever viewport is currently materialized.
-        nextResponder?.tryToPerform(
-            #selector(LighTxtEditorViewController.undoDocumentEdit(_:)),
-            with: self
-        )
-    }
 
     /// Releases only the bounded viewport's copied UTF-8/UTF-16 text, syntax
     /// decorations, and TextKit glyph/layout storage. Every accepted edit has
@@ -562,6 +575,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
 
     private func configureTextSystem() {
         let appearance = effectiveAppearance
+        textView.virtualEditor = self
         textView.delegate = self
         textView.isRichText = false
         textView.importsGraphics = false
@@ -797,7 +811,9 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
 
         let total = max(0, delegate.editorDocumentByteCount)
         let center = min(max(0, requestedOffset), total)
-        let capacity = Int64(Self.maximumViewportBytes)
+        // Keep typing headroom even when the original file fills the window.
+        let capacity = Int64(total > Self.maximumViewportBytes
+            ? Self.maximumViewportBytes - 16 * 1_024 : Self.maximumViewportBytes)
         var lower = max(0, center - capacity / 2)
         var upper = min(total, lower + capacity)
         lower = max(0, upper - capacity)
@@ -819,7 +835,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             // retain one such graphics allocation after every virtual jump. Keep
             // the large viewport for normal line-oriented files, but page through
             // unusually long lines with a much smaller, still-editable window.
-            let longLineCapacity = Int64(Self.maximumUnbrokenLineViewportBytes)
+            let longLineCapacity = Int64(Self.maximumUnbrokenLineViewportBytes - 256)
             var usesLongLineViewport = false
             if bytes.count > Self.maximumUnbrokenLineViewportBytes,
                Self.containsUnbrokenLineLonger(
@@ -848,6 +864,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             let location = delegate.editorLineLocation(at: lower)
             viewportFirstLine = location.lineNumber
             viewportFirstLineStart = location.lineStartByteOffset
+            selectionOutsideViewport = nil
             requestedSelectionAfterLoad = preferredSelection
 
             isApplyingSnapshot = true
@@ -863,6 +880,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             rulerView.needsDisplay = true
             restoreRequestedSelectionOrCenter(center, preserving: anchor)
             isApplyingSnapshot = false
+            if preferredSelection != nil { updateSelectionStatus() }
             updateVirtualScroller(visibleOffset: center)
             delegate.editorDidLoadViewport(byteRange: viewportRange)
             delegate.editorDidExpose(byteRange: viewportRange)
@@ -939,10 +957,11 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     ) {
         if let selection = requestedSelectionAfterLoad {
             requestedSelectionAfterLoad = nil
-            let selectionIsVisible = viewportRange.lowerBound <= selection.lowerBound
-                && selection.upperBound <= viewportRange.upperBound
-            if selectionIsVisible {
-                selectGlobalByteRange(selection, scroll: anchor == nil)
+            let total = editorDelegate?.editorDocumentByteCount ?? 0
+            let clamped = selection.clamped(to: 0..<total)
+            if !clamped.isEmpty || viewportRange.lowerBound <= clamped.lowerBound
+                && clamped.upperBound <= viewportRange.upperBound {
+                selectGlobalByteRange(clamped, scroll: anchor == nil)
                 if let anchor { restore(anchor) }
                 return
             }
@@ -1019,8 +1038,10 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
     }
 
     private func selectGlobalByteRange(_ global: Range<Int64>, scroll: Bool) {
-        let lowerByte = Int(max(0, global.lowerBound - viewportRange.lowerBound))
-        let upperByte = Int(max(Int64(lowerByte), global.upperBound - viewportRange.lowerBound))
+        let visible = global.clamped(to: viewportRange)
+        selectionOutsideViewport = visible == global ? nil : global
+        let lowerByte = Int(visible.lowerBound - viewportRange.lowerBound)
+        let upperByte = Int(visible.upperBound - viewportRange.lowerBound)
         let lowerUTF16 = decoder.utf16Offset(forByteOffset: lowerByte, bias: .leading)
         let upperUTF16 = decoder.utf16Offset(forByteOffset: upperByte, bias: .trailing)
         let range = NSRange(location: lowerUTF16, length: max(0, upperUTF16 - lowerUTF16))
@@ -1039,18 +1060,95 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
         }
     }
 
+    // All unchanged lines in this layout already meet the limit. Only the
+    // inserted content and the two touching line fragments can exceed it.
+    private func editCreatesLongLine(replacing range: Range<Int>, with bytes: Data) -> Bool {
+        let limit = Self.maximumUnbrokenLineViewportBytes
+        guard sourceBytes.count - range.count + bytes.count > limit else { return false }
+        var lineLength = 0
+        var cursor = range.lowerBound
+        while cursor > 0, lineLength <= limit {
+            cursor -= 1
+            let byte = sourceBytes[cursor]
+            if byte == 0x0A || byte == 0x0D { break }
+            lineLength += 1
+        }
+        for byte in bytes {
+            if byte == 0x0A || byte == 0x0D {
+                lineLength = 0
+            } else {
+                lineLength += 1
+                if lineLength > limit { return true }
+            }
+        }
+        cursor = range.upperBound
+        while cursor < sourceBytes.count, lineLength <= limit {
+            let byte = sourceBytes[cursor]
+            if byte == 0x0A || byte == 0x0D { break }
+            lineLength += 1
+            cursor += 1
+        }
+        return lineLength > limit
+    }
+
+    fileprivate func selectEntireDocument() {
+        guard let delegate = editorDelegate else { return }
+        selectGlobalByteRange(0..<delegate.editorDocumentByteCount, scroll: false)
+        updateSelectionStatus()
+    }
+
+    fileprivate var canChangeSelectedText: Bool {
+        textView.isEditable && !isApplyingSnapshot && !isCommittingEdit && editorDelegate?.editorAllowsTextMutation == true
+    }
+
+    fileprivate func deleteExtendedSelection() -> Bool {
+        guard let range = selectionOutsideViewport, let delegate = editorDelegate else { return false }
+        guard canChangeSelectedText else { NSSound.beep(); return true }
+        do {
+            try delegate.editorReplaceBytes(in: range, with: Data())
+            selectionOutsideViewport = nil
+            delegate.editorDidCommitEdit(replaced: range, insertedByteCount: 0)
+            let caret = range.lowerBound
+            loadViewport(centeredAt: caret, preferredSelection: caret..<caret)
+        } catch {
+            delegate.editorDidFail(error)
+        }
+        return true
+    }
+
+    func transferExtendedSelection(cut: Bool, publish: (NSPasteboardItem) throws -> Void) -> Bool {
+        guard let range = selectionOutsideViewport, let delegate = editorDelegate else { return false }
+        guard !cut || canChangeSelectedText else { NSSound.beep(); return true }
+        do {
+            let snapshot = try delegate.editorSnapshot()
+            let item = NSPasteboardItem()
+            let provider = SelectionPasteboardProvider(snapshot: snapshot, range: range)
+            guard item.setDataProvider(provider, forTypes: [.string]) else { throw CocoaError(.fileWriteUnknown) }
+            try publish(item)
+            if cut, editorDelegate === delegate, selectionOutsideViewport == range,
+               try delegate.editorSnapshot().revision == snapshot.revision {
+                _ = deleteExtendedSelection()
+            }
+        } catch {
+            delegate.editorDidFail(error)
+        }
+        return true
+    }
+
     func textView(
         _ textView: NSTextView,
         shouldChangeTextIn affectedCharRange: NSRange,
         replacementString: String?
     ) -> Bool {
         guard !isApplyingSnapshot, !isCommittingEdit,
-              let globalRange = localUTF16RangeToGlobalBytes(affectedCharRange) else { return isApplyingSnapshot }
+              let localSelection = localUTF16RangeToGlobalBytes(affectedCharRange) else { return isApplyingSnapshot }
 
+        let globalRange = affectedCharRange == textView.selectedRange()
+            ? selectionOutsideViewport ?? localSelection : localSelection
         let replacement = replacementString ?? ""
         let replacementBytes = Data(replacement.utf8)
-        let localLower = Int(globalRange.lowerBound - viewportRange.lowerBound)
-        let localUpper = Int(globalRange.upperBound - viewportRange.lowerBound)
+        let localLower = Int(localSelection.lowerBound - viewportRange.lowerBound)
+        let localUpper = Int(localSelection.upperBound - viewportRange.lowerBound)
         let pending = PendingReplacement(
             localByteRange: localLower..<localUpper,
             globalByteRange: globalRange,
@@ -1064,16 +1162,22 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             let projectedViewportByteCount = sourceBytes.count
                 - pending.localByteRange.count
                 + replacementBytes.count
-            if projectedViewportByteCount > Self.maximumViewportBytes {
-                // A large paste belongs in the file-backed edit store, never
-                // in TextKit. The core mutation is already complete; veto the
-                // local insertion and repaint a bounded window around its end
-                // on the next run-loop turn.
+            let requiresReload = globalRange != localSelection
+                || projectedViewportByteCount > Self.maximumViewportBytes
+                || (usesWrappedLongLineViewport
+                    ? projectedViewportByteCount > Self.maximumUnbrokenLineViewportBytes
+                    : editCreatesLongLine(replacing: pending.localByteRange, with: replacementBytes))
+            if requiresReload {
+                // TextKit cannot represent this edit in its current window.
+                // Repaint after the delegate call unwinds.
+                selectionOutsideViewport = nil
                 let caret = globalRange.lowerBound + Int64(replacementBytes.count)
-                DispatchQueue.main.async { [weak self] in
+                let editingDelegate = editorDelegate
+                DispatchQueue.main.async { [weak self, weak editingDelegate] in
                     guard let self else { return }
                     self.isCommittingEdit = false
-                    self.editorDelegate?.editorDidCommitEdit(
+                    guard let editingDelegate, self.editorDelegate === editingDelegate else { return }
+                    editingDelegate.editorDidCommitEdit(
                         replaced: globalRange,
                         insertedByteCount: Int64(replacementBytes.count)
                     )
@@ -1085,6 +1189,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
                 return false
             }
 
+            selectionOutsideViewport = nil
             isCommittingEdit = false
             pendingReplacement = pending
             return true
@@ -1154,6 +1259,10 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
 
     @objc private func selectionChanged(_ notification: Notification) {
         guard !isApplyingSnapshot else { return }
+        if let selectionOutsideViewport,
+           localUTF16RangeToGlobalBytes(textView.selectedRange()) != selectionOutsideViewport.clamped(to: viewportRange) {
+            self.selectionOutsideViewport = nil
+        }
         textView.needsDisplay = true
         updateSelectionStatus()
     }
@@ -1235,7 +1344,7 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             fileType: editorDelegate.editorSyntaxFileType,
             limits: limits
         )
-        ViewportSyntaxWorker.queue.async {
+        ViewportSyntaxWorker.queue.async { [weak self] in
             guard let output = ViewportSyntaxWorker.analyze(input, cancellation: cancellation),
                   !cancellation.isCancelled else { return }
             DispatchQueue.main.async { [weak self] in
@@ -1434,8 +1543,13 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
             return
         }
 
+        let selection = selectionOutsideViewport
+        let anchor = selection.map { _ in
+            ViewportScrollAnchor(byteOffset: offset, screenOffset: scrollView.contentSize.height / 2,
+                                 horizontalOffset: rememberedHorizontalOffset)
+        }
         guard usesWrappedLongLineViewport else {
-            loadViewport(centeredAt: offset, preferredSelection: nil)
+            loadViewport(centeredAt: offset, preferredSelection: selection, preserving: anchor)
             return
         }
 
@@ -1445,10 +1559,124 @@ final class VirtualTextEditorView: NSView, NSTextViewDelegate {
         // materializing only the last requested destination.
         reloadWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            self?.loadViewport(centeredAt: offset, preferredSelection: nil)
+            self?.loadViewport(centeredAt: offset, preferredSelection: selection, preserving: anchor)
         }
         reloadWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+}
+
+/// Native text selection is limited to the materialized TextKit window.
+@MainActor
+private final class DocumentSelectionTextView: NSTextView {
+    weak var virtualEditor: VirtualTextEditorView?
+
+    override func selectAll(_ sender: Any?) {
+        guard let virtualEditor else { super.selectAll(sender); return }
+        virtualEditor.selectEntireDocument()
+    }
+
+    override func copy(_ sender: Any?) {
+        if !transferSelection(cut: false) { super.copy(sender) }
+    }
+
+    override func cut(_ sender: Any?) {
+        if !transferSelection(cut: true) { super.cut(sender) }
+    }
+
+    override func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if let editor = virtualEditor, editor.selectionOutsideViewport != nil {
+            switch item.action {
+            case #selector(NSText.copy(_:)): return true
+            case #selector(NSText.cut(_:)), #selector(NSText.delete(_:)): return editor.canChangeSelectedText
+            default: break
+            }
+        }
+        return super.validateMenuItem(item)
+    }
+
+    override func delete(_ sender: Any?) {
+        if virtualEditor?.deleteExtendedSelection() != true { super.delete(sender) }
+    }
+
+    override func deleteBackward(_ sender: Any?) {
+        if virtualEditor?.deleteExtendedSelection() != true { super.deleteBackward(sender) }
+    }
+
+    override func deleteForward(_ sender: Any?) {
+        if virtualEditor?.deleteExtendedSelection() != true { super.deleteForward(sender) }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // Clicking the same projected insertion point need not trigger an
+        // NSTextView selection notification. The click still cancels a
+        // prior off-screen selection before a subsequent destructive edit.
+        virtualEditor?.selectionOutsideViewport = nil
+        super.mouseDown(with: event)
+    }
+
+    override func moveLeft(_ sender: Any?) {
+        if !collapseExtendedSelection(toEnd: baseWritingDirection == .rightToLeft) { super.moveLeft(sender) }
+    }
+
+    override func moveRight(_ sender: Any?) {
+        if !collapseExtendedSelection(toEnd: baseWritingDirection != .rightToLeft) { super.moveRight(sender) }
+    }
+
+    private func collapseExtendedSelection(toEnd: Bool) -> Bool {
+        guard let editor = virtualEditor, let range = editor.selectionOutsideViewport else { return false }
+        let caret = toEnd ? range.upperBound : range.lowerBound
+        editor.scrollTo(byteRange: caret..<caret)
+        return true
+    }
+
+    private func transferSelection(cut: Bool) -> Bool {
+        virtualEditor?.transferExtendedSelection(cut: cut) { item in
+            let board = NSPasteboard.general
+            board.clearContents()
+            guard board.writeObjects([item]) else { throw CocoaError(.fileWriteUnknown) }
+        } ?? false
+    }
+}
+
+/// Keep the immutable revision alive across Cut, later edits and window close.
+/// The pasteboard requests its UTF-8 payload only when a consumer needs it.
+private final class SelectionPasteboardProvider: NSObject, NSPasteboardItemDataProvider {
+    let snapshot: DocumentSnapshot
+    let range: Range<Int64>
+
+    init(snapshot: DocumentSnapshot, range: Range<Int64>) {
+        self.snapshot = snapshot
+        self.range = range
+    }
+
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
+        do {
+            let bytes = try clipboardData()
+            guard item.setData(bytes, forType: type) else { throw CocoaError(.fileWriteUnknown) }
+        } catch {
+            DispatchQueue.main.async { NSApp.presentError(error) }
+        }
+    }
+
+    private func clipboardData() throws -> Data {
+        let chunkSize: Int64 = 1 << 20
+        if range.count <= chunkSize { return try snapshot.data(in: range) }
+        let directory = FileManager.default.temporaryDirectory
+        let url = directory.appendingPathComponent("LighTxt-clipboard-" + UUID().uuidString)
+        guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        defer { try? FileManager.default.removeItem(at: url) }
+        let file = try FileHandle(forWritingTo: url)
+        defer { try? file.close() }
+        var offset = range.lowerBound
+        while offset < range.upperBound {
+            let end = offset + min(chunkSize, range.upperBound - offset)
+            try file.write(contentsOf: snapshot.data(in: offset..<end))
+            offset = end
+        }
+        return try Data(contentsOf: url, options: .alwaysMapped)
     }
 }
 
@@ -1718,13 +1946,5 @@ private struct ViewportUTF8Map: Sendable {
         guard (0x80...0xBF).contains(fourth) else { return (0xFFFD, 3) }
         scalar = (scalar << 6) | UInt32(fourth & 0x3F)
         return (scalar, 4)
-    }
-}
-
-private extension Int {
-    init(clamping value: Int64) {
-        if value > Int64(Int.max) { self = Int.max }
-        else if value < Int64(Int.min) { self = Int.min }
-        else { self = Int(value) }
     }
 }

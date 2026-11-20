@@ -275,6 +275,58 @@ public nonisolated final class DocumentSnapshot: @unchecked Sendable {
         try visit(root, documentOffset: 0)
     }
 
+    var originalFile: (url: URL, fingerprint: FileFingerprint)? {
+        mappingKeeper.map { ($0.url, $0.fingerprint) }
+    }
+
+    /// A bulk rewrite already produced an immutable, unlinked file. On APFS
+    /// checkpoint that exact file by descriptor instead of writing it twice.
+    func cloneBulkRewriteForRecovery(to url: URL) throws -> MemoryMappedFile? {
+        guard let root, root.subtreePieceCount == 1,
+              case let .mapped(file) = root.piece.backing, file !== mappingKeeper,
+              root.piece.offset == 0, root.piece.length == file.byteCount else { return nil }
+        return try file.cloneForRecovery(to: url)
+    }
+
+    /// A pathname replacement leaves the retained descriptor readable.
+    /// An in-place write invalidates it even if the size is unchanged.
+    var originalFileIsUnavailable: Bool {
+        guard let mappingKeeper else { return false }
+        do {
+            try mappingKeeper.validateDescriptorFingerprint()
+            return false
+        } catch {
+            return true
+        }
+    }
+
+    /// Emits a recipe for this exact revision without touching the original
+    /// bytes. A bulk-rewrite mapping is independent local data, just like
+    /// ordinary inserted pieces and spilled additions.
+    func forEachLocalEditSegment(
+        original: (Range<Int64>) throws -> Void,
+        inserted: (UnsafeRawBufferPointer) throws -> Void
+    ) throws {
+        func visit(_ node: PieceNode?) throws {
+            guard let node else { return }
+            try visit(node.left)
+            let piece = node.piece
+            let end = piece.offset + piece.length
+            if case let .mapped(mapping) = piece.backing, mapping === mappingKeeper {
+                try original(piece.offset..<end)
+            } else {
+                var start = piece.offset
+                while start < end {
+                    let next = start + min(64 << 10, end - start)
+                    try piece.backing.withUnsafeBytes(in: start..<next, inserted)
+                    start = next
+                }
+            }
+            try visit(node.right)
+        }
+        try visit(root)
+    }
+
     /// Copies a bounded range for UI presentation or parsing. Large-document
     /// paths should prefer `forEachByteSlice`.
     public func data(in range: Range<Int64>) throws -> Data {

@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "LighTxtCore", targets: ["LighTxt"]),
     ],
     targets: [
+        .systemLibrary(name: "CDuckDB", path: "ThirdParty/DuckDB/include"),
         .target(
             name: "LighTxtJSONAccelerator",
             path: "LighTxt/Vendor/JSONAccelerator",
@@ -27,7 +28,7 @@ let package = Package(
         ),
         .target(
             name: "LighTxt",
-            dependencies: ["LighTxtJSONAccelerator"],
+            dependencies: ["LighTxtJSONAccelerator", "CDuckDB"],
             path: "LighTxt",
             exclude: [
                 "Application",

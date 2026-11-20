@@ -520,14 +520,10 @@ private nonisolated enum MarkdownViewportLoader {
         let bytes = try snapshot.data(in: range)
         if cancellation.isCancelled { throw CancellationError() }
         let prepared = try MarkdownSemanticPreparer.prepare(
-            String(decoding: bytes, as: UTF8.self),
+            bytes: bytes,
             cancellation: cancellation
         )
-        var lineStarts = [range.lowerBound]
-        lineStarts.reserveCapacity(max(1, bytes.count / 48))
-        for (index, byte) in bytes.enumerated() where byte == 0x0A {
-            lineStarts.append(range.lowerBound + Int64(index + 1))
-        }
+        let lineStarts = prepared.sourceLineByteOffsets.map { range.lowerBound + Int64($0) }
         return MarkdownViewportPayload(
             range: range.lowerBound..<(range.lowerBound + Int64(bytes.count)),
             prepared: prepared,
@@ -554,6 +550,10 @@ private nonisolated enum MarkdownViewportLoader {
             let probe = try snapshot.data(in: probeStart..<lower)
             if let newline = probe.lastIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
                 lower = probeStart + Int64(newline + 1)
+                if probe[newline] == 0x0D, lower < total,
+                   try snapshot.data(in: lower..<(lower + 1)).first == 0x0A {
+                    lower += 1
+                }
             }
         }
         if upper < total {
@@ -561,6 +561,10 @@ private nonisolated enum MarkdownViewportLoader {
             let probe = try snapshot.data(in: upper..<probeEnd)
             if let newline = probe.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
                 upper += Int64(newline + 1)
+                if probe[newline] == 0x0D, upper < total,
+                   try snapshot.data(in: upper..<(upper + 1)).first == 0x0A {
+                    upper += 1
+                }
             }
         }
         if upper - lower > Int64(maximumByteCount) {
@@ -609,6 +613,7 @@ private nonisolated enum MarkdownViewportLoader {
 
 struct MarkdownPreparedDocument: @unchecked Sendable {
     let blocks: [MarkdownPreparedBlock]
+    let sourceLineByteOffsets: [Int]
 }
 
 enum MarkdownPreparedBlock: @unchecked Sendable {
@@ -638,15 +643,24 @@ nonisolated enum MarkdownSemanticPreparer {
         _ source: String,
         cancellation: CancellationToken? = nil
     ) throws -> MarkdownPreparedDocument {
-        let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+        try prepare(bytes: Data(source.utf8), cancellation: cancellation)
+    }
+
+    static func prepare(
+        bytes: Data,
+        cancellation: CancellationToken? = nil
+    ) throws -> MarkdownPreparedDocument {
         var blocks: [MarkdownPreparedBlock] = []
-        blocks.reserveCapacity(lines.count)
+        var lineStarts: [Int] = []
         var inFence = false
-        for (lineIndex, sourceLine) in lines.enumerated() {
-            if lineIndex.isMultiple(of: 32), cancellation?.isCancelled == true {
+        var start = bytes.startIndex
+        while true {
+            if blocks.count.isMultiple(of: 32), cancellation?.isCancelled == true {
                 throw CancellationError()
             }
-            let line = String(sourceLine).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+            let end = bytes[start...].firstIndex { $0 == 0x0A || $0 == 0x0D } ?? bytes.endIndex
+            lineStarts.append(start - bytes.startIndex)
+            let line = String(decoding: bytes[start..<end], as: UTF8.self)
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
                 inFence.toggle()
@@ -666,8 +680,11 @@ nonisolated enum MarkdownSemanticPreparer {
             } else {
                 blocks.append(.paragraph(content: inline(line), isBlank: trimmed.isEmpty))
             }
+            guard end < bytes.endIndex else { break }
+            start = end + 1
+            if bytes[end] == 0x0D, start < bytes.endIndex, bytes[start] == 0x0A { start += 1 }
         }
-        return MarkdownPreparedDocument(blocks: blocks)
+        return MarkdownPreparedDocument(blocks: blocks, sourceLineByteOffsets: lineStarts)
     }
 
     private static func inline(_ markdown: String) -> AttributedString {
@@ -820,7 +837,10 @@ enum MarkdownNativeRenderer {
         startsMidDocument: Bool
     ) -> NSAttributedString {
         let prepared = (try? MarkdownSemanticPreparer.prepare(source))
-            ?? MarkdownPreparedDocument(blocks: [.paragraph(content: AttributedString(source), isBlank: source.isEmpty)])
+            ?? MarkdownPreparedDocument(
+                blocks: [.paragraph(content: AttributedString(source), isBlank: source.isEmpty)],
+                sourceLineByteOffsets: [0]
+            )
         return render(prepared, appearance: appearance, startsMidDocument: startsMidDocument)
     }
 

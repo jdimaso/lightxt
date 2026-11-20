@@ -20,6 +20,13 @@ final class ExternalFileMonitorTests: XCTestCase {
         }
     }
 
+    func testSignedDeviceIDsMatchAcrossDocumentFingerprintsAndMonitors() {
+        var status = stat()
+        status.st_dev = -1
+        XCTAssertEqual(FileFingerprint(status).device, UInt64.max)
+        XCTAssertEqual(ExternalFileState(status).identity.device, UInt64.max)
+    }
+
     func testClassifiesAppendTruncateModifyReplaceAndAvailability() {
         let firstIdentity = ExternalFileIdentity(device: 1, inode: 10)
         let secondIdentity = ExternalFileIdentity(device: 1, inode: 11)

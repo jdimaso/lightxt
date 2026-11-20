@@ -35,50 +35,77 @@ nonisolated enum StreamingFileWriter {
     private static let writeBlockSize = 1 << 20
     private static let progressInterval: Int64 = 8 << 20
 
-    /// A sandboxed save-panel grant authorizes the chosen destination, but not
-    /// arbitrary hidden siblings beside it. Ask Foundation for the volume's
-    /// replacement directory first (the supported safe-save location), then
-    /// fall back to the app's private temporary directory when the destination
-    /// is represented by a file-only sandbox extension.
-    private struct StagingArea {
+    /// The save panel grants the selected pathname. Foundation can allocate a
+    /// private replacement directory on its volume without a parent-folder grant.
+    struct StagingArea {
         let directoryURL: URL
         let fileURL: URL
     }
 
-    private static func makeStagingArea(
+    static func makeStagingArea(
         appropriateFor targetURL: URL,
-        targetExists: Bool
+        targetExists: Bool,
+        fileManager: FileManager = .default
     ) throws -> StagingArea {
-        let fileManager = FileManager.default
-        let directoryURL: URL
-        if targetExists,
-           let replacementDirectory = try? fileManager.url(
-               for: .itemReplacementDirectory,
-               in: .userDomainMask,
-               appropriateFor: targetURL,
-               create: true
-           ) {
-            directoryURL = replacementDirectory
+        guard targetURL.isFileURL else { throw CocoaError(.fileWriteUnsupportedScheme) }
+        let volumeURL = targetExists ? targetURL : targetURL.deletingLastPathComponent()
+        var status = stat()
+        let targetDevice: dev_t?
+        if stat(volumeURL.path, &status) == 0 {
+            let type = status.st_mode & S_IFMT
+            guard targetExists ? type == S_IFREG : type == S_IFDIR else {
+                let code = targetExists ? (type == S_IFDIR ? EISDIR : EINVAL) : ENOTDIR
+                throw LighTxtCoreError.io(operation: "prepare save destination", path: targetURL.path, code: code)
+            }
+            targetDevice = status.st_dev
         } else {
-            directoryURL = fileManager.temporaryDirectory.appendingPathComponent(
-                "LighTxt-save-\(UUID().uuidString)",
-                isDirectory: true
+            let code = errno
+            // A file-only grant can hide metadata for the parent of a new file.
+            // Exclusive rename below still enforces the volume boundary at commit.
+            guard !targetExists, code == EACCES || code == EPERM else {
+                throw LighTxtCoreError.io(operation: "inspect save volume", path: volumeURL.path, code: code)
+            }
+            targetDevice = nil
+        }
+
+        func checkVolume(of directory: URL) throws {
+            guard let targetDevice else { return }
+            var directoryStatus = stat()
+            guard stat(directory.path, &directoryStatus) == 0 else {
+                throw LighTxtCoreError.io(operation: "inspect save staging volume", path: directory.path, code: errno)
+            }
+            guard directoryStatus.st_dev == targetDevice else {
+                throw LighTxtCoreError.io(operation: "stage an atomic save on the destination volume", path: targetURL.path, code: EXDEV)
+            }
+        }
+
+        let directoryURL: URL
+        do {
+            directoryURL = try fileManager.url(
+                for: .itemReplacementDirectory,
+                in: .userDomainMask,
+                appropriateFor: volumeURL,
+                create: true
             )
+        } catch {
+            let temporary = fileManager.temporaryDirectory
+            try checkVolume(of: temporary)
+            let fallback = temporary.appendingPathComponent("LighTxt-save-\(UUID().uuidString)", isDirectory: true)
             try fileManager.createDirectory(
-                at: directoryURL,
-                withIntermediateDirectories: false,
+                at: fallback, withIntermediateDirectories: false,
                 attributes: [.posixPermissions: 0o700]
             )
+            directoryURL = fallback
         }
-        return StagingArea(
-            directoryURL: directoryURL,
-            fileURL: directoryURL.appendingPathComponent(UUID().uuidString)
-        )
+        do {
+            try checkVolume(of: directoryURL)
+        } catch {
+            try? fileManager.removeItem(at: directoryURL)
+            throw error
+        }
+        return StagingArea(directoryURL: directoryURL, fileURL: directoryURL.appendingPathComponent(UUID().uuidString))
     }
 
-    /// Publish a completed staging inode through Foundation's safe-replacement
-    /// API. Unlike a raw sibling `rename`, this operation stays within the
-    /// exact URL authority granted by NSSavePanel/NSOpenPanel.
     private static func publish(
         stagedURL: URL,
         to targetURL: URL,
@@ -92,7 +119,12 @@ nonisolated enum StreamingFileWriter {
                 options: .usingNewMetadataOnly
             )
         } else {
-            try FileManager.default.moveItem(at: stagedURL, to: targetURL)
+            // A high-level move may copy across volumes. Publish only this exact
+            // inode, and leave an intervening creator's destination untouched.
+            if renamex_np(stagedURL.path, targetURL.path, UInt32(RENAME_EXCL)) == 0 { return }
+            let code = errno
+            if code == EEXIST { throw LighTxtCoreError.fileChangedExternally(path: targetURL.path) }
+            throw LighTxtCoreError.io(operation: "publish atomic save", path: targetURL.path, code: code)
         }
     }
 

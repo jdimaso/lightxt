@@ -8,6 +8,15 @@ final class DocumentNavigationView: NSView {
     var onSelectResults: ((Bool) -> Void)?
     private let tabs = NSSegmentedControl(labels: ["Outline", "Results"], trackingMode: .selectOne, target: nil, action: nil)
 
+    var presentation: StructureSidebarPresentation {
+        get { outline.presentation }
+        set {
+            outline.presentation = newValue
+            results.presentation = newValue
+            applyAppearance()
+        }
+    }
+
     private var outlineAvailable = true
     private var resultsSelected = false
     var showsResults: Bool {
@@ -25,6 +34,7 @@ final class DocumentNavigationView: NSView {
         self.results = results
         super.init(frame: .zero)
         wantsLayer = true
+        results.presentation = outline.presentation
         applyAppearance()
         tabs.target = self
         tabs.action = #selector(selectTab(_:))
@@ -63,7 +73,8 @@ final class DocumentNavigationView: NSView {
     }
 
     private func applyAppearance() {
-        layer?.backgroundColor = LighTxtTheme.resolved(LighTxtTheme.chromeBackground, for: effectiveAppearance).cgColor
+        let background = presentation == .fullWorkspace ? LighTxtTheme.structureCanvas : LighTxtTheme.chromeBackground
+        layer?.backgroundColor = LighTxtTheme.resolved(background, for: effectiveAppearance).cgColor
     }
 
     func setOutlineAvailable(_ available: Bool) {

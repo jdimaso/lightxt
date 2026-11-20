@@ -82,8 +82,7 @@ public nonisolated enum CSVFilterPredicate: Sendable, Equatable {
         case .isNotEmpty:
             return !value.isEmpty
         case let .numeric(operation, expected):
-            guard let actual = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)),
-                  actual.isFinite else { return false }
+            guard let actual = CSVNumericValue.parse(value) else { return false }
             switch operation {
             case .lessThan: return actual < expected
             case .lessThanOrEqual: return actual <= expected
@@ -961,7 +960,14 @@ public nonisolated enum CSVRowQueryEngine {
                     limit: exactValueLimit
                 )
             }
-            values.append(field?.value ?? "")
+            let value = field?.value ?? ""
+            // Prepare numeric keys once per record. External merge passes can then
+            // compare amounts without validating currency punctuation on each comparison.
+            if descriptor.valueKind != .text, let amount = CSVNumericValue.parse(value) {
+                values.append(String(amount))
+            } else {
+                values.append(value)
+            }
         }
         return CSVSortEntry(record: record, values: values)
     }
@@ -1262,8 +1268,7 @@ public nonisolated enum CSVRowQueryEngine {
     }
 
     private static func finiteNumber(_ value: String) -> Double? {
-        guard let number = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)),
-              number.isFinite else { return nil }
+        guard let number = Double(value), number.isFinite else { return nil }
         return number
     }
 }
@@ -2845,10 +2850,10 @@ private nonisolated struct CSVProfileAccumulator {
             emptyValueCount += 1
         } else if ["true", "false", "yes", "no"].contains(trimmed.lowercased()) {
             booleanValueCount += 1
-        } else if Int64(trimmed) != nil {
+        } else if let integer = Int64(trimmed) {
             integerValueCount += 1
-            addNumeric(Double(trimmed))
-        } else if let number = Double(trimmed), number.isFinite {
+            addNumeric(Double(integer))
+        } else if let number = CSVNumericValue.parse(trimmed) {
             decimalValueCount += 1
             addNumeric(number)
         } else {
@@ -2992,5 +2997,75 @@ private nonisolated struct CSVHyperLogLog {
             estimate = m * log(m / Double(zeroes))
         }
         return Int64(max(0, estimate.rounded()))
+    }
+}
+
+/// File-backed analysis reads exact projected values. A pivot replays its captured
+/// filters so closing a view's temporary sort map cannot invalidate its snapshot.
+nonisolated enum CSVAnalysisReader {
+    static func read(snapshot: DocumentSnapshot, index: CSVRowIndex, firstRecord: Int64,
+                     filters: [CSVColumnFilter], rowMap: CSVRowMap?, rows: IndexSet?,
+                     columns: [Int], visit: ([String?]) throws -> Void) throws {
+        try Task.checkCancellation()
+        if rows?.isEmpty == true { return }
+        let cancelled: CSVRowIndex.CancellationCheck = { Task.isCancelled }
+        let contiguousRange = rows?.rangeView.count == 1 ? rows?.rangeView.first : nil
+        let wholeProjection = contiguousRange.map { $0.lowerBound == 0 && Int64($0.upperBound) == rowMap?.rowCount } ?? false
+        let scanFilteredSource = rows == nil || wholeProjection
+        let groups = scanFilteredSource ? compileCSVColumnFilterGroups(filters) : []
+        let requested = Set(columns + groups.map(\.column))
+        let fieldLimit = 1 << 20
+        let rowLimit = 16 << 20
+        func emit(_ record: Int64, _ selected: CSVSelectedFields) throws {
+            func value(_ column: Int) throws -> String? {
+                let field = selected.fields[column]
+                guard field?.wasTruncated != true else {
+                    throw CSVDataOperationError.queryValueTooLarge(record: record, column: column, limit: fieldLimit)
+                }
+                return field?.value
+            }
+            for group in groups {
+                if try !group.matches(value(group.column) ?? "") { return }
+            }
+            try visit(columns.map(value))
+        }
+        // Statistics are order-independent. A whole sorted view or a large contiguous
+        // source range can use the same sequential projection as a pivot.
+        if scanFilteredSource || (rowMap == nil && (contiguousRange?.count ?? 0) >= 256 && index.progress.isComplete) {
+            guard index.progress.isComplete else { throw CSVDataOperationError.invalidRecord(firstRecord) }
+            let start = firstRecord + (scanFilteredSource ? 0 : Int64(contiguousRange?.lowerBound ?? 0))
+            let end = scanFilteredSource ? nil : contiguousRange.map { firstRecord + Int64($0.upperBound) }
+            _ = try CSVProjectedRecordScanner.scan(snapshot: snapshot, index: index, firstRecord: start,
+                columns: requested, maximumValueBytesPerField: fieldLimit, maximumRetainedValueBytes: rowLimit,
+                cancellation: cancelled) { record, selected in
+                    try emit(record, selected)
+                    return end.map { record + 1 < $0 } ?? true
+                }
+        } else if let rows {
+            for range in rows.rangeView {
+                var start = range.lowerBound
+                while start < range.upperBound {
+                    try Task.checkCancellation()
+                    let count = min(1024, range.upperBound - start)
+                    let first = Int64(start)
+                    let locations: [CSVRowIndex.RecordLocation]
+                    if let rowMap {
+                        let records = try rowMap.records(in: first..<first + Int64(count))
+                        locations = try index.recordLocations(forRecords: records, cancellation: cancelled)
+                    } else {
+                        locations = try index.recordLocations(startingAt: first + firstRecord, limit: count, cancellation: cancelled)
+                    }
+                    guard locations.count == count else { throw CSVRowIndex.IndexError.inconsistentCheckpointData }
+                    for location in locations {
+                        try Task.checkCancellation()
+                        let values = try CSVRecordParser.selectedFields(snapshot: snapshot, location: location,
+                            columns: requested, delimiter: index.delimiter, maximumValueBytesPerField: fieldLimit,
+                            maximumRetainedValueBytes: rowLimit, cancellation: cancelled)
+                        try emit(location.record, values)
+                    }
+                    start += count
+                }
+            }
+        }
     }
 }

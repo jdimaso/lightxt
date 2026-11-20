@@ -92,6 +92,8 @@ final class LighTxtWorkflowRuntimeQA {
         UserDefaults.standard.removePersistentDomain(forName: defaultsDomain)
 
         try verifyOpenPanelAndMenuConfiguration()
+        try await verifyConcurrentConversionOpen()
+        try await verifyRecoveryChooser()
 
         let requestedURLs = try makeFixtures(in: invocation.workspaceURL)
         guard let applicationDelegate = NSApp.delegate as? LighTxtAppDelegate else {
@@ -827,6 +829,87 @@ final class LighTxtWorkflowRuntimeQA {
             .write(to: markdownURL, options: .atomic)
         urls.append(markdownURL.standardizedFileURL)
         return urls
+    }
+
+    private func verifyRecoveryChooser() async throws {
+        let root = invocation.workspaceURL.appendingPathComponent("chooser-journals")
+        let store = RecoveryStore(rootURL: root)
+        let base = invocation.workspaceURL.appendingPathComponent("chooser-base.txt")
+        try Data("base".utf8).write(to: base)
+        let choices = ["first": "Recover", "second": "Recover", "later": "Keep for Later", "discard": "Discard"]
+        var identifiers: [String: UUID] = [:]
+        for name in choices.keys.sorted() {
+            let journal = try store.createJournal(for: base, metadata: .init(task: .init(displayName: name)))
+            let entry = try journal.record(RecoveryPendingEdit(byteRange: 4..<4, replacement: Data(name.utf8)))
+            identifiers[name] = entry.identifier
+        }
+        var chosenCount = 0
+        let select = Timer(timeInterval: 0.05, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                guard let root = NSApp.modalWindow?.contentView else { return }
+                func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+                let controls = descendants(root)
+                let menus = controls.compactMap { $0 as? NSPopUpButton }
+                guard menus.count == choices.count,
+                      let apply = controls.compactMap({ $0 as? NSButton }).first(where: { $0.title == "Apply Choices" }) else { return }
+                for menu in menus {
+                    guard let choice = choices.first(where: { menu.accessibilityLabel() == "Recovery action for " + $0.key }) else { return }
+                    menu.selectItem(withTitle: choice.value)
+                }
+                chosenCount = menus.count
+                apply.performClick(nil)
+            }
+        }
+        // The chooser runs AppKit's modal run loop. Bound the probe even if
+        // a future UI change removes an expected action or accessibility label.
+        let timeout = Timer(timeInterval: 10, repeats: false) { _ in MainActor.assumeIsolated { NSApp.abortModal() } }
+        RunLoop.main.add(select, forMode: .modalPanel)
+        RunLoop.main.add(timeout, forMode: .modalPanel)
+        defer { select.invalidate(); timeout.invalidate() }
+        var opened: Bool?
+        documentController.offerCrashRecovery(from: store) { opened = $0 }
+        try await waitUntil("all recovery chooser decisions") { opened != nil }
+        let recovered = documentController.documents.compactMap { $0 as? LighTxtDocument }
+        try expect(opened == true && chosenCount == choices.count && recovered.count == 2,
+                   "the chooser did not apply all selected recoveries")
+        try expect(recovered.filter { $0.fileURL != nil }.count == 1,
+                   "two recovered revisions claimed the same writable base file")
+        let texts = try recovered.map { document in
+            String(decoding: try document.session.editorReadBytes(in: 0..<document.session.byteCount), as: UTF8.self)
+        }
+        try expect(Set(texts) == ["basefirst", "basesecond"], "recovered document revisions differ")
+        recovered.forEach { $0.close() }
+        let remaining = try store.recoveryCandidates().map(\.identifier)
+        try expect(remaining == [identifiers["later"]!], "the chooser discarded or retained the wrong journal")
+    }
+
+    private func verifyConcurrentConversionOpen() async throws {
+        let url = invocation.workspaceURL.appendingPathComponent("concurrent-open.txt")
+        let expected = String(repeating: "αβ\n", count: 24_000)
+        var bytes = Data([0xff, 0xfe])
+        bytes.append(expected.data(using: .utf16LittleEndian)!)
+        try bytes.write(to: url)
+        var documents: [LighTxtDocument] = []
+        var openedFlags: [Bool] = []
+        var errors: [Error] = []
+        for _ in 0..<2 {
+            documentController.openDocument(withContentsOf: url, display: false) { document, alreadyOpen, error in
+                if let document = document as? LighTxtDocument { documents.append(document) }
+                if let error { errors.append(error) }
+                openedFlags.append(alreadyOpen)
+            }
+        }
+        try expect(openedFlags.isEmpty, "conversion completed synchronously on the caller's main actor")
+        try await waitUntil("both requests for the UTF-16 source") { openedFlags.count == 2 }
+        if let error = errors.first { throw error }
+        guard let document = documents.first else { throw QAError.failed("missing converted document") }
+        defer { document.close() }
+        try expect(documents.count == 2 && documents[1] === document && openedFlags == [false, true],
+                   "concurrent opens created separate converted documents")
+        try expect(document.fileURL == nil && document.session.isSourceTextValidated,
+                   "finished UTF-8 conversion lost its working-copy semantics")
+        let result = try document.session.editorReadBytes(in: 0..<document.session.byteCount)
+        try expect(result == Data(expected.utf8), "the converted file content did not round trip")
     }
 
     private func documentsByURL(_ requestedURLs: [URL]) throws -> [LighTxtDocument] {

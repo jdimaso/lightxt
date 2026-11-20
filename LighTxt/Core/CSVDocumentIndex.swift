@@ -102,6 +102,7 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
     private struct State {
         var checkpoints: [Int64] = [0]
         var checkpointInterval: Int64
+        var logicalStart: Int64 = 0
         var scanOffset: Int64 = 0
         var recordStart: Int64 = 0
         var completedRecords: Int64 = 0
@@ -178,14 +179,30 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
             return ScanResult(progress: makeProgress(capture), stopReason: .completed)
         }
 
-        let upper = min(byteCount, capture.scanOffset + Int64(configuration.readChunkByteCount))
-        let requested = capture.scanOffset..<upper
+        var next = capture
+        if capture.scanOffset == 0, byteCount >= 3 {
+            let bom: [UInt8] = [0xEF, 0xBB, 0xBF]
+            var position = 0
+            while position < bom.count {
+                let end = position + min(bom.count - position, configuration.readChunkByteCount)
+                let range = Int64(position)..<Int64(end)
+                let part = try reader(range)
+                guard part.count == end - position else {
+                    throw IndexError.invalidReaderResult(requested: range, actualByteCount: part.count)
+                }
+                guard part.elementsEqual(bom[position..<end]) else { break }
+                position = end
+            }
+            if position == bom.count { next.logicalStart = 3 }
+        }
+        let start = max(capture.scanOffset, next.logicalStart)
+        let upper = min(byteCount, start + Int64(configuration.readChunkByteCount))
+        let requested = start..<upper
         let data = try reader(requested)
         guard data.count == Int(requested.count) else {
             throw IndexError.invalidReaderResult(requested: requested, actualByteCount: data.count)
         }
 
-        var next = capture
         if !processChunk(
             data,
             baseOffset: requested.lowerBound,
@@ -369,6 +386,39 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
         )
     }
 
+    /// Refines sparse checkpoints once per group of requested source rows,
+    /// then restores the caller's ordering (including duplicate ordinals).
+    func recordLocations(
+        forRecords records: [Int64],
+        cancellation: CancellationCheck? = nil
+    ) throws -> [RecordLocation] {
+        let ordered = Set(records).sorted()
+        guard let first = ordered.first else { return [] }
+        guard first >= 0 else { throw IndexError.invalidRecord(first) }
+        let interval = progress.checkpointRecordInterval
+        var resolved: [Int64: RecordLocation] = [:]
+        var next = 0
+        while next < ordered.count {
+            let start = ordered[next]
+            var end = next + 1
+            while end < ordered.count && ordered[end] / interval == start / interval
+                && ordered[end] - start < 4_096 {
+                end += 1
+            }
+            let count = Int(ordered[end - 1] - start) + 1
+            let page = try recordLocations(startingAt: start, limit: count, cancellation: cancellation)
+            guard page.count == count else { throw IndexError.inconsistentCheckpointData }
+            for record in ordered[next..<end] {
+                resolved[record] = page[Int(record - start)]
+            }
+            next = end
+        }
+        return try records.map { record in
+            guard let location = resolved[record] else { throw IndexError.inconsistentCheckpointData }
+            return location
+        }
+    }
+
     /// Reuses all sparse indexing work after a row-preserving field edit.
     /// CSV table edits replace one encoded field and therefore cannot add or
     /// remove logical record boundaries. Checkpoints at or after the old edit
@@ -401,13 +451,34 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
         scanLock.unlock()
 
         let rebased = try CSVRowIndex(snapshot: snapshot, configuration: configuration)
-        var adjusted = captured
-        let pivot = oldRange.upperBound
-        adjusted.checkpoints = adjusted.checkpoints.map { offset in
-            offset >= pivot ? offset + delta : offset
+        // Clearing the last unterminated record can remove that logical row.
+        // A file ending in a newline has no extra empty record after it.
+        if captured.isComplete && insertedByteCount == 0 && !oldRange.isEmpty
+            && oldRange.lowerBound == captured.recordStart && oldRange.upperBound == byteCount {
+            return rebased
         }
-        if adjusted.scanOffset >= pivot { adjusted.scanOffset += delta }
-        if adjusted.recordStart >= pivot { adjusted.recordStart += delta }
+        if oldRange.lowerBound < 3, snapshot.byteCount >= 3 {
+            let hasBOM = try snapshot.data(in: 0..<3).elementsEqual([0xEF, 0xBB, 0xBF])
+            if hasBOM != (captured.logicalStart == 3) { return rebased }
+        }
+        var adjusted = captured
+        // A partially scanned field may change its quote state. Resume from a
+        // fresh index when the edit touches the scanner's unfinished record.
+        if !captured.isComplete && oldRange.lowerBound < captured.scanOffset
+            && oldRange.upperBound >= captured.recordStart {
+            return rebased
+        }
+        func shiftedRecordStart(_ offset: Int64) -> Int64 {
+            // Filling an empty first cell inserts at the record's own start.
+            offset > oldRange.lowerBound && offset >= oldRange.upperBound ? offset + delta : offset
+        }
+        adjusted.checkpoints = adjusted.checkpoints.map(shiftedRecordStart)
+        adjusted.recordStart = shiftedRecordStart(adjusted.recordStart)
+        if captured.isComplete {
+            adjusted.scanOffset = snapshot.byteCount
+        } else if adjusted.scanOffset > oldRange.lowerBound && adjusted.scanOffset >= oldRange.upperBound {
+            adjusted.scanOffset += delta
+        }
         guard adjusted.checkpoints.allSatisfy({ $0 >= 0 && $0 <= snapshot.byteCount }),
               adjusted.scanOffset >= 0,
               adjusted.scanOffset <= snapshot.byteCount,
@@ -671,7 +742,7 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
     ) throws -> [RecordLocation] {
         var currentRecord = checkpointRecord
         var recordStart = startOffset
-        var offset = startOffset
+        var offset = max(startOffset, withStateLock { $0.logicalStart })
         var inQuotedField = false
         var pendingQuote = false
         var atFieldStart = true
@@ -790,7 +861,7 @@ public nonisolated final class CSVRowIndex: @unchecked Sendable {
         guard !requestedOffsets.isEmpty else { return [] }
         var currentRecord = checkpointRecord
         var recordStart = startOffset
-        var offset = startOffset
+        var offset = max(startOffset, withStateLock { $0.logicalStart })
         var inQuotedField = false
         var pendingQuote = false
         var atFieldStart = true
@@ -1319,7 +1390,7 @@ public nonisolated enum CSVHeaderDetector {
     private static func scalarKind(_ value: String) -> ScalarKind {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return .empty }
-        if Double(trimmed) != nil { return .number }
+        if CSVNumericValue.parse(trimmed) != nil { return .number }
         if ["true", "false", "yes", "no"].contains(trimmed.lowercased()) { return .boolean }
         return .text
     }

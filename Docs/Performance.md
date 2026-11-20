@@ -132,6 +132,8 @@ The 160 MiB transient gate is therefore not met on macOS 26.4.1, but the excess 
 
 ## Latency and throughput gates
 
+The November 2026 optimized 128 MiB log benchmark sustained **4.86–4.91 GiB/s** for literal Find All, taking the median of three warm runs per case. The four cases cover an absent term and a term present 128 times, each with case sensitivity on and off. Full regression mode runs `StreamingSearchTests.testWarmLiteralThroughput` against the 1.5 GiB/s goal.
+
 These gates apply to Release builds on the audited M3 Ultra using a local file on the internal data volume. Record slower reference hardware before lowering a gate; do not silently normalize results by file size when the operation should be constant-time.
 
 | Interaction | Gate |

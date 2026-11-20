@@ -133,6 +133,55 @@ nonisolated final class SparseUTF8LineIndexTests: XCTestCase {
         XCTAssertEqual(indexedByteCounts.last, Int64(data.count))
     }
 
+    func testGiantLineLookupResumesAtByteCheckpointIncludingPendingCR() throws {
+        let interval = 1 << 20
+        var bytes = Data(repeating: 0x61, count: 4 * interval - 1)
+        bytes.append(contentsOf: [0x0d, 0x0a, 0x62])
+        let reader = RecordingDataReader(bytes)
+        let index = try SparseUTF8LineIndex(byteCount: Int64(bytes.count), reader: reader.read)
+        _ = try index.scanToEnd()
+        XCTAssertEqual(index.progress.byteCheckpointCount, 4)
+        let readsBeforeLookup = reader.requestedRanges.count
+        let boundary = Int64(4 * interval)
+        XCTAssertEqual(try index.lineAndColumn(forByteOffset: boundary), .init(line: 0, column: boundary))
+        XCTAssertEqual(try index.lineAndColumn(forByteOffset: boundary + 1), .init(line: 1, column: 0))
+        XCTAssertEqual(try index.byteOffset(forLine: 1), boundary + 1)
+        XCTAssertEqual(try index.lineAndColumn(forByteOffset: boundary - 1), .init(line: 0, column: boundary - 1))
+        let reads = reader.requestedRanges.dropFirst(readsBeforeLookup)
+        XCTAssertTrue(reads.allSatisfy { $0.lowerBound >= Int64(3 * interval) })
+        XCTAssertLessThanOrEqual(reads.reduce(0) { $0 + $1.count }, interval + 4)
+    }
+
+    func testEditPreservesUnchangedPrefixAndReevaluatesCRAtBoundary() throws {
+        let boundary = 2 << 20
+        var old = Data(repeating: 0x61, count: boundary - 1)
+        old.append(contentsOf: [0x0d, 0x78, 0x0a])
+        let oldReader = RecordingDataReader(old)
+        let index = try SparseUTF8LineIndex(
+            byteCount: Int64(old.count), configuration: .init(checkpointLineInterval: 1),
+            reader: oldReader.read
+        )
+        _ = try index.scanToEnd()
+
+        var new = old
+        new[boundary] = 0x0a
+        let newReader = RecordingDataReader(new)
+        _ = try index.invalidate(byteCount: Int64(new.count), sourceRevision: 1,
+                                 unchangedPrefixByteCount: Int64(boundary), reader: newReader.read)
+        XCTAssertEqual(index.progress.indexedByteCount, Int64(boundary))
+        XCTAssertEqual(try index.byteOffset(forLine: 1), Int64(boundary + 1))
+        XCTAssertEqual(try index.lineAndColumn(forByteOffset: Int64(boundary)), .init(line: 0, column: Int64(boundary)))
+        XCTAssertTrue(newReader.requestedRanges.allSatisfy { $0.lowerBound >= Int64(boundary) })
+        XCTAssertEqual(try index.scanToEnd().progress.totalLineCount, 3)
+
+        let truncated = RecordingDataReader(new.prefix(boundary))
+        _ = try index.invalidate(byteCount: Int64(boundary), sourceRevision: 2,
+                                 unchangedPrefixByteCount: Int64(boundary), reader: truncated.read)
+        XCTAssertEqual(index.totalLineCount, 2)
+        XCTAssertEqual(try index.byteOffset(forLine: 1), Int64(boundary))
+        XCTAssertEqual(try index.lineAndColumn(forByteOffset: Int64(boundary)), .init(line: 1, column: 0))
+    }
+
     func testResidentPurgeRetainsSourceAndRebuildsCheckpointsLazily() throws {
         let lineCount = 512
         let data = Data(String(repeating: "value\n", count: lineCount).utf8)

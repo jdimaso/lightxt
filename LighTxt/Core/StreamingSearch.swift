@@ -1407,6 +1407,14 @@ extension DocumentSnapshot {
                 return byte
             }
         let pattern = patternData.map(fold)
+        func comparisonMask(for byte: UInt8) -> SIMD16<UInt8> {
+            let foldsLetter = !options.caseSensitive && (0x61...0x7A).contains(byte)
+            return SIMD16(repeating: foldsLetter ? 0x20 : 0)
+        }
+        let firstByte = SIMD16<UInt8>(repeating: pattern[0])
+        let lastByte = SIMD16<UInt8>(repeating: pattern[pattern.count - 1])
+        let firstMask = comparisonMask(for: pattern[0])
+        let lastMask = comparisonMask(for: pattern[pattern.count - 1])
         var prefix = [Int](repeating: 0, count: pattern.count)
         if pattern.count > 1 {
             var matched = 0
@@ -1470,7 +1478,9 @@ extension DocumentSnapshot {
         do {
             try forEachByteSlice(in: range) { rawBytes in
                 let bytes = rawBytes.bindMemory(to: UInt8.self)
-                for byte in bytes {
+                var index = 0
+                var nextVectorCheck = 0
+                while index < bytes.count {
                     if processed >= nextCancellationCheck {
                         if cancellation?.isCancelled == true {
                             throw SearchInterruption.cancelled
@@ -1478,6 +1488,37 @@ extension DocumentSnapshot {
                         nextCancellationCheck = processed + (64 << 10)
                     }
 
+                    if processed >= nextProgress {
+                        progress?(SearchProgress(
+                            processedBytes: processed,
+                            totalBytes: total,
+                            matchesFound: matchesFound
+                        ))
+                        nextProgress = processed + options.progressIntervalByteCount
+                    }
+
+                    // Test 16 potential starts together. The last-byte check
+                    // also skips common prefixes. Near a piece boundary use
+                    // only the first byte so partial matches carry into the next piece.
+                    if !options.matchesWholeWords, matchedBytes == 0,
+                       index >= nextVectorCheck, bytes.count - index >= 16 {
+                        let block = rawBytes.loadUnaligned(fromByteOffset: index, as: SIMD16<UInt8>.self)
+                        var candidates = (block | firstMask) .== firstByte
+                        if pattern.count > 1, pattern.count - 1 <= bytes.count - index - 16 {
+                            let ends = rawBytes.loadUnaligned(
+                                fromByteOffset: index + (pattern.count - 1), as: SIMD16<UInt8>.self
+                            )
+                            candidates = candidates .& ((ends | lastMask) .== lastByte)
+                        }
+                        nextVectorCheck = index + 16
+                        if !any(candidates) {
+                            index += 16
+                            processed += 16
+                            continue
+                        }
+                    }
+                    let byte = bytes[index]
+                    index += 1
                     if options.matchesWholeWords {
                         try emitPendingWholeWordMatch(before: byte)
                         byteHistory[Int(processed % Int64(historySize))] = byte
@@ -1519,14 +1560,6 @@ extension DocumentSnapshot {
                             : 0
                     }
 
-                    if processed >= nextProgress {
-                        progress?(SearchProgress(
-                            processedBytes: processed,
-                            totalBytes: total,
-                            matchesFound: matchesFound
-                        ))
-                        nextProgress = processed + options.progressIntervalByteCount
-                    }
                 }
             }
             if options.matchesWholeWords {
@@ -2017,7 +2050,7 @@ extension DocumentSnapshot {
         )
     }
 
-    private func utf8BoundaryAtOrAfter(
+    func utf8BoundaryAtOrAfter(
         _ proposedOffset: Int64,
         limitedBy upperBound: Int64
     ) throws -> Int64 {
@@ -2030,7 +2063,7 @@ extension DocumentSnapshot {
         return offset
     }
 
-    private func utf8BoundaryAtOrBefore(
+    func utf8BoundaryAtOrBefore(
         _ proposedOffset: Int64,
         limitedBy lowerBound: Int64
     ) throws -> Int64 {

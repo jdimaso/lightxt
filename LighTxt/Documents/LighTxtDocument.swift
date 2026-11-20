@@ -8,6 +8,11 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
     private(set) static weak var active: LighTxtDocumentController?
     private var homeWindowController: LighTxtHomeWindowController?
     private var sessionRecentDocumentURLs: [URL] = []
+    private struct PendingOpen {
+        let options: DocumentOpenOptions
+        var waiters: [(LighTxtDocument?, Error?) -> Void] = []
+    }
+    private var pendingOpenRequests: [URL: PendingOpen] = [:]
     private var documentHistory = DocumentVisitHistory<ObjectIdentifier>()
     private var isActivatingDocumentHistory = false
     private var isReplayingPersistedTask = false
@@ -50,45 +55,12 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
         display displayDocument: Bool,
         completionHandler: @escaping (NSDocument?, Bool, Error?) -> Void
     ) {
-        performOpenDocument(
+        openDocument(
             withContentsOf: url,
+            openOptions: DocumentOpenOptions(),
             display: displayDocument,
             completionHandler: completionHandler
         )
-    }
-
-    private func performOpenDocument(
-        withContentsOf url: URL,
-        display displayDocument: Bool,
-        completionHandler: @escaping (NSDocument?, Bool, Error?) -> Void
-    ) {
-        if let existing = existingDocument(matching: url) {
-            if displayDocument {
-                hideHomeWindow()
-                noteNewRecentDocumentURL(url)
-                existing.showWindows()
-                existing.windowControllers.first?.window?.makeKeyAndOrderFront(nil)
-                if let existing = existing as? LighTxtDocument {
-                    noteDocumentActivated(existing)
-                }
-                captureCurrentTask()
-            }
-            completionHandler(existing, true, nil)
-            return
-        }
-        super.openDocument(withContentsOf: url, display: displayDocument) { document, alreadyOpen, error in
-            if displayDocument, let document, error == nil {
-                self.hideHomeWindow()
-                self.noteNewRecentDocumentURL(url)
-                document.showWindows()
-                document.windowControllers.first?.window?.makeKeyAndOrderFront(nil)
-                if let document = document as? LighTxtDocument {
-                    self.noteDocumentActivated(document)
-                }
-                self.captureCurrentTask()
-            }
-            completionHandler(document, alreadyOpen, error)
-        }
     }
 
     private var activeWindowController: LighTxtWindowController? {
@@ -112,8 +84,10 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
         if let direct = document(for: url) { return direct }
         let identity = Self.documentIdentityURL(for: url)
         return documents.first { document in
-            guard let openURL = document.fileURL else { return false }
-            return Self.documentIdentityURL(for: openURL) == identity
+            // Converted working copies have no save destination, but the
+            // source the user opened still identifies the existing window.
+            let openURL = document.fileURL ?? (document as? LighTxtDocument)?.session.originalSourceURL
+            return openURL.map { Self.documentIdentityURL(for: $0) == identity } ?? false
         }
     }
 
@@ -167,46 +141,104 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
         }
     }
 
-    /// Offers the newest valid crash journal before showing the normal home
-    /// window. Journals are never auto-applied: recovery replays byte offsets,
-    /// so the user retains an explicit Recover/Discard choice.
-    func offerCrashRecovery(completion: @escaping (Bool) -> Void) {
-        let store: RecoveryStore
-        do {
-            store = RecoveryStore(rootURL: try RecoveryStore.defaultRootURL())
-            _ = try? store.prune()
-        } catch {
-            completion(false)
-            return
-        }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let candidates = (try? store.recoveryCandidates()) ?? []
-            DispatchQueue.main.async { [weak self] in
-                guard let self, let candidate = candidates.first else {
-                    completion(false)
-                    return
+    private enum RecoveryChoice: Int {
+        case recover, keep, discard
+    }
+
+    func offerCrashRecovery(from store: RecoveryStore? = nil, completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let store = try store ?? RecoveryStore(rootURL: RecoveryStore.defaultRootURL())
+                _ = try? store.prune()
+                let candidates = try store.recoveryCandidates()
+                DispatchQueue.main.async {
+                    guard let self, !candidates.isEmpty else { completion(false); return }
+                    let choices = self.chooseRecoveryActions(for: candidates)
+                    self.applyRecoveryChoices(choices[...], from: store, openedAny: false, completion: completion)
                 }
-                let alert = NSAlert()
-                alert.alertStyle = .warning
-                alert.messageText = "Recover unsaved work?"
-                let name = candidate.metadata.task?.displayName
-                    ?? candidate.baseURL.lastPathComponent
-                alert.informativeText = "LighTxt found unsaved changes for \(name) from an interrupted session."
-                alert.addButton(withTitle: "Recover")
-                alert.addButton(withTitle: "Discard")
-                alert.addButton(withTitle: "Not Now")
-                switch alert.runModal() {
-                case .alertFirstButtonReturn:
-                    self.recover(candidate, from: store, completion: completion)
-                case .alertSecondButtonReturn:
-                    DispatchQueue.global(qos: .utility).async {
-                        try? store.discard(identifier: candidate.identifier)
-                    }
-                    completion(false)
-                default:
-                    completion(false)
+            } catch {
+                DispatchQueue.main.async { completion(false) }
+            }
+        }
+    }
+
+    private func chooseRecoveryActions(for entries: [RecoveryEntry]) -> [(RecoveryEntry, RecoveryChoice)] {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Recover unsaved work?"
+        alert.informativeText = "Choose what to do with each document from the interrupted session."
+        let apply = alert.addButton(withTitle: "Apply Choices")
+        alert.addButton(withTitle: "Not Now").keyEquivalent = "\u{1b}"
+        apply.keyEquivalent = "\r"
+
+        let width: CGFloat = 470
+        let rowHeight: CGFloat = 52
+        let height = rowHeight * CGFloat(entries.count)
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: min(height, 5 * rowHeight)))
+        scroll.hasVerticalScroller = height > scroll.frame.height
+        scroll.autohidesScrollers = true
+        let list = NSView(frame: NSRect(x: 0, y: 0, width: scroll.contentSize.width, height: height))
+        scroll.documentView = list
+        var menus: [NSPopUpButton] = []
+        for (index, entry) in entries.enumerated() {
+            let y = height - CGFloat(index + 1) * rowHeight
+            let untitled = entry.metadata.task?.values["untitled"] == "true"
+            let name = entry.metadata.task?.displayName ?? (untitled ? "Untitled" : entry.baseURL.lastPathComponent)
+            let labelWidth = list.frame.width - 150
+            let title = NSTextField(labelWithString: name)
+            title.font = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+            title.frame = NSRect(x: 0, y: y + 25, width: labelWidth, height: 18)
+            title.lineBreakMode = .byTruncatingMiddle
+            list.addSubview(title)
+
+            let date = entry.updatedAt.formatted(date: .abbreviated, time: .shortened)
+            let details = untitled ? date : date + "  ·  " + entry.baseURL.deletingLastPathComponent().path
+            let subtitle = NSTextField(labelWithString: details)
+            subtitle.frame = NSRect(x: 0, y: y + 6, width: labelWidth, height: 17)
+            subtitle.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+            subtitle.textColor = .secondaryLabelColor
+            subtitle.lineBreakMode = .byTruncatingMiddle
+            subtitle.toolTip = details
+            list.addSubview(subtitle)
+
+            let menu = NSPopUpButton(frame: NSRect(x: labelWidth + 8, y: y + 13, width: 136, height: 26))
+            menu.addItems(withTitles: ["Recover", "Keep for Later", "Discard"])
+            menu.setAccessibilityLabel("Recovery action for " + name)
+            list.addSubview(menu)
+            menus.append(menu)
+        }
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, height - scroll.contentSize.height)))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        alert.accessoryView = scroll
+        guard alert.runModal() == .alertFirstButtonReturn else { return [] }
+        return zip(entries, menus).map { entry, menu in
+            (entry, RecoveryChoice(rawValue: menu.indexOfSelectedItem) ?? .keep)
+        }
+    }
+
+    private func applyRecoveryChoices(
+        _ choices: ArraySlice<(RecoveryEntry, RecoveryChoice)>,
+        from store: RecoveryStore,
+        openedAny: Bool,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let (entry, choice) = choices.first else { completion(openedAny); return }
+        let next: (Bool) -> Void = { opened in
+            self.applyRecoveryChoices(choices.dropFirst(), from: store, openedAny: openedAny || opened, completion: completion)
+        }
+        switch choice {
+        case .recover:
+            recover(entry, from: store, completion: next)
+        case .discard:
+            DispatchQueue.global(qos: .utility).async {
+                let result = Result { try store.discard(identifier: entry.identifier) }
+                DispatchQueue.main.async {
+                    if case .failure(let error) = result { NSApp.presentError(error) }
+                    next(false)
                 }
             }
+        case .keep:
+            next(false)
         }
     }
 
@@ -224,16 +256,14 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
                 }
                 do {
                     let recovered = try result.get()
-                    if entry.metadata.task?.values["untitled"] != "true" {
-                        let base = entry.baseURL.standardizedFileURL
-                        for existing in self.documents.compactMap({ $0 as? LighTxtDocument })
-                        where existing.fileURL?.standardizedFileURL == base
-                            && !existing.session.isEdited
-                            && !existing.isDocumentEdited {
-                            existing.close()
-                        }
+                    let base = Self.documentIdentityURL(for: entry.baseURL)
+                    let existing = self.documents.compactMap { $0 as? LighTxtDocument }.filter { document in
+                        guard entry.metadata.task?.values["untitled"] != "true", let url = document.fileURL else { return false }
+                        return Self.documentIdentityURL(for: url) == base
                     }
-                    let document = try LighTxtDocument(recovering: recovered)
+                    let conflictingEdits = existing.contains { $0.session.isEdited || $0.isDocumentEdited }
+                    let document = try LighTxtDocument(recovering: recovered, asCopy: conflictingEdits)
+                    for clean in existing where !clean.session.isEdited && !clean.isDocumentEdited { clean.close() }
                     self.addDocument(document)
                     self.hideHomeWindow()
                     document.makeWindowControllers()
@@ -289,6 +319,7 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
     override func typeForContents(of url: URL) throws -> String {
         switch SyntaxFileTypeDetector.detect(url: url) {
         case .json: "public.json"
+        case .jsonLines: "app.lightext.json-lines"
         case .xml: "public.xml"
         case .csv: "public.comma-separated-values-text"
         case .markdown: "net.daringfireball.markdown"
@@ -349,7 +380,7 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
         }
         panel.message = openAs
             ? "Choose any local file, then select how LighTxt should interpret its sampled content."
-            : "Choose one or more text, JSON, Markdown, SQL, XML, CSV/TSV/PSV, YAML, or Parquet files."
+            : "Choose one or more text, JSON, JSON Lines, Markdown, SQL, XML, CSV/TSV/PSV, YAML, or Parquet files."
         panel.prompt = "Open"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -488,48 +519,58 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
                let controller = existing.windowControllers.first as? LighTxtWindowController {
                 controller.navigateToDocument(at: url, openOptions: openOptions) { document, error in
                     if display, let document, error == nil {
-                        self.hideHomeWindow()
-                        document.showWindows()
-                        document.windowControllers.first?.window?.makeKeyAndOrderFront(nil)
-                        self.noteDocumentActivated(document)
+                        self.presentOpenedDocument(document, from: url)
                     }
                     completionHandler(document, true, error)
                 }
                 return
             }
-            if display {
-                hideHomeWindow()
-                existing.showWindows()
-                existing.windowControllers.first?.window?.makeKeyAndOrderFront(nil)
-                if let existing = existing as? LighTxtDocument {
-                    noteDocumentActivated(existing)
-                }
-            }
+            if display { presentOpenedDocument(existing, from: url) }
             completionHandler(existing, true, nil)
             return
         }
 
-        do {
-            let typeName = try typeForContents(of: url)
-            let document = try LighTxtDocument(
-                opening: url,
-                ofType: typeName,
-                openOptions: openOptions
-            )
-            addDocument(document)
-            if display {
-                hideHomeWindow()
-                noteNewRecentDocumentURL(url)
-                document.makeWindowControllers()
-                document.showWindows()
-                document.windowControllers.first?.window?.makeKeyAndOrderFront(nil)
-                noteDocumentActivated(document)
-                captureCurrentTask()
+        let identity = Self.documentIdentityURL(for: url)
+        if let pendingOptions = pendingOpenRequests[identity]?.options {
+            pendingOpenRequests[identity]?.waiters.append { document, error in
+                if let error {
+                    completionHandler(nil, false, error)
+                } else if pendingOptions == openOptions, let document {
+                    if display { self.presentOpenedDocument(document, from: url) }
+                    completionHandler(document, true, nil)
+                } else {
+                    self.openDocument(withContentsOf: url, openOptions: openOptions, display: display,
+                                      completionHandler: completionHandler)
+                }
             }
-            completionHandler(document, false, nil)
-        } catch {
-            completionHandler(nil, false, error)
+            return
         }
+        pendingOpenRequests[identity] = PendingOpen(options: openOptions)
+        let operation = DocumentOpeningOperation(url: url, options: openOptions, showsProgress: display)
+        operation.start { result, scope in
+            let waiting = self.pendingOpenRequests.removeValue(forKey: identity)?.waiters ?? []
+            switch result {
+            case .success(let session):
+                let document = LighTxtDocument(openedSession: session, url: url, scope: scope)
+                self.addDocument(document)
+                if display { self.presentOpenedDocument(document, from: url) }
+                completionHandler(document, false, nil)
+                waiting.forEach { $0(document, nil) }
+            case .failure(let error):
+                completionHandler(nil, false, error)
+                waiting.forEach { $0(nil, error) }
+            }
+        }
+    }
+
+    private func presentOpenedDocument(_ document: NSDocument, from url: URL) {
+        hideHomeWindow()
+        noteNewRecentDocumentURL(url)
+        if document.windowControllers.isEmpty { document.makeWindowControllers() }
+        document.showWindows()
+        document.windowControllers.first?.window?.makeKeyAndOrderFront(nil)
+        if let document = document as? LighTxtDocument { noteDocumentActivated(document) }
+        captureCurrentTask()
     }
 
     @objc func openRecentLighTxtDocument(_ sender: NSMenuItem) {
@@ -907,7 +948,7 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
         }
         let alert = NSAlert()
         alert.messageText = "LighTxt"
-        alert.informativeText = "Open TXT, SCRIPT, JSON, Markdown, SQL, XML, CSV, YAML, or Parquet. Text stays file-backed, and Parquet opens in a read-only table."
+        alert.informativeText = "Open TXT, SCRIPT, JSON, JSON Lines, Markdown, SQL, XML, CSV, YAML, or Parquet. Text stays file-backed, and Parquet opens in a read-only table."
         alert.addButton(withTitle: "Done")
         alert.runModal()
     }
@@ -1007,7 +1048,7 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
     }
 
     private static let supportedFilenameExtensions = [
-        "txt", "text", "log", "script", "json", "md", "markdown", "sql", "xml", "csv", "tsv", "psv", "yml", "yaml", "parquet",
+        "txt", "text", "log", "script", "json", "jsonl", "ndjson", "md", "markdown", "sql", "xml", "csv", "tsv", "psv", "yml", "yaml", "parquet",
     ]
 
 }
@@ -1018,6 +1059,20 @@ final class LighTxtDocumentController: NSDocumentController, NSMenuDelegate {
 private nonisolated final class DocumentSecurityScope: @unchecked Sendable {
     private let lock = NSLock()
     private var accessedURL: URL?
+
+    init(accessing url: URL? = nil) {
+        if let url, url.startAccessingSecurityScopedResource() { accessedURL = url }
+    }
+
+    deinit { stop() }
+
+    func transfer(to owner: DocumentSecurityScope, for url: URL) {
+        lock.lock()
+        let started = accessedURL != nil
+        accessedURL = nil
+        lock.unlock()
+        owner.adopt(url, accessWasStarted: started)
+    }
 
     func adopt(_ url: URL, accessWasStarted: Bool) {
         lock.lock()
@@ -1048,6 +1103,93 @@ private nonisolated final class DocumentSecurityScope: @unchecked Sendable {
     }
 }
 
+/// The file stays scoped from the originating open request until the main
+/// actor adopts the finished session. Slow conversions show real byte progress.
+@MainActor
+private final class DocumentOpeningOperation: NSObject {
+    private let url: URL
+    private let options: DocumentOpenOptions
+    private let showsProgress: Bool
+    private let cancellation = CancellationToken()
+    private var panel: NSPanel?
+    private var bar: NSProgressIndicator?
+    private var fraction: Double?
+    private var finished = false
+
+    init(url: URL, options: DocumentOpenOptions, showsProgress: Bool) {
+        self.url = url
+        self.options = options
+        self.showsProgress = showsProgress
+    }
+
+    func start(_ completion: @escaping (Result<LighTxtDocumentSession, Error>, DocumentSecurityScope) -> Void) {
+        let scope = DocumentSecurityScope(accessing: url)
+        let target = url.standardizedFileURL
+        if showsProgress {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.showProgress() }
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [self, options, cancellation] in
+            var nextUpdate = 0.0
+            let result = Result {
+                try LighTxtDocumentSession.PreparedOpen(url: target, options: options, cancellation: cancellation) { value in
+                    let now = ProcessInfo.processInfo.systemUptime
+                    guard now >= nextUpdate || value.sourceBytesProcessed == value.sourceByteCount else { return }
+                    nextUpdate = now + 0.1
+                    DispatchQueue.main.async {
+                        self.fraction = value.fractionCompleted
+                        self.bar?.isIndeterminate = false
+                        self.bar?.doubleValue = value.fractionCompleted
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                self.finished = true
+                self.panel?.orderOut(nil)
+                self.panel = nil
+                do {
+                    if cancellation.isCancelled { throw CocoaError(.userCancelled) }
+                    let session = try LighTxtDocumentSession(prepared: result.get())
+                    completion(.success(session), scope)
+                } catch let error as LighTxtCoreError {
+                    if case .io(_, let path, ENOENT) = error, path == target.path {
+                        let missing = CocoaError(.fileReadNoSuchFile, userInfo: [NSURLErrorKey: target, NSUnderlyingErrorKey: error])
+                        completion(.failure(missing), scope)
+                    } else {
+                        completion(.failure(error), scope)
+                    }
+                } catch {
+                    completion(.failure(error), scope)
+                }
+            }
+        }
+    }
+
+    @objc func cancel() { cancellation.cancel() }
+
+    private func showProgress() {
+        guard !finished, !cancellation.isCancelled else { return }
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 92),
+                            styleMask: [.titled], backing: .buffered, defer: false)
+        panel.title = "Opening " + url.lastPathComponent
+        panel.isReleasedWhenClosed = false
+        let bar = NSProgressIndicator(frame: NSRect(x: 20, y: 55, width: 320, height: 16))
+        bar.minValue = 0
+        bar.maxValue = 1
+        bar.isIndeterminate = fraction == nil
+        if let fraction { bar.doubleValue = fraction } else { bar.startAnimation(nil) }
+        panel.contentView?.addSubview(bar)
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancel))
+        cancel.keyEquivalent = "\u{1b}"
+        cancel.sizeToFit()
+        cancel.setFrameOrigin(NSPoint(x: 340 - cancel.frame.width, y: 10))
+        panel.contentView?.addSubview(cancel)
+        panel.center()
+        self.bar = bar
+        self.panel = panel
+        panel.makeKeyAndOrderFront(nil)
+    }
+}
+
 @objc(LighTxtDocument)
 final class LighTxtDocument: NSDocument {
     private enum SaveRoute: Equatable, Sendable {
@@ -1058,6 +1200,7 @@ final class LighTxtDocument: NSDocument {
 
     private(set) var session: LighTxtDocumentSession
     private var hasLoadedContents = false
+    private var openingOperation: DocumentOpeningOperation?
     private var saveCancellation: CancellationToken?
     private(set) var isSaving = false
     private let securityScope = DocumentSecurityScope()
@@ -1069,42 +1212,33 @@ final class LighTxtDocument: NSDocument {
         hasUndoManager = false
     }
 
-    init(
+    convenience init(
         opening url: URL,
         ofType typeName: String,
         openOptions: DocumentOpenOptions
     ) throws {
-        let target = url.standardizedFileURL
-        let accessedSecurityScope = target.startAccessingSecurityScopedResource()
-        do {
-            session = try LighTxtDocumentSession(
-                opening: target,
-                openOptions: openOptions
-            )
-        } catch {
-            if accessedSecurityScope { target.stopAccessingSecurityScopedResource() }
-            throw error
-        }
+        let scope = DocumentSecurityScope(accessing: url)
+        let session = try LighTxtDocumentSession(opening: url.standardizedFileURL, openOptions: openOptions)
+        self.init(openedSession: session, url: url, scope: scope)
+    }
+
+    fileprivate init(openedSession: LighTxtDocumentSession, url: URL, scope: DocumentSecurityScope) {
+        session = openedSession
         super.init()
         hasLoadedContents = true
+        fileType = Self.typeIdentifier(for: session.syntaxFileType)
         if session.needsSaveAsDestination {
-            fileURL = nil
-            fileType = Self.typeIdentifier(for: session.syntaxFileType)
-            if accessedSecurityScope { target.stopAccessingSecurityScopedResource() }
             updateChangeCount(.changeDone)
         } else {
-            fileURL = target
-            fileType = Self.typeIdentifier(for: session.syntaxFileType)
-            fileModificationDate = try? target.resourceValues(
-                forKeys: [.contentModificationDateKey]
-            ).contentModificationDate
-            securityScope.adopt(target, accessWasStarted: accessedSecurityScope)
+            scope.transfer(to: securityScope, for: url)
+            fileURL = url.standardizedFileURL
+            fileModificationDate = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
         }
         hasUndoManager = false
     }
 
-    init(recovering recovered: RecoveredDocument) throws {
-        session = try LighTxtDocumentSession(recovering: recovered)
+    init(recovering recovered: RecoveredDocument, asCopy: Bool = false) throws {
+        session = try LighTxtDocumentSession(recovering: recovered, asCopy: asCopy)
         super.init()
         hasLoadedContents = true
         if session.needsSaveAsDestination {
@@ -1192,48 +1326,46 @@ final class LighTxtDocument: NSDocument {
         }
     }
 
-    /// Replaces the current file while preserving the NSDocument, its window,
-    /// and its single-document window shell. The caller must first complete AppKit's
-    /// `canClose` review. Construction is transactional: the old engine remains
-    /// alive until the new file has opened successfully.
-    @MainActor
-    func replaceContentsForNavigation(with url: URL, ofType typeName: String) throws {
-        try replaceContentsForNavigation(
-            with: url,
-            ofType: typeName,
-            openOptions: session.reopenOptions
-        )
-    }
-
+    /// Replaces the current file only after preparation succeeds. The caller
+    /// keeps the existing session suspended until completion.
     @MainActor
     func replaceContentsForNavigation(
         with url: URL,
-        ofType typeName: String,
-        openOptions: DocumentOpenOptions
-    ) throws {
-        let target = url.standardizedFileURL
-        let accessedSecurityScope = target.startAccessingSecurityScopedResource()
-        let replacement: LighTxtDocumentSession
-        do {
-            replacement = try LighTxtDocumentSession(
-                opening: target,
-                openOptions: openOptions
-            )
-        } catch {
-            if accessedSecurityScope { target.stopAccessingSecurityScopedResource() }
-            throw error
+        openOptions: DocumentOpenOptions,
+        completion: @escaping (Error?) -> Void
+    ) {
+        guard openingOperation == nil else {
+            completion(LighTxtSessionError.documentNavigationInProgress)
+            return
         }
+        let operation = DocumentOpeningOperation(url: url, options: openOptions, showsProgress: true)
+        openingOperation = operation
+        operation.start { [weak self] result, scope in
+            guard let self, self.openingOperation === operation else {
+                completion(CocoaError(.userCancelled))
+                return
+            }
+            self.openingOperation = nil
+            switch result {
+            case .success(let replacement):
+                self.installReplacement(replacement, for: url, scope: scope)
+                completion(nil)
+            case .failure(let error):
+                completion(error)
+            }
+        }
+    }
 
+    private func installReplacement(_ replacement: LighTxtDocumentSession, for target: URL, scope: DocumentSecurityScope) {
         let previous = session
         session = replacement
         hasLoadedContents = true
         if replacement.needsSaveAsDestination {
-            if accessedSecurityScope { target.stopAccessingSecurityScopedResource() }
             securityScope.stop()
             fileURL = nil
             fileType = Self.typeIdentifier(for: replacement.syntaxFileType)
         } else {
-            securityScope.adopt(target, accessWasStarted: accessedSecurityScope)
+            scope.transfer(to: securityScope, for: target)
             fileURL = target
             fileType = Self.typeIdentifier(for: replacement.syntaxFileType)
         }
@@ -1285,6 +1417,10 @@ final class LighTxtDocument: NSDocument {
         for saveOperation: NSDocument.SaveOperationType,
         completionHandler: @escaping (Error?) -> Void
     ) {
+        guard openingOperation == nil else {
+            completionHandler(LighTxtSessionError.documentNavigationInProgress)
+            return
+        }
         let requestedRoute = Self.route(for: saveOperation)
         guard !session.isReadOnly || requestedRoute == .copy else {
             completionHandler(session.readOnlyError)
@@ -1436,6 +1572,11 @@ final class LighTxtDocument: NSDocument {
                 case .failure(let error):
                     LighTxtSignpost.end("DocumentSave", bytes: 0)
                     self.session.callbacks.statusChanged?(error.localizedDescription, false, true)
+                    if case .fileChangedExternally = error as? LighTxtCoreError {
+                        for controller in self.windowControllers.compactMap({ $0 as? LighTxtWindowController }) {
+                            controller.offerLocalEditExportAfterSaveFailure()
+                        }
+                    }
                     // A terminal progress event prevents a queued initial 0%
                     // update from leaving the status bar looking busy after
                     // AppKit presents the save error. The document remains
@@ -1503,6 +1644,8 @@ final class LighTxtDocument: NSDocument {
     }
 
     override func close() {
+        openingOperation?.cancel()
+        openingOperation = nil
         saveCancellation?.cancel()
         session.prepareForClose()
         securityScope.stop()
@@ -1519,6 +1662,7 @@ final class LighTxtDocument: NSDocument {
     private static func typeIdentifier(for syntax: SyntaxFileType) -> String {
         switch syntax {
         case .json: "public.json"
+        case .jsonLines: "app.lightext.json-lines"
         case .xml: "public.xml"
         case .csv: "public.comma-separated-values-text"
         case .markdown: "net.daringfireball.markdown"

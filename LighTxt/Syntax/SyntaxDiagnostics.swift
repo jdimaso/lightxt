@@ -35,6 +35,20 @@ public enum SyntaxDiagnostics {
             return utf8Diagnostics(bytes, baseByteOffset: baseByteOffset, limits: limits)
         case .parquet:
             return []
+        case .jsonLines:
+            var diagnostics: [SyntaxDiagnostic] = []
+            var start = 0
+            while start < bytes.count, diagnostics.count < limits.maximumDiagnostics {
+                let end = bytes[start...].firstIndex(of: 0x0A) ?? bytes.count
+                var validator = JSONValidator(
+                    bytes: UnsafeBufferPointer(rebasing: bytes[start..<end]),
+                    baseByteOffset: baseByteOffset + start, limits: limits
+                )
+                diagnostics.append(contentsOf: validator.validate(allowsBOM: start == 0 && baseByteOffset == 0)
+                    .prefix(limits.maximumDiagnostics - diagnostics.count))
+                start = end + 1
+            }
+            return diagnostics
         case .json:
             var validator = JSONValidator(
                 bytes: bytes, baseByteOffset: baseByteOffset, limits: limits
@@ -109,8 +123,8 @@ public enum SyntaxDiagnostics {
             )
         }
 
-        mutating func validate() -> [SyntaxDiagnostic] {
-            if bytes.count >= 3,
+        mutating func validate(allowsBOM: Bool = true) -> [SyntaxDiagnostic] {
+            if allowsBOM, bytes.count >= 3,
                bytes[0] == 0xEF, bytes[1] == 0xBB, bytes[2] == 0xBF { index = 3 }
             skipWhitespace()
             guard index < bytes.count else {

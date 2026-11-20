@@ -14,6 +14,18 @@ enum LighTxtTheme {
         light: NSColor(calibratedRed: 0.993, green: 0.997, blue: 0.997, alpha: 1),
         dark: NSColor(calibratedRed: 0.054, green: 0.064, blue: 0.071, alpha: 1)
     )
+    static let structureCanvas = dynamic(
+        light: .white,
+        dark: NSColor(srgbRed: 0.075, green: 0.075, blue: 0.075, alpha: 1)
+    )
+    static let structureKey = NSColor(name: nil) { appearance in
+        let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast {
+            return isDark ? .white : .black
+        }
+        let component: CGFloat = isDark ? 0.733 : 0.376
+        return NSColor(srgbRed: component, green: component, blue: component, alpha: 1)
+    }
     static let chromeBackground = dynamic(
         light: NSColor(calibratedRed: 0.949, green: 0.978, blue: 0.979, alpha: 0.96),
         dark: NSColor(calibratedRed: 0.085, green: 0.112, blue: 0.119, alpha: 0.96)

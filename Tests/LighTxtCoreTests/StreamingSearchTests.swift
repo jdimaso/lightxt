@@ -28,6 +28,40 @@ final class StreamingSearchTests: XCTestCase {
         XCTAssertEqual(match?.byteRange, 4..<14)
     }
 
+    func testWarmLiteralThroughput() throws {
+        guard ProcessInfo.processInfo.environment["LIGHTXT_RUN_PERFORMANCE_REGRESSIONS"] == "1" else {
+            throw XCTSkip("Full regression mode benchmarks optimized literal search.")
+        }
+        #if DEBUG
+        throw XCTSkip("Run the throughput benchmark in Release.")
+        #else
+        let url = temporaryDirectory.appendingPathComponent("search-throughput.log")
+        let line = "2026-01-01T12:30:00Z info request completed in 13 milliseconds\n"
+        let block = Data((String(repeating: line, count: (1 << 20) / line.utf8.count) + "event-QZ-785391\n").utf8)
+        XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        let file = try FileHandle(forWritingTo: url)
+        for _ in 0..<128 { try file.write(contentsOf: block) }
+        try file.close()
+        let snapshot = try FileBackedPieceTable(opening: url).snapshot()
+        for sensitive in [true, false] {
+            let options = SearchOptions(caseSensitive: sensitive)
+            for (pattern, expected) in [("missing-QZ-785391", 0), ("event-QZ-785391", 128)] {
+                var speeds: [Double] = []
+                for iteration in 0...3 {
+                    let start = ProcessInfo.processInfo.systemUptime
+                    let matches = try snapshot.allMatches(for: .literal(pattern), options: options)
+                    let duration = ProcessInfo.processInfo.systemUptime - start
+                    XCTAssertEqual(matches.matches.count, expected)
+                    if iteration > 0 { speeds.append(Double(snapshot.byteCount) / Double(1 << 30) / duration) }
+                }
+                let median = speeds.sorted()[1]
+                print("LighTxt literal throughput: matches=\(expected), caseSensitive=\(sensitive), \(median) GiB/s")
+                XCTAssertGreaterThanOrEqual(median, 1.5)
+            }
+        }
+        #endif
+    }
+
     func testOverlappingLiteralMatches() throws {
         let snapshot = try makeTable("aaaa").snapshot()
         var overlapping = SearchOptions()
@@ -45,6 +79,22 @@ final class StreamingSearchTests: XCTestCase {
         options.caseSensitive = false
         let all = try snapshot.allMatches(for: .literal("one"), options: options)
         XCTAssertEqual(all.matches.map(\.byteRange), [0..<3, 4..<7, 8..<11])
+    }
+
+    func testLiteralSearchSkipsCandidatesWithoutLosingBoundaryMatches() throws {
+        let prefix = String(repeating: "AxA!", count: 19)
+        let table = try makeTable(prefix + "abAb" + String(repeating: "AxA!", count: 30))
+        try table.insert(utf8: "AB", at: Int64(prefix.utf8.count + 2))
+        let snapshot = try table.snapshot()
+        let start = Int64(prefix.utf8.count)
+        let overlaps = try snapshot.allMatches(
+            for: .literal("abab"),
+            options: SearchOptions(caseSensitive: false, allowsOverlappingMatches: true)
+        )
+        XCTAssertEqual(overlaps.matches.map(\.byteRange), [start..<(start + 4), (start + 2)..<(start + 6)])
+
+        let tail = try snapshot.firstMatch(for: .literal("AbAxA!"), in: start..<snapshot.byteCount)
+        XCTAssertEqual(tail?.byteRange, (start + 4)..<(start + 10))
     }
 
     func testWholeWordLiteralSearchRemainsStreamingAndHonorsRangeContext() throws {

@@ -417,6 +417,57 @@ final class RecoveryJournalTests: XCTestCase {
         XCTAssertTrue(try store.inspectEntries().isEmpty)
     }
 
+    func testCheckpointReplaysLaterEditsAndSurvivesCancelledReplacement() throws {
+        let base = try makeFile(named: "bulk.txt", contents: Data("source".utf8))
+        let store = RecoveryStore(rootURL: recoveryRoot)
+        let journal = try store.createJournal(for: base)
+        let table = try FileBackedPieceTable(opening: base)
+        try journal.record(.init(byteRange: 6..<6, replacement: Data("!".utf8)))
+        // This revision is larger than the configured prune budget. Its active
+        // checkpoint still needs to reach the chooser on the next launch.
+        let payload = Data(repeating: 97, count: 3 << 20)
+        try table.replace(byteRange: 0..<6, with: payload)
+        try journal.checkpoint(table.snapshot(), metadata: .init())
+        let size = Int64(payload.count)
+        try journal.record(.init(byteRange: size..<size, replacement: Data("tail".utf8)))
+
+        let cancelled = CancellationToken()
+        cancelled.cancel()
+        XCTAssertThrowsError(try journal.checkpoint(table.snapshot(), metadata: .init(), cancellation: cancelled))
+        // Fail while streaming a replacement, after its staging file is created.
+        let stale = try makeFile(named: "stale.txt", contents: Data("old".utf8))
+        let staleTable = try FileBackedPieceTable(opening: stale)
+        let snapshot = try staleTable.snapshot()
+        try Data("longer".utf8).write(to: stale)
+        XCTAssertThrowsError(try journal.checkpoint(snapshot, metadata: .init()))
+        journal.close()
+        let report = try store.prune(policy: .init(maximumStoredBytes: 64 << 10))
+        XCTAssertTrue(report.removed.isEmpty)
+        let recovered = try store.recover(identifier: journal.identifier)
+        defer { recovered.close() }
+        XCTAssertEqual(try recovered.engine.snapshot().materializedData(), payload + Data("tail".utf8))
+        XCTAssertEqual(try Data(contentsOf: base), Data("source".utf8))
+    }
+
+    func testCheckpointRebasesOnSavedDestinationWithNewerUnsavedEdits() throws {
+        let first = try makeFile(named: "original.txt", contents: Data("first".utf8))
+        let saved = try makeFile(named: "saved.txt", contents: Data("saved".utf8))
+        let store = RecoveryStore(rootURL: recoveryRoot)
+        let journal = try store.createJournal(for: first)
+        let table = try FileBackedPieceTable(opening: saved)
+        try table.insert(utf8: " after save", at: 5)
+        try journal.checkpoint(
+            table.snapshot(), metadata: .init(),
+            rebasingOn: (saved, try XCTUnwrap(table.recoveryBaseFingerprint), nil)
+        )
+        journal.close()
+        let result = try store.recover(identifier: journal.identifier)
+        defer { result.close() }
+        XCTAssertEqual(result.entry.baseURL, saved)
+        XCTAssertEqual(try result.engine.snapshot().materializedData(), Data("saved after save".utf8))
+        XCTAssertTrue(result.engine.hasUnsavedChanges)
+    }
+
     private func makeFile(named name: String, contents: Data) throws -> URL {
         let url = temporaryDirectory.appendingPathComponent(name, isDirectory: false)
         try contents.write(to: url)

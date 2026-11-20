@@ -2,28 +2,9 @@
 import AppKit
 import Foundation
 
-final class DocumentSnapshot: @unchecked Sendable {
-    private let bytes: Data
-    let byteCount: Int64
-
-    init(_ bytes: Data) {
-        self.bytes = bytes
-        byteCount = Int64(bytes.count)
-    }
-
-    func data(in range: Range<Int64>) throws -> Data {
-        bytes.subdata(in: Int(range.lowerBound)..<Int(range.upperBound))
-    }
-}
-
 enum LighTxtSignpost {
     static func begin(_ name: StaticString, bytes: Int64) {}
     static func end(_ name: StaticString, bytes: Int64) {}
-}
-
-@MainActor
-final class LighTxtEditorViewController: NSViewController {
-    @objc func undoDocumentEdit(_ sender: Any?) {}
 }
 
 @main
@@ -32,6 +13,7 @@ struct EditorScrollingRuntimeQA {
     static func main() throws {
         guard CommandLine.arguments.count >= 3 else { throw QAError.usage }
         _ = NSApplication.shared
+        try assertDocumentWideEditing()
         let fixture = URL(fileURLWithPath: CommandLine.arguments[1])
         let capture = URL(fileURLWithPath: CommandLine.arguments[2])
         let source = try Data(contentsOf: fixture)
@@ -39,7 +21,7 @@ struct EditorScrollingRuntimeQA {
             throw QAError.failed("Expected exact 57,531-byte attachment, got \(source.count)")
         }
 
-        let delegate = QAEditorDelegate(bytes: source)
+        let delegate = try QAEditorDelegate(bytes: source)
         let editor = VirtualTextEditorView(
             frame: NSRect(x: 0, y: 0, width: 1_000, height: 720)
         )
@@ -194,6 +176,103 @@ struct EditorScrollingRuntimeQA {
         )
     }
 
+    private static func assertDocumentWideEditing() throws {
+        let multiline = Data(String(repeating: "1234567\n", count: 160_000).utf8)
+        let singleLine = Data(repeating: 0x78, count: 65_536)
+        for bytes in [multiline, singleLine] {
+            let delegate = try QAEditorDelegate(bytes: bytes)
+            let editor = VirtualTextEditorView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+            editor.editorDelegate = delegate
+            guard let text = descendant(of: editor, as: NSTextView.self) else { throw QAError.failed("Missing editor") }
+            text.selectAll(nil)
+            guard editor.selectedGlobalByteRange == 0..<Int64(bytes.count) else {
+                throw QAError.failed("Select All stopped at a viewport boundary")
+            }
+            for action in [#selector(NSText.copy(_:)), #selector(NSText.cut(_:)), #selector(NSText.delete(_:))] {
+                guard text.validateMenuItem(NSMenuItem(title: "", action: action, keyEquivalent: "")) else {
+                    throw QAError.failed("Edit menu disabled \(NSStringFromSelector(action)) for Select All")
+                }
+            }
+            var copyItem: NSPasteboardItem?
+            guard editor.transferExtendedSelection(cut: false, publish: { copyItem = $0 }) else {
+                throw QAError.failed("Document-wide copy fell back to the viewport")
+            }
+            text.insertText("x", replacementRange: text.selectedRange())
+            pumpRunLoop(for: 0.02)
+            guard delegate.editorDocumentByteCount == 1, text.string == "x",
+                  delegate.engine.undo(), try delegate.editorSnapshot().data(in: 0..<Int64(bytes.count)) == bytes,
+                  delegate.engine.redo(), try delegate.editorSnapshot().data(in: 0..<1) == Data("x".utf8) else {
+                throw QAError.failed("Document-wide replacement did not round-trip through one undo and redo")
+            }
+            try delegate.engine.save()
+            delegate.engine.close()
+            guard copyItem?.data(forType: .string) == bytes else {
+                throw QAError.failed("Deferred clipboard bytes changed after replacing, saving and closing")
+            }
+        }
+
+        let delegate = try QAEditorDelegate(bytes: multiline)
+        let editor = VirtualTextEditorView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        editor.editorDelegate = delegate
+        guard let text = descendant(of: editor, as: NSTextView.self) else { throw QAError.failed("Missing editor") }
+        text.selectAll(nil)
+        text.moveRight(nil)
+        guard editor.selectedGlobalByteRange == Int64(multiline.count)..<Int64(multiline.count) else {
+            throw QAError.failed("Right arrow stopped at the viewport boundary after Select All")
+        }
+        let caret = Int64(multiline.count - 10)..<Int64(multiline.count - 10)
+        for anchor in [caret.lowerBound - 24, caret.lowerBound - 400_000, 0] {
+            editor.restoreRecoverySelection(caret, viewportByteOffset: anchor)
+            pumpRunLoop(for: 0.08)
+            guard editor.selectedGlobalByteRange == caret, delegate.lastSelection == caret else {
+                throw QAError.failed("Recovery moved the caret to \(editor.selectedGlobalByteRange) at viewport \(anchor)")
+            }
+        }
+        let offscreen = Int64(10)..<Int64(20)
+        editor.restorePresentationState(.init(selection: offscreen, anchorByteOffset: Int64(multiline.count - 100),
+                                              horizontalOffset: 0))
+        guard text.selectedRange().length == 0, editor.selectedGlobalByteRange == offscreen,
+              text.validateMenuItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "")),
+              text.validateMenuItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "")),
+              text.validateMenuItem(NSMenuItem(title: "Delete", action: #selector(NSText.delete(_:)), keyEquivalent: "")) else {
+            throw QAError.failed("Restoring an offscreen document selection disabled its edit commands")
+        }
+        delegate.editorAllowsTextMutation = false
+        var publishedWhileSuspended = false
+        guard !text.validateMenuItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "")),
+              editor.transferExtendedSelection(cut: true, publish: { _ in publishedWhileSuspended = true }),
+              !publishedWhileSuspended, delegate.editorDocumentByteCount == Int64(multiline.count) else {
+            throw QAError.failed("Cut changed a suspended document or its pasteboard")
+        }
+        delegate.editorAllowsTextMutation = true
+        text.deleteBackward(nil)
+        guard delegate.editorDocumentByteCount == Int64(multiline.count - offscreen.count),
+              delegate.lastSelection == offscreen.lowerBound..<offscreen.lowerBound, delegate.engine.undo() else {
+            throw QAError.failed("Offscreen deletion did not edit the selected document range")
+        }
+        editor.reloadPreservingSelection()
+        let before = text.string.utf8.count
+        text.insertText("x", replacementRange: NSRange(location: 0, length: 0))
+        guard text.string.utf8.count == before + 1 else { throw QAError.failed("One keystroke reloaded a full viewport") }
+
+        text.selectAll(nil)
+        var cutItem: NSPasteboardItem?
+        guard editor.transferExtendedSelection(cut: true, publish: { cutItem = $0 }),
+              delegate.editorDocumentByteCount == 0,
+              cutItem?.data(forType: .string)?.count == multiline.count + 1 else {
+            throw QAError.failed("Cut did not retain the entire pre-edit snapshot")
+        }
+        text.insertText(String(repeating: "x", count: 16_384), replacementRange: text.selectedRange())
+        pumpRunLoop(for: 0.03)
+        guard text.string.utf8.count <= 8_192, text.textContainer?.widthTracksTextView == true else {
+            throw QAError.failed("Pasting a long line bypassed wrapped viewport limits")
+        }
+        text.selectAll(nil)
+        text.deleteBackward(nil)
+        pumpRunLoop(for: 0.02)
+        guard delegate.editorDocumentByteCount == 0 else { throw QAError.failed("Delete stopped at a viewport boundary") }
+    }
+
     private static func assertComfortScrollerMetrics() throws {
         guard LighTxtComfortScroller.isCompatibleWithOverlayScrollers else {
             throw QAError.failed("Comfort scroller disabled native overlay compatibility")
@@ -258,24 +337,32 @@ struct EditorScrollingRuntimeQA {
 
 @MainActor
 private final class QAEditorDelegate: VirtualTextEditorDelegate {
-    private var bytes: Data
+    let engine: FileBackedPieceTable
+    var editorAllowsTextMutation = true
+    var lastSelection: Range<Int64>?
+    private let url: URL
 
-    init(bytes: Data) { self.bytes = bytes }
-
-    var editorDocumentByteCount: Int64 { Int64(bytes.count) }
-    var editorSyntaxFileType: SyntaxFileType { .markdown }
-    func editorSnapshot() throws -> DocumentSnapshot { DocumentSnapshot(bytes) }
-    func editorReadBytes(in range: Range<Int64>) throws -> Data {
-        bytes.subdata(in: Int(range.lowerBound)..<Int(range.upperBound))
+    init(bytes: Data) throws {
+        url = FileManager.default.temporaryDirectory.appendingPathComponent("LighTxt-editor-QA-" + UUID().uuidString)
+        try bytes.write(to: url)
+        engine = try FileBackedPieceTable(opening: url)
     }
+
+    deinit { try? FileManager.default.removeItem(at: url) }
+
+    var editorDocumentByteCount: Int64 { engine.byteCount }
+    var editorSyntaxFileType: SyntaxFileType { .markdown }
+    func editorSnapshot() throws -> DocumentSnapshot { try engine.snapshot() }
+    func editorReadBytes(in range: Range<Int64>) throws -> Data { try engine.snapshot().data(in: range) }
     func editorReplaceBytes(in range: Range<Int64>, with replacement: Data) throws {
-        bytes.replaceSubrange(Int(range.lowerBound)..<Int(range.upperBound), with: replacement)
+        try engine.replace(byteRange: range, with: replacement)
     }
     func editorLineLocation(at byteOffset: Int64) -> EditorLineLocation {
-        let upper = min(bytes.count, max(0, Int(byteOffset)))
+        let upper = max(0, min(byteOffset, engine.byteCount))
+        let bytes = (try? editorReadBytes(in: 0..<upper)) ?? Data()
         var line: Int64 = 1
         var lineStart = 0
-        for (index, byte) in bytes[..<upper].enumerated() where byte == 0x0A {
+        for (index, byte) in bytes.enumerated() where byte == 0x0A {
             line += 1
             lineStart = index + 1
         }
@@ -285,7 +372,7 @@ private final class QAEditorDelegate: VirtualTextEditorDelegate {
         )
     }
     func editorDidCommitEdit(replaced range: Range<Int64>, insertedByteCount: Int64) {}
-    func editorSelectionDidChange(byteRange: Range<Int64>, line: Int64, column: Int) {}
+    func editorSelectionDidChange(byteRange: Range<Int64>, line: Int64, column: Int) { lastSelection = byteRange }
     func editorDidLoadViewport(byteRange: Range<Int64>) {}
     func editorDidExpose(byteRange: Range<Int64>) {}
     func editorDidDiscoverStructure(
